@@ -1,0 +1,47 @@
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "mcp__.*___Counter__(Deploy|ExecuteMethod)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/permission-hook.sh mcp__*___Counter__*"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__.*___Counter__ExecuteMethod",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/extract-and-create-loop.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/stop.sh"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/update-prompt.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
