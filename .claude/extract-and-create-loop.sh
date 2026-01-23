@@ -8,8 +8,11 @@ set -euo pipefail
 # Trap errors with better logging
 trap 'echo "❌ extract-and-create-loop.sh error at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 
+STATE_FILE=".claude/agent-loop.local.md"
+[[ ! -f "$STATE_FILE" ]] || exit 0
+
 # Read hook input from stdin
-HOOK_INPUT=$(cat 2>/dev/null || echo "{}")
+HOOK_INPUT=$(cat 2> /dev/null || echo "{}")
 
 # Log for debugging
 if [[ -n "${DEBUG_HOOKS:-}" ]]; then
@@ -22,8 +25,12 @@ extract_json_string() {
   local json="$1"
   local key="$2"
   local default="${3:-}"
-  # Match "key": "value" and extract the value part, handling escaped characters
+  # Try matching "key": "value" (normal JSON)
   local value=$(echo "$json" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\",}]*\)\".*/\1/p" | head -1)
+  # Fallback: split on comma, find key with string value
+  if [[ -z "$value" ]]; then
+    value=$(echo "$json" | sed 's/,/\n/g' | sed -n "/${key}.*\"[^\"]*\"/{s/\\\\\"/\"/g;s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p;}" | head -1)
+  fi
   echo "${value:-$default}"
 }
 
@@ -32,7 +39,12 @@ extract_json_number() {
   local json="$1"
   local key="$2"
   local default="${3:-}"
+  # Try matching "key": value (normal JSON)
   local value=$(echo "$json" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p" | head -1)
+  # Fallback: split on comma, find key with numeric value
+  if [[ -z "$value" ]]; then
+    value=$(echo "$json" | sed 's/,/\n/g' | sed -n "/${key}.*[0-9]/{s/\\\\\"//g;s/.*${key}\"*[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p;}" | head -1)
+  fi
   echo "${value:-$default}"
 }
 
@@ -40,7 +52,7 @@ extract_json_number() {
 # The hook JSON contains the tool parameters
 ITERATION=1
 MAX_ITERATIONS=$(extract_json_number "$HOOK_INPUT" "max_iterations" "50")
-COMPLETION_PROMISE=$(extract_json_string "$HOOK_INPUT" "completion_promise" "LOOP_COMPLETE")
+COMPLETION_PROMISE=$(extract_json_string "$HOOK_INPUT" "completion_promise" "attempt_completion")
 PROMPT=$(extract_json_string "$HOOK_INPUT" "prompt")
 
 # Only proceed if this is an agent-loop call
@@ -53,9 +65,8 @@ if [[ -z "$PROMPT" ]]; then
 fi
 
 # Create the agent-loop state file
-STATE_FILE=".claude/agent-loop.local.md"
 mkdir -p "$(dirname "$STATE_FILE")"
-cat > "$STATE_FILE" <<EOF
+cat > "$STATE_FILE" << EOF
 ---
 iteration: $ITERATION
 max_iterations: $MAX_ITERATIONS

@@ -1,4 +1,4 @@
-# 🎯 Agent Loop Stop Hook (Ralph Wiggum in 38 lines)
+# 🎯 Agent Loop Stop Hook (Ralph Wiggum in ~30 lines)
 
 Create your own MCP tools that leverage this stop-hook to work as Ralph Wiggum.
 

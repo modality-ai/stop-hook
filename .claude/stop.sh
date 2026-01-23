@@ -19,10 +19,10 @@ PROMPT=$(awk '/^---$/{i++; next} i>=2' "$STATE")
 
 # Check completion promise in transcript
 INPUT=$(cat)
-if [[ -n "$PROMISE" && "$PROMISE" != "null" ]]; then
+if [[ $ITER -gt 2 && -n "$PROMISE" && "$PROMISE" != "null" ]]; then
   TRANSCRIPT=$(echo "$INPUT" | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
   if [[ -f "$TRANSCRIPT" ]]; then
-    FOUND=$(grep -o '<promise>[^<]*</promise>' "$TRANSCRIPT" 2>/dev/null | tail -1 | sed 's/<[^>]*>//g' || true)
+    FOUND=$(tail -1 "$TRANSCRIPT" 2>/dev/null | grep -o '<promise>[^<]*</promise>' | sed 's/<[^>]*>//g' || true)
     [[ "$FOUND" == "$PROMISE" ]] && { echo "Completed: $PROMISE"; rm -f "$STATE"; exit 0; }
   fi
 fi
@@ -31,8 +31,6 @@ fi
 NEXT=$((ITER + 1))
 sed -i.bak "s/^iteration: .*/iteration: $NEXT/" "$STATE" && rm -f "$STATE.bak"
 
-MSG="Iteration $NEXT/$MAX"
-[[ -n "$PROMISE" && "$PROMISE" != "null" ]] && MSG="$MSG | Complete: <promise>$PROMISE</promise>"
-
+MSG="Iteration Count $NEXT: WHEN YOU MEET PROMPT output '<promise>$PROMISE</promise>' in last line."
 printf '{"decision":"block","reason":"%s","systemMessage":"%s"}\n' \
   "$(echo "LOOP ($NEXT/$MAX) PROMPT - $PROMPT" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')" "$MSG"
