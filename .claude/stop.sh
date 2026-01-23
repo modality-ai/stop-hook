@@ -31,6 +31,6 @@ fi
 NEXT=$((ITER + 1))
 sed -i.bak "s/^iteration: .*/iteration: $NEXT/" "$STATE" && rm -f "$STATE.bak"
 
-MSG="Iteration Count $NEXT: WHEN YOU MEET PROMPT output '<promise>$PROMISE</promise>' in last line."
+SYSTEM_MESSAGE="Iteration $NEXT: Execute one PDCA cycle (Plan-Do-Check-Act) targeting this prompt. Output '<promise>$PROMISE</promise>' in your final line when you achieve perfect fit."
 printf '{"decision":"block","reason":"%s","systemMessage":"%s"}\n' \
-  "$(echo "LOOP ($NEXT/$MAX) PROMPT - $PROMPT" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')" "$MSG"
+  "$(echo "LOOP ($NEXT/$MAX) PROMPT - $PROMPT" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')" "$SYSTEM_MESSAGE"
