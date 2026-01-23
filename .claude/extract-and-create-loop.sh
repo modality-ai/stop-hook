@@ -39,8 +39,8 @@ extract_json_number() {
 # Extract params from the MCP method call
 # The hook JSON contains the tool parameters
 ITERATION=1
-MAX_ITERATIONS=$(extract_json_number "$HOOK_INPUT" "maxIterations" "50")
-COMPLETION_PROMISE=$(extract_json_string "$HOOK_INPUT" "completionPromise" "LOOP_COMPLETE")
+MAX_ITERATIONS=$(extract_json_number "$HOOK_INPUT" "max_iterations" "50")
+COMPLETION_PROMISE=$(extract_json_string "$HOOK_INPUT" "completion_promise" "LOOP_COMPLETE")
 PROMPT=$(extract_json_string "$HOOK_INPUT" "prompt")
 
 # Only proceed if this is an agent-loop call
@@ -54,6 +54,7 @@ fi
 
 # Create the agent-loop state file
 STATE_FILE=".claude/agent-loop.local.md"
+mkdir -p "$(dirname "$STATE_FILE")"
 cat > "$STATE_FILE" <<EOF
 ---
 iteration: $ITERATION

@@ -15,6 +15,6 @@ NEW_PROMPT=$(cat)
   echo "---"
   # Add new prompt
   echo "$NEW_PROMPT"
-} > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+} > "$STATE.tmp" && cp "$STATE.tmp" "$STATE"
 
 echo "✓ Prompt updated in state file"
