@@ -31,6 +31,6 @@ fi
 NEXT=$((ITER + 1))
 sed -i.bak "s/^iteration: .*/iteration: $NEXT/" "$STATE" && rm -f "$STATE.bak"
 
-AGENT_PROMPT="Iteration $NEXT: Execute one PDCA (Plan-Do-Check-Act) LOOP ($NEXT/$MAX) to targeting mission. Output '<promise>$PROMISE</promise>' in your final line when you achieve perfect fit."
+AGENT_PROMPT="Iteration $NEXT: Execute one PDCA (Plan-Do-Check-Act) LOOP ($NEXT/$MAX) to achieve mission. When you get perfect fit, output '<promise>$PROMISE</promise>' in your final line."
 printf '{"decision":"block","reason":"%s","systemMessage":"%s"}\n' \
   "$(echo "$AGENT_PROMPT PROMPT - $PROMPT" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')" "LOOP ($NEXT/$MAX)"
