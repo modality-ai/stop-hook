@@ -9,10 +9,17 @@ set -euo pipefail
 trap 'echo "❌ extract-and-create-loop.sh error at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 
 STATE_FILE=".claude/agent-loop.local.md"
-[[ ! -f "$STATE_FILE" ]] || exit 0
 
-# Read hook input from stdin
-HOOK_INPUT=$(cat 2> /dev/null || echo "{}")
+# Read hook input from stdin and strip ANSI color codes
+HOOK_INPUT=$(cat 2> /dev/null | sed 's/\x1b\[[0-9;]*[mK]//g' || echo "{}")
+
+# DEBUG_HOOKS=1
+
+# Cache grep -P capability check (avoid repeated checks in function)
+HAS_GREP_P=false
+if command -v grep &>/dev/null && grep --help 2>&1 | grep -q '\-P'; then
+  HAS_GREP_P=true
+fi
 
 # Log for debugging
 if [[ -n "${DEBUG_HOOKS:-}" ]]; then
@@ -20,40 +27,66 @@ if [[ -n "${DEBUG_HOOKS:-}" ]]; then
   echo "$HOOK_INPUT" >> /tmp/hooks-debug.log
 fi
 
-# Helper: Extract quoted JSON value without jq (handles escaped quotes and newlines)
-extract_json_string() {
+# Unified JSON value extractor - DRY utility for nested tool_input.params structure
+# Usage: extract_json_value "json" "key" "string|number" "default" [max_len]
+# Fallback chain: grep -oP → sed -E → awk
+extract_json_value() {
   local json="$1"
   local key="$2"
-  local default="${3:-}"
-  # Try matching "key": "value" (normal JSON)
-  local value=$(echo "$json" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\",}]*\)\".*/\1/p" | head -1)
-  # Fallback: split on comma, find key with string value
-  if [[ -z "$value" ]]; then
-    value=$(echo "$json" | sed 's/,/\n/g' | sed -n "/${key}.*\"[^\"]*\"/{s/\\\\\"/\"/g;s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p;}" | head -1)
+  local type="${3:-string}"  # "string" or "number"
+  local default="${4:-}"
+  local max_len="${5:-10000}"
+  local value=""
+
+  # Build patterns based on type
+  if [[ "$type" == "number" ]]; then
+    local grep_pattern="\"${key}\"\\s*:\\s*\\K[0-9]+"
+    local sed_pattern="s/.*\"${key}\"\\s*:\\s*([0-9]+).*/\\1/"
+    local awk_sep="\"${key}\":"
+    local awk_end='[,}]'
+  else
+    local grep_pattern="\"${key}\"\\s*:\\s*\"\\K[^\"]*(?=\")"
+    local sed_pattern="s/.*\"${key}\"\\s*:\\s*\"([^\"]*)\".*/\\1/"
+    local awk_sep="\"${key}\":\""
+    local awk_end='"'
   fi
+
+  # Try grep -oP (Perl regex) - most reliable
+  if [[ "$HAS_GREP_P" == "true" ]]; then
+    value=$(echo "$json" | grep -oP "$grep_pattern" 2>/dev/null | head -1)
+  fi
+
+  # Fallback: sed -E
+  if [[ -z "$value" ]]; then
+    value=$(echo "$json" | sed -E "$sed_pattern" 2>/dev/null | head -1)
+    # Validate extraction succeeded
+    if [[ "$type" == "number" ]]; then
+      [[ ! "$value" =~ ^[0-9]+$ ]] && value=""
+    else
+      [[ "$value" == "$json" || ${#value} -gt $max_len ]] && value=""
+    fi
+  fi
+
+  # Fallback: awk
+  if [[ -z "$value" ]]; then
+    if [[ "$type" == "number" ]]; then
+      value=$(echo "$json" | awk -F"$awk_sep" '{print $2}' | awk -F"$awk_end" '{print $1}' | tr -d ' ' | head -1)
+      [[ ! "$value" =~ ^[0-9]+$ ]] && value=""
+    else
+      value=$(echo "$json" | awk -F"$awk_sep" '{print $2}' | awk -F"$awk_end" '{print $1}' | head -1)
+      [[ ${#value} -gt $max_len ]] && value=""
+    fi
+  fi
+
   echo "${value:-$default}"
 }
 
-# Helper: Extract numeric JSON value without jq
-extract_json_number() {
-  local json="$1"
-  local key="$2"
-  local default="${3:-}"
-  # Try matching "key": value (normal JSON)
-  local value=$(echo "$json" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p" | head -1)
-  # Fallback: split on comma, find key with numeric value
-  if [[ -z "$value" ]]; then
-    value=$(echo "$json" | sed 's/,/\n/g' | sed -n "/${key}.*[0-9]/{s/\\\\\"//g;s/.*${key}\"*[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p;}" | head -1)
-  fi
-  echo "${value:-$default}"
-}
-
-# Extract params from the MCP method call
-# The hook JSON contains the tool parameters
+# Extract params from the MCP method call (nested in tool_input.params)
+# The hook JSON structure: {"tool_input":{"method":"*agent-loop","params":{"prompt":"...","max_iterations":N,...}}}
 ITERATION=1
-MAX_ITERATIONS=$(extract_json_number "$HOOK_INPUT" "max_iterations" "50")
-COMPLETION_PROMISE=$(extract_json_string "$HOOK_INPUT" "completion_promise" "attempt_completion")
-PROMPT=$(extract_json_string "$HOOK_INPUT" "prompt")
+MAX_ITERATIONS=$(extract_json_value "$HOOK_INPUT" "max_iterations" "number" "50")
+COMPLETION_PROMISE=$(extract_json_value "$HOOK_INPUT" "completion_promise" "string" "attempt_completion" "1000")
+PROMPT=$(extract_json_value "$HOOK_INPUT" "prompt" "string" "" "10000")
 
 # Only proceed if this is an agent-loop call
 if [[ -z "$PROMPT" ]]; then
