@@ -298,7 +298,8 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
     await initSession(systemPrompt, options);
   }
   try {
-    const response = await session!.sendAndWait({ prompt }, 300000); // 5 minute timeout
+    const timeoutMs = 86400000 * 7; // 7 day 
+    const response = await session!.sendAndWait({ prompt }, timeoutMs);
     return response?.data?.content || "";
   } catch (error) {
     console.error(
