@@ -100,8 +100,10 @@ class SweAgent {
     if (content?.trim()) {
       const lines = content.split("\n").slice(-CONFIG.PROMISE_LINES);
       for (let i = lines.length - 1; i >= 0; i--) {
-        const promise = this.extractPromise(lines[i]);
-        if (promise === this.completionPromise) {
+        const line = lines[i];
+        if (!line) continue;
+        const promise = this.extractPromise(line);
+        if (promise && promise === this.completionPromise) {
           console.log(
             `${Colors.green}Promise detected: ${promise}${Colors.reset}`
           );

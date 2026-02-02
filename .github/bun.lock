@@ -3,6 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
+      "name": "copilot-loop",
       "dependencies": {
         "@github/copilot-sdk": "^0.1.20",
       },

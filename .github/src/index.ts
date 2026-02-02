@@ -1,3 +1,5 @@
+#!/usr/bin/env bun
+
 import { SweAgentInteraction } from "./utils/SweAgentInteraction";
 import { CopilotClient } from "@github/copilot-sdk";
 import type { CopilotSession } from "@github/copilot-sdk";
@@ -10,7 +12,7 @@ const parseCliArgs = (flag: string) => {
   // For flags with values (like --prompt)
   if (
     index + 1 < process.argv.length &&
-    !process.argv[index + 1].startsWith("--")
+    !process.argv[index + 1]?.startsWith("--")
   ) {
     return process.argv[index + 1];
   }
@@ -309,7 +311,7 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
 
 const printHelp = () => {
   console.log(`
-Usage: bun ./src/index.ts [options]
+Usage: copilot-loop [options]
 
 Options:
   --config <file>   Load configuration from YAML file
@@ -317,9 +319,9 @@ Options:
   --debug          Use confirm mode instead of yolo mode
 
 Examples:
-  bun ./src/index.ts --config config.yaml
-  bun ./src/index.ts -p "your prompt here"
-  bun ./src/index.ts --config config.yaml --debug
+  copilot-loop --config config.yaml
+  copilot-loop -p "your prompt here"
+  copilot-loop --config config.yaml --debug
   `);
   process.exit(0);
 };
