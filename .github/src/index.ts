@@ -296,6 +296,7 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
       options = await loadPromptFile(configFile);
     }
     await initSession(systemPrompt, options);
+    await new Promise((resolve) => setTimeout(resolve, 5000));
   }
   try {
     const timeoutMs = 86400000 * 7; // 7 day 
