@@ -31,7 +31,7 @@ fi
 NEXT=$((ITER + 1))
 sed -i.bak "s/^iteration: .*/iteration: $NEXT/" "$STATE" && rm -f "$STATE.bak"
 
-AGENT_PROMPT="Iteration $NEXT: Execute one PDCA (Plan-Do-Check-Act) LOOP ($NEXT/$MAX) to achieve mission. When you get perfect fit, output '<promise>$PROMISE</promise>' in your final line."
+AGENT_PROMPT="You're execute on PDCA (Plan-Do-Check-Act) LOOP ($NEXT/$MAX) to achieve mission. When you get perfect fit, output '<promise>$PROMISE</promise>' in your final line."
 AGENT_PROMPT+=" If persona persistence was lost, redeploy the previously active Hero from the session context without extra confirm."
 printf '{"decision":"block","reason":"%s","systemMessage":"%s"}\n' \
   "$(echo "$AGENT_PROMPT PROMPT - $PROMPT" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')" "LOOP ($NEXT/$MAX)"
