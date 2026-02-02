@@ -2,12 +2,49 @@ import { SweAgentInteraction } from "./utils/SweAgentInteraction";
 import { CopilotClient } from "@github/copilot-sdk";
 import type { CopilotSession } from "@github/copilot-sdk";
 
+// Parse CLI arguments for flags (--prompt with value, --debug as boolean)
+const parseCliArgs = (flag: string) => {
+  const index = process.argv.indexOf(flag);
+  if (index === -1) return null;
+
+  // For flags with values (like --prompt)
+  if (
+    index + 1 < process.argv.length &&
+    !process.argv[index + 1].startsWith("--")
+  ) {
+    return process.argv[index + 1];
+  }
+
+  // For boolean flags (like --debug)
+  return flag === "--debug" ? true : null;
+};
+
+// Load and parse YAML prompt file
+const loadPromptFile = async (filePath: any) => {
+  if (typeof filePath !== "string") {
+    console.error("Prompt file path must be a string.");
+    process.exit(1);
+  }
+  try {
+    const content = await Bun.file(filePath).text();
+    const parsed = Bun.YAML.parse(content);
+    return parsed;
+  } catch (error) {
+    console.error(`Failed to load prompt file: ${filePath}`);
+    console.error(error);
+    process.exit(1);
+  }
+};
+
 const client = new CopilotClient();
 let session: CopilotSession | undefined;
 
-const initSession = async (systemPrompt: string) => {
+const initSession = async (systemPrompt: string, options: any = {}) => {
+  const { model = "gpt-4.1", mcpServers } = options;
+  console.log(`🚀 Initializing session with model: ${model}...`);
   session = await client.createSession({
-    model: "gpt-4.1",
+    model,
+    mcpServers,
     streaming: true,
     systemMessage: {
       mode: "append", // [append | replace] - whether to append to or replace the default system SDK security guardrails
@@ -252,10 +289,43 @@ const initSession = async (systemPrompt: string) => {
 
 const aiCommand = async (prompt: any, systemPrompt: string) => {
   if (null == session) {
-    await initSession(systemPrompt);
+    let options: any = {};
+    if (promptFile) {
+      options = await loadPromptFile(promptFile);
+    }
+    await initSession(systemPrompt, options);
   }
-  const response = await session!.sendAndWait({ prompt });
-  return response?.data?.content || "";
+  try {
+    const response = await session!.sendAndWait({ prompt }, 300000); // 5 minute timeout
+    return response?.data?.content || "";
+  } catch (error) {
+    console.error(
+      "Error during AI command execution:",
+      (error as Error).message
+    );
+    return "";
+  }
 };
 
-new SweAgentInteraction({ aiCommand }).init("auto", "say hi one time and exit loop");
+// Main execution
+const main = async () => {
+  let initialPrompt = "say hi one time and exit loop";
+  let promptConfig: any;
+
+  if (promptFile) {
+    console.log(`🤖 Load prompt file ${promptFile}...`);
+    promptConfig = await loadPromptFile(promptFile);
+    initialPrompt =
+      promptConfig.prompt || promptConfig.message || initialPrompt;
+  }
+  // Use --debug flag to change mode to "confirm"
+  const mode = parseCliArgs("--debug") ? "confirm" : "auto";
+  new SweAgentInteraction({
+    aiCommand,
+    completionPromise: promptConfig.promise,
+    maxIterations: promptConfig["max-iterations"],
+  }).init(mode, initialPrompt);
+};
+
+const promptFile = parseCliArgs("--prompt");
+main();
