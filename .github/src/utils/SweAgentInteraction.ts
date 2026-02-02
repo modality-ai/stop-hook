@@ -1,8 +1,8 @@
 import readline from "node:readline";
 
 enum Mode {
-  Auto = "auto",
-  Confirm = "confirm",
+  YOLO = "yolo",
+  CONFIRM = "confirm",
 }
 
 const Colors = {
@@ -27,7 +27,7 @@ const DEFAULT_FUNC = async (val: any, _systePromp: string) => val;
 const DEFAULT_SYSTEM_PROMPT = `You're execute on PDCA (Plan-Do-Check-Act) LOOP ([CURRENT] / [MAX]) to achieve mission. When you get perfect fit, output '<promise>[PROMISE]</promise>' in your final line.`;
 
 class SweAgent {
-  protected mode: Mode = Mode.Confirm;
+  protected mode: Mode = Mode.CONFIRM;
   protected pause = false;
   protected iteration = 0;
   private aiCommand = DEFAULT_FUNC;
@@ -105,13 +105,13 @@ class SweAgent {
           console.log(
             `${Colors.green}Promise detected: ${promise}${Colors.reset}`
           );
-          if (this.mode === Mode.Auto) {
+          if (this.mode === Mode.YOLO) {
             return await this.step("exit");
           }
         }
       }
     }
-    if (this.mode === Mode.Auto) {
+    if (this.mode === Mode.YOLO) {
       if (this.iteration >= this.maxIterations) {
         console.log(
           `${Colors.yellow}Max iterations reached (${this.maxIterations}). Exiting.${Colors.reset}`
@@ -163,7 +163,7 @@ export class SweAgentInteraction extends SweAgent {
     this.rl.on("SIGINT", () => {
       clearTimeout(sigintTimer);
       console.log(`\n${Colors.yellow}Use /q to quit${Colors.reset}`);
-      if (this.mode === Mode.Auto) {
+      if (this.mode === Mode.YOLO) {
         if (!this.pause) {
           this.pause = true;
           sigintTimer = setTimeout(() => this.run(), 1000);
@@ -199,7 +199,7 @@ export class SweAgentInteraction extends SweAgent {
 
   private printHelp(): void {
     console.log(
-      `${Colors.cyan}Commands: /h=help /a=auto /c=confirm /q=quit${Colors.reset}`
+      `${Colors.cyan}Commands: /h=help /a=yolo /c=confirm /q=quit${Colors.reset}`
     );
     console.log();
   }
@@ -232,7 +232,7 @@ export class SweAgentInteraction extends SweAgent {
     if (input.toLowerCase() === "exit") {
       this.isQuitting = true;
       this.rl.close();
-    } else if (this.mode === Mode.Confirm) {
+    } else if (this.mode === Mode.CONFIRM) {
       await this.handleConfirmMode(input);
     } else {
       await super.step(input);
@@ -240,10 +240,14 @@ export class SweAgentInteraction extends SweAgent {
   }
 
   async run(userPrompt?: string): Promise<void> {
-    this.printHelp();
+    let init = false;
     while (true) {
       try {
-        const prompt = `${Colors.green}[${this.mode === Mode.Auto ? "auto" : "input"}]>${Colors.reset} `;
+        if (!init && !userPrompt) {
+          this.printHelp();
+          init = true;
+        }
+        const prompt = `${Colors.green}[${this.mode === Mode.YOLO ? "yolo" : "input"}]>${Colors.reset} `;
         const input = userPrompt || (await this.ask(prompt));
         userPrompt = undefined;
 
@@ -254,11 +258,11 @@ export class SweAgentInteraction extends SweAgent {
               this.printHelp();
               break;
             case "a":
-              this.mode = Mode.Auto;
-              console.log(`${Colors.magenta}Auto mode${Colors.reset}`);
+              this.mode = Mode.YOLO;
+              console.log(`${Colors.magenta}YOLO mode${Colors.reset}`);
               break;
             case "c":
-              this.mode = Mode.Confirm;
+              this.mode = Mode.CONFIRM;
               console.log(`${Colors.magenta}Confirm mode${Colors.reset}`);
               break;
             case "q":
@@ -282,4 +286,4 @@ export class SweAgentInteraction extends SweAgent {
   }
 }
 
-// new SweAgentInteraction().init("auto", "test");
+// new SweAgentInteraction().init("yolo", "test");

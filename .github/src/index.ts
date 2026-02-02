@@ -290,8 +290,8 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
 const aiCommand = async (prompt: any, systemPrompt: string) => {
   if (null == session) {
     let options: any = {};
-    if (promptFile) {
-      options = await loadPromptFile(promptFile);
+    if (configFile) {
+      options = await loadPromptFile(configFile);
     }
     await initSession(systemPrompt, options);
   }
@@ -307,19 +307,49 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
   }
 };
 
+const printHelp = () => {
+  console.log(`
+Usage: bun ./src/index.ts [options]
+
+Options:
+  --config <file>   Load configuration from YAML file
+  -p <prompt>       Directly input a prompt
+  --debug          Use confirm mode instead of yolo mode
+
+Examples:
+  bun ./src/index.ts --config config.yaml
+  bun ./src/index.ts -p "your prompt here"
+  bun ./src/index.ts --config config.yaml --debug
+  `);
+  process.exit(0);
+};
+
+let configFile: any;
+let directPrompt: any;
+
 // Main execution
 const main = async () => {
-  let initialPrompt = "say hi one time and exit loop";
-  let promptConfig: any;
+  configFile = parseCliArgs("--config");
+  directPrompt = parseCliArgs("-p");
 
-  if (promptFile) {
-    console.log(`🤖 Load prompt file ${promptFile}...`);
-    promptConfig = await loadPromptFile(promptFile);
+  if (!configFile && !directPrompt) {
+    printHelp();
+  }
+
+  let initialPrompt = "say hi one time and exit loop";
+  let promptConfig: any = {};
+
+  if (directPrompt) {
+    initialPrompt = directPrompt;
+  } else if (configFile) {
+    console.log(`🤖 Load config file ${configFile}...`);
+    console.log();
+    promptConfig = await loadPromptFile(configFile);
     initialPrompt =
       promptConfig.prompt || promptConfig.message || initialPrompt;
   }
   // Use --debug flag to change mode to "confirm"
-  const mode = parseCliArgs("--debug") ? "confirm" : "auto";
+  const mode = parseCliArgs("--debug") ? "confirm" : "yolo";
   new SweAgentInteraction({
     aiCommand,
     completionPromise: promptConfig.promise,
@@ -327,5 +357,4 @@ const main = async () => {
   }).init(mode, initialPrompt);
 };
 
-const promptFile = parseCliArgs("--prompt");
 main();
