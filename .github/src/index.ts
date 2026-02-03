@@ -206,7 +206,7 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
     if (event.type === "assistant.turn_start") {
       // Agent starts processing - beginning of step-by-step execution
       console.log(
-        `\n─── Assistant Turn ${event.data.turnId?.slice(0, 8) || "unknown"} ───`
+        `\n─── Assistant ${gSessionId} Turn ${event.data.turnId?.slice(0, 8) || "unknown"} ───`
       );
     }
 
