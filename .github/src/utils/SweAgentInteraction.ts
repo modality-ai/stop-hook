@@ -81,11 +81,9 @@ class SweAgent {
     console.log(
       `${Colors.blue}Assistant (${this.iteration} / ${this.maxIterations}): ${aiCommand}${Colors.reset}`
     );
-    console.log();
     console.log(
-      `${Colors.magenta}----------------------------------------------------${Colors.reset}`
+      `\n${Colors.magenta}----------------------------------------------------${Colors.reset}\n`
     );
-    console.log();
     if (null != this.executeCommand) {
       aiCommand = await callback(aiCommand);
       if (this.pause) return;
@@ -165,6 +163,7 @@ export class SweAgentInteraction extends SweAgent {
     this.rl.on("SIGINT", () => {
       clearTimeout(sigintTimer);
       console.log(`\n${Colors.yellow}Use /q to quit${Colors.reset}`);
+      process.emit("SIGINT", "SIGINT");
       if (this.mode === Mode.YOLO) {
         if (!this.pause) {
           this.pause = true;
@@ -201,9 +200,8 @@ export class SweAgentInteraction extends SweAgent {
 
   private printHelp(): void {
     console.log(
-      `${Colors.cyan}Commands: /h=help /a=yolo /c=confirm /q=quit${Colors.reset}`
+      `\n${Colors.cyan}Commands: /h=help /a=yolo /c=confirm /q=quit${Colors.reset}\n`
     );
-    console.log();
   }
 
   private async promptConfirmation(): Promise<string> {

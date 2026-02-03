@@ -1,8 +1,7 @@
 #!/usr/bin/env bun
 
 import { SweAgentInteraction } from "./utils/SweAgentInteraction";
-import { CopilotClient } from "@github/copilot-sdk";
-import type { CopilotSession } from "@github/copilot-sdk";
+import { CopilotClient, type CopilotSession } from "@github/copilot-sdk";
 
 // Global session ID - Snowflake-like ID (distributed system friendly)
 const gSessionId = `${(Date.now() << 10) | ((Math.random() * 1024) | 0)}`;
@@ -41,25 +40,30 @@ const loadPromptFile = async (filePath: any) => {
   }
 };
 
-const setupSignalHandlers = (client: CopilotClient): (() => void) => {
-  let stopping = false;
-
-  const handler = async (signal: NodeJS.Signals) => {
-    if (stopping) return;
-    stopping = true;
-
-    console.log(`\nReceived ${signal}, shutting down...`);
+const setupSignalHandlers = (
+  client: CopilotClient,
+  getSession: () => CopilotSession | undefined
+): (() => void) => {
+  let stopping: boolean = false;
+  const handler = async (_signal: NodeJS.Signals) => {
+    const activeSession = getSession();
+    if (activeSession && !stopping) {
+      await activeSession.abort(); // Cancel in-progress operation
+      stopping = true;
+    }
 
     try {
-      const timeout = new Promise<never>((_, reject) =>
+      const timeout = new Promise<Error[]>((_, reject) =>
         setTimeout(() => reject(new Error("Timeout")), 5000)
       );
-      await Promise.race([client.stop(), timeout]);
+
+      const errors = await Promise.race([client.stop(), timeout]);
+      if (errors.length > 0) {
+        console.error("Cleanup errors:", errors);
+      }
     } catch {
       await client.forceStop();
     }
-
-    process.exit(signal === "SIGINT" ? 130 : 143);
   };
 
   process.on("SIGINT", handler);
@@ -73,7 +77,6 @@ const setupSignalHandlers = (client: CopilotClient): (() => void) => {
 
 const client = new CopilotClient();
 let session: CopilotSession | undefined;
-setupSignalHandlers(client);
 
 const initSession = async (systemPrompt: string, options: any = {}) => {
   const { model = "gpt-4.1", mcpServers } = options;
@@ -104,7 +107,6 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
       sessionId: gSessionId,
     });
   }
-
   // ============================================================================
   // Session Event Listener - Comprehensive Event Tracking
   // ============================================================================
@@ -430,6 +432,7 @@ const main = async () => {
     completionPromise,
     maxIterations,
   }).init(mode, initialPrompt);
+  setupSignalHandlers(client, () => session);
 };
 
 main();
