@@ -4,6 +4,9 @@ import { SweAgentInteraction } from "./utils/SweAgentInteraction";
 import { CopilotClient } from "@github/copilot-sdk";
 import type { CopilotSession } from "@github/copilot-sdk";
 
+// Global session ID - Snowflake-like ID (distributed system friendly)
+const gSessionId = `${(Date.now() << 10) | ((Math.random() * 1024) | 0)}`;
+
 // Parse CLI arguments for flags (--prompt with value, --debug as boolean)
 const parseCliArgs = (flag: string) => {
   const index = process.argv.indexOf(flag);
@@ -70,21 +73,29 @@ const setupSignalHandlers = (client: CopilotClient): (() => void) => {
 
 const client = new CopilotClient();
 let session: CopilotSession | undefined;
+setupSignalHandlers(client);
 
 const initSession = async (systemPrompt: string, options: any = {}) => {
   const { model = "gpt-4.1", mcpServers } = options;
   console.log(`🚀 Initializing session with model: ${model}...`);
-  await new Promise((resolve) => setTimeout(resolve, 5000));
-  setupSignalHandlers(client);
-  session = await client.createSession({
+  console.log(`📌 Session ID: ${gSessionId}`);
+  const sessionOptoins = {
     model,
     mcpServers,
     streaming: true,
     systemMessage: {
-      mode: "append", // [append | replace] - whether to append to or replace the default system SDK security guardrails
+      mode: "append" as const, // [append | replace] - whether to append to or replace the default system SDK security guardrails
       content: systemPrompt,
     },
-  });
+  };
+  if (null == session) {
+    session = await client.createSession({
+      ...sessionOptoins,
+      sessionId: gSessionId,
+    });
+  } else {
+    session = await client.resumeSession(gSessionId, sessionOptoins);
+  }
 
   // ============================================================================
   // Session Event Listener - Comprehensive Event Tracking
@@ -232,7 +243,9 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
 
     if (event.type === "tool.execution_partial_result") {
       // Partial result from tool (before completion)
-      console.log(`   📦 Partial Output: ${event.data.partialOutput?.split('\n').slice(-5).join('\n')}`);
+      console.log(
+        `   📦 Partial Output: ${event.data.partialOutput?.split("\n").slice(-5).join("\n")}`
+      );
     }
 
     if (event.type === "tool.execution_complete") {
@@ -278,11 +291,6 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
     // ASSISTANT RESPONSE - Streaming output to user
     // ─────────────────────────────────────────────────────────────
 
-    if (event.type === "assistant.message") {
-      // Complete message from agent
-      console.log(`\n${event.data.content}`);
-    }
-
     if (event.type === "assistant.message_delta") {
       // Streaming response content (write without newline)
       process.stdout.write(event.data.deltaContent);
@@ -322,18 +330,18 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
 };
 
 const aiCommand = async (prompt: any, systemPrompt: string) => {
-  if (null == session) {
-    await initSession(systemPrompt, promptConfig);
-  }
+  await initSession(systemPrompt, promptConfig);
   try {
     const timeoutMs = 86400000 * 7; // 7 day
     const response = await session!.sendAndWait({ prompt }, timeoutMs);
+    session?.destroy();
     return response?.data?.content || "";
   } catch (error) {
     console.error(
       "Error during AI command execution:",
       (error as Error).message
     );
+    session?.destroy();
     return "";
   }
 };
