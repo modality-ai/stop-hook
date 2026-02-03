@@ -232,7 +232,7 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
 
     if (event.type === "tool.execution_partial_result") {
       // Partial result from tool (before completion)
-      console.log(`   📦 Partial: ${event.data.partialOutput?.slice(0, 100)}`);
+      console.log(`   📦 Partial Output: ${event.data.partialOutput?.split('\n').slice(-5).join('\n')}`);
     }
 
     if (event.type === "tool.execution_complete") {
