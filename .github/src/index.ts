@@ -38,12 +38,43 @@ const loadPromptFile = async (filePath: any) => {
   }
 };
 
+const setupSignalHandlers = (client: CopilotClient): (() => void) => {
+  let stopping = false;
+
+  const handler = async (signal: NodeJS.Signals) => {
+    if (stopping) return;
+    stopping = true;
+
+    console.log(`\nReceived ${signal}, shutting down...`);
+
+    try {
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Timeout")), 5000)
+      );
+      await Promise.race([client.stop(), timeout]);
+    } catch {
+      await client.forceStop();
+    }
+
+    process.exit(signal === "SIGINT" ? 130 : 143);
+  };
+
+  process.on("SIGINT", handler);
+  process.on("SIGTERM", handler);
+
+  return () => {
+    process.off("SIGINT", handler);
+    process.off("SIGTERM", handler);
+  };
+};
+
 const client = new CopilotClient();
 let session: CopilotSession | undefined;
 
 const initSession = async (systemPrompt: string, options: any = {}) => {
   const { model = "gpt-4.1", mcpServers } = options;
   console.log(`🚀 Initializing session with model: ${model}...`);
+  setupSignalHandlers(client);
   session = await client.createSession({
     model,
     mcpServers,
@@ -291,11 +322,7 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
 
 const aiCommand = async (prompt: any, systemPrompt: string) => {
   if (null == session) {
-    let options: any = {};
-    if (configFile) {
-      options = await loadPromptFile(configFile);
-    }
-    await initSession(systemPrompt, options);
+    await initSession(systemPrompt, promptConfig);
     await new Promise((resolve) => setTimeout(resolve, 5000));
   }
   try {
@@ -337,6 +364,7 @@ Examples:
 
 // Main execution
 let configFile: any;
+let promptConfig: any = {};
 const main = async () => {
   const directPrompt: any = parseCliArgs("-p");
   const appendPrompt: any = parseCliArgs("-a");
@@ -350,7 +378,6 @@ const main = async () => {
   }
 
   let initialPrompt = "";
-  let promptConfig: any = {};
 
   if (configFile) {
     console.log(`🤖 Load config file ${configFile}...`);
