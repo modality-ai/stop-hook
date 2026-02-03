@@ -318,6 +318,7 @@ Usage: copilot-loop [options]
 Options:
   --config <file>     Load configuration from YAML file
   -p <prompt>         Directly input a prompt
+  -a <prompt>         Append a prompt to existing prompt
   --model <model>     Specify the AI model to use
   --max <iterations>  Set maximum iterations for agent loop
   --promise <phrase>  Set completion promise phrase
@@ -326,6 +327,7 @@ Options:
 Examples:
   copilot-loop --config config.yaml
   copilot-loop -p "your prompt here"
+  copilot-loop -a "additional prompt text"
   copilot-loop --config config.yaml --debug
   copilot-loop --model gpt-4.1 --max 10 --promise "Task completed"
   copilot-loop -p "your prompt" --model claude-3-sonnet --max 5
@@ -333,19 +335,15 @@ Examples:
   process.exit(0);
 };
 
-let configFile: any;
-let directPrompt: any;
-let modelOverride: any;
-let maxIterationsOverride: any;
-let promiseOverride: any;
-
 // Main execution
+let configFile: any;
 const main = async () => {
+  const directPrompt: any = parseCliArgs("-p");
+  const appendPrompt: any = parseCliArgs("-a");
+  const maxIterationsOverride: any = parseCliArgs("--max");
+  const promiseOverride = parseCliArgs("--promise");
+  const modelOverride = parseCliArgs("--model");
   configFile = parseCliArgs("--config");
-  directPrompt = parseCliArgs("-p");
-  modelOverride = parseCliArgs("--model");
-  maxIterationsOverride = parseCliArgs("--max");
-  promiseOverride = parseCliArgs("--promise");
 
   if (!configFile && !directPrompt && !parseCliArgs("--debug")) {
     printHelp();
@@ -363,7 +361,10 @@ const main = async () => {
   }
   if (directPrompt) {
     initialPrompt = directPrompt;
+  } else if (appendPrompt) {
+    initialPrompt += "\n" + appendPrompt;
   }
+
   // Use --debug flag to change mode to "confirm"
   const mode = parseCliArgs("--debug") ? "confirm" : "yolo";
 
