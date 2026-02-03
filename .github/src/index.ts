@@ -74,6 +74,7 @@ let session: CopilotSession | undefined;
 const initSession = async (systemPrompt: string, options: any = {}) => {
   const { model = "gpt-4.1", mcpServers } = options;
   console.log(`🚀 Initializing session with model: ${model}...`);
+  await new Promise((resolve) => setTimeout(resolve, 5000));
   setupSignalHandlers(client);
   session = await client.createSession({
     model,
@@ -323,7 +324,6 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
 const aiCommand = async (prompt: any, systemPrompt: string) => {
   if (null == session) {
     await initSession(systemPrompt, promptConfig);
-    await new Promise((resolve) => setTimeout(resolve, 5000));
   }
   try {
     const timeoutMs = 86400000 * 7; // 7 day
