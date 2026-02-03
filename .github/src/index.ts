@@ -299,7 +299,7 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
     await new Promise((resolve) => setTimeout(resolve, 5000));
   }
   try {
-    const timeoutMs = 86400000 * 7; // 7 day 
+    const timeoutMs = 86400000 * 7; // 7 day
     const response = await session!.sendAndWait({ prompt }, timeoutMs);
     return response?.data?.content || "";
   } catch (error) {
@@ -316,25 +316,36 @@ const printHelp = () => {
 Usage: copilot-loop [options]
 
 Options:
-  --config <file>   Load configuration from YAML file
-  -p <prompt>       Directly input a prompt
-  --debug          Use confirm mode instead of yolo mode
+  --config <file>     Load configuration from YAML file
+  -p <prompt>         Directly input a prompt
+  --model <model>     Specify the AI model to use
+  --max <iterations>  Set maximum iterations for agent loop
+  --promise <phrase>  Set completion promise phrase
+  --debug             Use confirm mode instead of yolo mode
 
 Examples:
   copilot-loop --config config.yaml
   copilot-loop -p "your prompt here"
   copilot-loop --config config.yaml --debug
+  copilot-loop --model gpt-4.1 --max 10 --promise "Task completed"
+  copilot-loop -p "your prompt" --model claude-3-sonnet --max 5
   `);
   process.exit(0);
 };
 
 let configFile: any;
 let directPrompt: any;
+let modelOverride: any;
+let maxIterationsOverride: any;
+let promiseOverride: any;
 
 // Main execution
 const main = async () => {
   configFile = parseCliArgs("--config");
   directPrompt = parseCliArgs("-p");
+  modelOverride = parseCliArgs("--model");
+  maxIterationsOverride = parseCliArgs("--max");
+  promiseOverride = parseCliArgs("--promise");
 
   if (!configFile && !directPrompt) {
     printHelp();
@@ -343,21 +354,37 @@ const main = async () => {
   let initialPrompt = "say hi one time and exit loop";
   let promptConfig: any = {};
 
-  if (directPrompt) {
-    initialPrompt = directPrompt;
-  } else if (configFile) {
+  if (configFile) {
     console.log(`🤖 Load config file ${configFile}...`);
     console.log();
     promptConfig = await loadPromptFile(configFile);
     initialPrompt =
       promptConfig.prompt || promptConfig.message || initialPrompt;
   }
+  if (directPrompt) {
+    initialPrompt = directPrompt;
+  }
   // Use --debug flag to change mode to "confirm"
   const mode = parseCliArgs("--debug") ? "confirm" : "yolo";
+
+  // Apply CLI overrides to promptConfig
+  if (modelOverride) {
+    promptConfig.model = modelOverride;
+  }
+  if (maxIterationsOverride) {
+    promptConfig["max-iterations"] = parseInt(maxIterationsOverride);
+  }
+  if (promiseOverride) {
+    promptConfig.promise = promiseOverride;
+  }
+
+  const completionPromise = promptConfig.promise;
+  const maxIterations = promptConfig["max-iterations"];
+
   new SweAgentInteraction({
     aiCommand,
-    completionPromise: promptConfig.promise,
-    maxIterations: promptConfig["max-iterations"],
+    completionPromise,
+    maxIterations,
   }).init(mode, initialPrompt);
 };
 
