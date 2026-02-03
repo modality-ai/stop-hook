@@ -88,13 +88,21 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
       content: systemPrompt,
     },
   };
-  if (null == session) {
+
+  try {
+    if (null == session) {
+      session = await client.createSession({
+        ...sessionOptoins,
+        sessionId: gSessionId,
+      });
+    } else {
+      session = await client.resumeSession(gSessionId, sessionOptoins);
+    }
+  } catch (error) {
     session = await client.createSession({
       ...sessionOptoins,
       sessionId: gSessionId,
     });
-  } else {
-    session = await client.resumeSession(gSessionId, sessionOptoins);
   }
 
   // ============================================================================
