@@ -347,11 +347,11 @@ const main = async () => {
   maxIterationsOverride = parseCliArgs("--max");
   promiseOverride = parseCliArgs("--promise");
 
-  if (!configFile && !directPrompt) {
+  if (!configFile && !directPrompt && !parseCliArgs("--debug")) {
     printHelp();
   }
 
-  let initialPrompt = "say hi one time and exit loop";
+  let initialPrompt = "";
   let promptConfig: any = {};
 
   if (configFile) {
