@@ -344,6 +344,10 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
       // ─────────────────────────────────────────────────────────────
       // ASSISTANT RESPONSE - Streaming output to user
       // ─────────────────────────────────────────────────────────────
+ 
+      if (event.type === "assistant.message") {
+        logger.store("log", `\n💭 ASSISTANT:\n${event.data.content}`);
+      }
 
       if (event.type === "assistant.message_delta") {
         // Streaming response content (write without newline)
@@ -426,7 +430,6 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
       }),
     ]);
     const message = response?.data?.content || "";
-    logger.store("log", message);
     return message;
   } catch (error) {
     if (abortController.signal.aborted) {
