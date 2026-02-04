@@ -419,7 +419,7 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
 };
 
 const printHelp = () => {
-  logger.log(`
+  process.stdout.write(`
 Usage: copilot-loop [options]
 
 Options:
@@ -465,7 +465,6 @@ const main = async () => {
 
   if (configFile) {
     logger.log(`🤖 Load config file ${configFile}...`);
-    logger.log();
     Object.assign(promptConfig, await loadPromptFile(configFile));
     initialPrompt = promptConfig.prompt || initialPrompt;
   }
