@@ -21,7 +21,7 @@ const logger = {
 };
 
 // Global session ID - Snowflake-like ID (distributed system friendly)
-let gSessionId = `${(Date.now() << 10) | ((Math.random() * 1024) | 0)}`;
+let gSessionId = `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
 
 // Parse CLI arguments for flags (--prompt with value, --debug as boolean)
 const parseCliArgs = (flag: string) => {
@@ -412,10 +412,10 @@ Options:
   --config <file>     Load configuration from YAML file
   -p <prompt>         Directly input a prompt
   -a <prompt>         Append a prompt to existing prompt
+  -s <id>             Specify session ID for resuming sessions
   --model <model>     Specify the AI model to use
   --max <iterations>  Set maximum iterations for agent loop
   --promise <phrase>  Set completion promise phrase
-  --session-id <id>   Specify session ID for resuming sessions
   --timeout-ms <ms>   Set timeout in milliseconds (default: 7 days)
   --debug             Use confirm mode instead of yolo mode
 
@@ -436,10 +436,10 @@ const promptConfig: any = {};
 const main = async () => {
   const directPrompt: any = parseCliArgs("-p");
   const appendPrompt: any = parseCliArgs("-a");
+  const sessionOverride = parseCliArgs("-s");
   const maxIterationsOverride: any = parseCliArgs("--max");
   const promiseOverride = parseCliArgs("--promise");
   const modelOverride = parseCliArgs("--model");
-  const sessionOverride = parseCliArgs("--session-id");
   const timeout = parseCliArgs("--timeout") || 86400 * 7; // 7 day
   configFile = parseCliArgs("--config");
 
