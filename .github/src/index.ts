@@ -344,7 +344,7 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
       // ─────────────────────────────────────────────────────────────
       // ASSISTANT RESPONSE - Streaming output to user
       // ─────────────────────────────────────────────────────────────
- 
+
       if (event.type === "assistant.message") {
         logger.store("log", `\n💭 ASSISTANT:\n${event.data.content}`);
       }
@@ -395,7 +395,7 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
   const abortController = new AbortController();
 
   // Periodic server health check via ping
-  const healthCheckIntervalMs = 30000; // 30 seconds
+  const healthCheckIntervalMs = 15000; // 15 seconds
   const pingTimeoutMs = 5000; // 5 second timeout for ping response
   const healthCheckHandle = setInterval(async () => {
     if (abortController.signal.aborted || !session) return;
