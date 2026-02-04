@@ -6,16 +6,18 @@ import { appendFileSync } from "fs";
 
 // Simple logger wrapper
 const logger = {
+  store: (logType: string, message: string) => {
+    const filePath = `/tmp/copilot-loop-${gSessionId}-${logType}.txt`;
+    appendFileSync(filePath, `${message}\n`);
+  },
+
   log: (message?: any, ...args: any[]) => {
-    appendFileSync(`/tmp/copilot-loop-${gSessionId}-log.txt`, `${message}\n`);
+    logger.store("log", message);
     console.log(message, ...args);
   },
 
   error: (message?: any, ...args: any[]) => {
-    appendFileSync(
-      `/tmp/copilot-loop-${gSessionId}-error.txt`,
-      `[ERROR] ${message}\n`
-    );
+    logger.store("error", message);
     console.error(message, ...args);
   },
 };
@@ -207,200 +209,212 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
   // ============================================================================
 
   session!.on((event) => {
-    // ─────────────────────────────────────────────────────────────
-    // SESSION LIFECYCLE EVENTS
-    // ─────────────────────────────────────────────────────────────
+    try {
+      // ─────────────────────────────────────────────────────────────
+      // SESSION LIFECYCLE EVENTS
+      // ─────────────────────────────────────────────────────────────
 
-    if (event.type === "session.start") {
-      // Session created - agent is ready
-      logger.log(`\n📍 Session started: ${event.data.sessionId}`);
-    }
-
-    if (event.type === "session.idle") {
-      // Session idle - turn complete, waiting for next input
-      if (process.stdout.isTTY) process.stdout.write("\n");
-    }
-
-    if (event.type === "session.error") {
-      // Session encountered an error
-      logger.log(`\n❌ Session error: ${event.data.message}`);
-    }
-
-    if (event.type === "session.info") {
-      // Session information (debugging info)
-      logger.log(`\nℹ️  Session info: ${event.data.message}`);
-    }
-
-    if (event.type === "session.usage_info") {
-      // Token usage and cost information
-      if (event.data.currentTokens || event.data.tokenLimit) {
-        logger.log(
-          `\n📊 Usage - Current: ${event.data.currentTokens}, Limit: ${event.data.tokenLimit}`
-        );
+      if (event.type === "session.start") {
+        // Session created - agent is ready
+        logger.log(`\n📍 Session started: ${event.data.sessionId}`);
       }
-    }
 
-    // ─────────────────────────────────────────────────────────────
-    // TURN LIFECYCLE - Shows agent reasoning flow
-    // ─────────────────────────────────────────────────────────────
-
-    if (event.type === "assistant.turn_start") {
-      // Agent starts processing - beginning of step-by-step execution
-      logger.log(
-        `\n─── Assistant ${gSessionId} Turn ${event.data.turnId?.slice(0, 8) || "unknown"} ───`
-      );
-    }
-
-    if (event.type === "assistant.turn_end") {
-      // Turn complete
-      logger.log(`\n✓ Turn ended (${event.data.turnId?.slice(0, 8)})`);
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // AGENT DECISION MAKING (What will the agent do?)
-    // ─────────────────────────────────────────────────────────────
-
-    if (event.type === "assistant.intent") {
-      // Agent deciding what action to take next
-      logger.log(`\n🎯 Agent Intent: ${event.data.intent}`);
-    }
-
-    if (event.type === "assistant.reasoning") {
-      // Complete reasoning from agent
-      logger.log(`\n💭 Reasoning:\n${event.data.content}`);
-    }
-
-    if (event.type === "assistant.reasoning_delta") {
-      // Streaming reasoning content
-      process.stdout.write(event.data.deltaContent);
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // TOOL EXECUTION - Shows what actions agent is taking
-    // ─────────────────────────────────────────────────────────────
-
-    if (event.type === "tool.execution_start") {
-      // Tool execution starting (file edits, reads, bash commands, etc.)
-      logger.log(`\n🔧 Executing tool: ${event.data.toolName}`);
-      if (event.data.arguments) {
-        logger.log(`   Arguments: ${JSON.stringify(event.data.arguments)}`);
+      if (event.type === "session.idle") {
+        // Session idle - turn complete, waiting for next input
+        if (process.stdout.isTTY) process.stdout.write("\n");
       }
-    }
 
-    if (event.type === "tool.execution_progress") {
-      // Progress updates during tool execution (streaming)
-      logger.log(`   ⏳ ${event.data.progressMessage}`);
-    }
+      if (event.type === "session.error") {
+        // Session encountered an error
+        logger.log(`\n❌ Session error: ${event.data.message}`);
+      }
 
-    if (event.type === "tool.execution_partial_result") {
-      // Partial result from tool (before completion)
-      logger.log(
-        `   📦 Partial Output: ${event.data.partialOutput?.split("\n").slice(-5).join("\n")}`
-      );
-    }
+      if (event.type === "session.info") {
+        // Session information (debugging info)
+        logger.log(`\nℹ️  Session info: ${event.data.message}`);
+      }
 
-    if (event.type === "tool.execution_complete") {
-      // Tool execution finished
-      if (event.data.success) {
-        logger.log(`   ✓ Tool completed`);
-        if (event.data.result?.content) {
-          const preview = event.data.result.content.slice(0, 150);
+      if (event.type === "session.usage_info") {
+        // Token usage and cost information
+        if (event.data.currentTokens || event.data.tokenLimit) {
           logger.log(
-            `   Result: ${preview}${event.data.result.content.length > 150 ? "..." : ""}`
+            `\n📊 Usage - Current: ${event.data.currentTokens}, Limit: ${event.data.tokenLimit}`
           );
         }
-      } else {
-        logger.log(`   ✗ Tool failed: ${event.data.error?.message}`);
       }
-    }
 
-    // ─────────────────────────────────────────────────────────────
-    // SUBAGENT EXECUTION - For delegated/agentic workflows
-    // ─────────────────────────────────────────────────────────────
+      // ─────────────────────────────────────────────────────────────
+      // TURN LIFECYCLE - Shows agent reasoning flow
+      // ─────────────────────────────────────────────────────────────
 
-    if (event.type === "subagent.started") {
-      // Subagent (delegated agent) started - recursive agentic workflows
-      logger.log(`\n🤖 Subagent started: ${event.data.agentDisplayName}`);
-    }
-
-    if (event.type === "subagent.selected") {
-      // Subagent was selected for task
-      logger.log(`   → Selected agent: ${event.data.agentName}`);
-    }
-
-    if (event.type === "subagent.completed") {
-      // Subagent finished successfully
-      logger.log(`   ✓ Subagent completed: ${event.data.agentName}`);
-    }
-
-    if (event.type === "subagent.failed") {
-      // Subagent encountered error
-      logger.log(`   ✗ Subagent failed: ${event.data.error}`);
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // ASSISTANT RESPONSE - Streaming output to user
-    // ─────────────────────────────────────────────────────────────
-
-    if (event.type === "assistant.message_delta") {
-      // Streaming response content (write without newline)
-      process.stdout.write(event.data.deltaContent);
-    }
-
-    if (event.type === "assistant.usage") {
-      // Usage info for this message
-      if (event.data.outputTokens) {
-        logger.log(`   [Tokens used: ${event.data.outputTokens}]`);
+      if (event.type === "assistant.turn_start") {
+        // Agent starts processing - beginning of step-by-step execution
+        logger.log(
+          `\n─── Assistant ${gSessionId} Turn ${event.data.turnId?.slice(0, 8) || "unknown"} ───`
+        );
       }
-    }
 
-    // ─────────────────────────────────────────────────────────────
-    // OTHER EVENTS - Less common but useful for debugging
-    // ─────────────────────────────────────────────────────────────
+      if (event.type === "assistant.turn_end") {
+        // Turn complete
+        logger.log(`\n✓ Turn ended (${event.data.turnId?.slice(0, 8)})`);
+      }
 
-    if (event.type === "hook.start") {
-      // Webhook/hook started
-      logger.log(`\n🪝 Hook started: ${event.data.hookType}`);
-    }
+      // ─────────────────────────────────────────────────────────────
+      // AGENT DECISION MAKING (What will the agent do?)
+      // ─────────────────────────────────────────────────────────────
 
-    if (event.type === "hook.end") {
-      // Webhook/hook completed
-      logger.log(`   ✓ Hook completed: ${event.data.hookType}`);
-    }
+      if (event.type === "assistant.intent") {
+        // Agent deciding what action to take next
+        logger.log(`\n🎯 Agent Intent: ${event.data.intent}`);
+      }
 
-    if (event.type === "abort") {
-      // Operation was aborted
-      logger.log(`\n⛔ Operation aborted: ${event.data.reason}`);
-    }
+      if (event.type === "assistant.reasoning") {
+        // Complete reasoning from agent
+        logger.store("log", `\n💭 Reasoning:\n${event.data.content}`);
+      }
 
-    if (event.type === "session.model_change") {
-      // Model was changed
-      logger.log(`\n🔄 Model changed to: ${event.data.newModel}`);
+      if (event.type === "assistant.reasoning_delta") {
+        // Streaming reasoning content
+        process.stdout.write(event.data.deltaContent);
+      }
+
+      // ─────────────────────────────────────────────────────────────
+      // TOOL EXECUTION - Shows what actions agent is taking
+      // ─────────────────────────────────────────────────────────────
+
+      if (event.type === "tool.execution_start") {
+        // Tool execution starting (file edits, reads, bash commands, etc.)
+        logger.log(`\n🔧 Executing tool: ${event.data.toolName}`);
+        if (event.data.arguments) {
+          logger.log(`   Arguments: ${JSON.stringify(event.data.arguments)}`);
+        }
+      }
+
+      if (event.type === "tool.execution_progress") {
+        // Progress updates during tool execution (streaming)
+        logger.log(`   ⏳ ${event.data.progressMessage}`);
+      }
+
+      if (event.type === "tool.execution_partial_result") {
+        // Partial result from tool (before completion)
+        logger.log(
+          `   📦 Partial Output: ${event.data.partialOutput?.split("\n").slice(-5).join("\n")}`
+        );
+      }
+
+      if (event.type === "tool.execution_complete") {
+        // Tool execution finished
+        if (event.data.success) {
+          logger.log(`   ✓ Tool completed`);
+          if (event.data.result?.content) {
+            const preview = event.data.result.content.slice(0, 150);
+            logger.log(
+              `   Result: ${preview}${event.data.result.content.length > 150 ? "..." : ""}`
+            );
+          }
+        } else {
+          logger.log(`   ✗ Tool failed: ${event.data.error?.message}`);
+        }
+      }
+
+      // ─────────────────────────────────────────────────────────────
+      // SUBAGENT EXECUTION - For delegated/agentic workflows
+      // ─────────────────────────────────────────────────────────────
+
+      if (event.type === "subagent.started") {
+        // Subagent (delegated agent) started - recursive agentic workflows
+        logger.log(`\n🤖 Subagent started: ${event.data.agentDisplayName}`);
+      }
+
+      if (event.type === "subagent.selected") {
+        // Subagent was selected for task
+        logger.log(`   → Selected agent: ${event.data.agentName}`);
+      }
+
+      if (event.type === "subagent.completed") {
+        // Subagent finished successfully
+        logger.log(`   ✓ Subagent completed: ${event.data.agentName}`);
+      }
+
+      if (event.type === "subagent.failed") {
+        // Subagent encountered error
+        logger.log(`   ✗ Subagent failed: ${event.data.error}`);
+      }
+
+      // ─────────────────────────────────────────────────────────────
+      // ASSISTANT RESPONSE - Streaming output to user
+      // ─────────────────────────────────────────────────────────────
+
+      if (event.type === "assistant.message_delta") {
+        // Streaming response content (write without newline)
+        process.stdout.write(event.data.deltaContent);
+      }
+
+      if (event.type === "assistant.usage") {
+        // Usage info for this message
+        if (event.data.outputTokens) {
+          logger.log(`   [Tokens used: ${event.data.outputTokens}]`);
+        }
+      }
+
+      // ─────────────────────────────────────────────────────────────
+      // OTHER EVENTS - Less common but useful for debugging
+      // ─────────────────────────────────────────────────────────────
+
+      if (event.type === "hook.start") {
+        // Webhook/hook started
+        logger.log(`\n🪝 Hook started: ${event.data.hookType}`);
+      }
+
+      if (event.type === "hook.end") {
+        // Webhook/hook completed
+        logger.log(`   ✓ Hook completed: ${event.data.hookType}`);
+      }
+
+      if (event.type === "abort") {
+        // Operation was aborted
+        logger.log(`\n⛔ Operation aborted: ${event.data.reason}`);
+      }
+
+      if (event.type === "session.model_change") {
+        // Model was changed
+        logger.log(`\n🔄 Model changed to: ${event.data.newModel}`);
+      }
+    } catch (error) {
+      console.error("Event handler error:", error);
     }
   });
 };
 
 const aiCommand = async (prompt: any, systemPrompt: string) => {
   await initSession(systemPrompt, promptConfig);
+  const timeoutMs = promptConfig.timeout * 1000;
+  const timeoutHandle = setTimeout(() => {
+    if (session) {
+      logger.error("Command timeout - forcing abort");
+      session.abort?.().catch(() => {});
+    }
+  }, timeoutMs);
+
   try {
-    const response = await session!.sendAndWait(
-      { prompt },
-      promptConfig.timeout * 1000
-    );
-    session?.destroy();
+    if (!session) {
+      logger.error("Session not initialized");
+      return "";
+    }
+
+    const response = await session.sendAndWait({ prompt }, timeoutMs);
     const message = response?.data?.content || "";
-    appendFileSync(
-      `/tmp/copilot-loop-${gSessionId}-log.txt`,
-      `Assistant: ${message}\n`
-    );
+    logger.store("log", message);
     return message;
   } catch (error) {
     logger.error(
       "Error during AI command execution:",
       (error as Error).message
     );
-    session?.destroy();
     return "";
+  } finally {
+    clearTimeout(timeoutHandle);
+    session?.destroy?.().catch(() => {});
   }
 };
 
@@ -440,7 +454,7 @@ const main = async () => {
   const maxIterationsOverride: any = parseCliArgs("--max");
   const promiseOverride = parseCliArgs("--promise");
   const modelOverride = parseCliArgs("--model");
-  const timeout = parseCliArgs("--timeout") || 86400 * 7; // 7 day
+  const timeout = parseCliArgs("--timeout") || 86400 * 7; // 7 days
   configFile = parseCliArgs("--config");
 
   if (!configFile && !directPrompt && !parseCliArgs("--debug")) {
