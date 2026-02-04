@@ -49,7 +49,7 @@ const loadPromptFile = async (filePath: any) => {
   try {
     const content = await Bun.file(filePath).text();
     const parsed = Bun.YAML.parse(content);
-    return parsed;
+    return parsed || {};
   } catch (error) {
     logger.error(`Failed to load prompt file: ${filePath}`);
     logger.error(error);
@@ -385,7 +385,7 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
   try {
     const response = await session!.sendAndWait(
       { prompt },
-      promptConfig.timeoutMs
+      promptConfig.timeout * 1000
     );
     session?.destroy();
     const message = response?.data?.content || "";
@@ -432,7 +432,7 @@ Examples:
 
 // Main execution
 let configFile: any;
-let promptConfig: any = {};
+const promptConfig: any = {};
 const main = async () => {
   const directPrompt: any = parseCliArgs("-p");
   const appendPrompt: any = parseCliArgs("-a");
@@ -440,7 +440,7 @@ const main = async () => {
   const promiseOverride = parseCliArgs("--promise");
   const modelOverride = parseCliArgs("--model");
   const sessionOverride = parseCliArgs("--session-id");
-  const timeoutMs = parseCliArgs("--timeout-ms") || 86400000 * 7; // 7 day
+  const timeout = parseCliArgs("--timeout") || 86400 * 7; // 7 day
   configFile = parseCliArgs("--config");
 
   if (!configFile && !directPrompt && !parseCliArgs("--debug")) {
@@ -452,9 +452,8 @@ const main = async () => {
   if (configFile) {
     logger.log(`🤖 Load config file ${configFile}...`);
     logger.log();
-    promptConfig = await loadPromptFile(configFile);
-    initialPrompt =
-      promptConfig.prompt || promptConfig.message || initialPrompt;
+    Object.assign(promptConfig, await loadPromptFile(configFile));
+    initialPrompt = promptConfig.prompt || initialPrompt;
   }
   if (directPrompt) {
     initialPrompt = directPrompt;
@@ -478,7 +477,7 @@ const main = async () => {
   if (promiseOverride) {
     promptConfig.promise = promiseOverride;
   }
-  promptConfig.timeoutMs = timeoutMs;
+  promptConfig.timeout = timeout;
 
   const completionPromise = promptConfig.promise;
   const maxIterations = promptConfig["max-iterations"];
