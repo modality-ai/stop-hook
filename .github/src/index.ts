@@ -2,9 +2,26 @@
 
 import { SweAgentInteraction } from "./utils/SweAgentInteraction";
 import { CopilotClient, type CopilotSession } from "@github/copilot-sdk";
+import { appendFileSync } from "fs";
+
+// Simple logger wrapper
+const logger = {
+  log: (message?: any, ...args: any[]) => {
+    appendFileSync(`/tmp/copilot-loop-${gSessionId}-log.txt`, `${message}\n`);
+    console.log(message, ...args);
+  },
+
+  error: (message?: any, ...args: any[]) => {
+    appendFileSync(
+      `/tmp/copilot-loop-${gSessionId}-error.txt`,
+      `[ERROR] ${message}\n`
+    );
+    console.error(message, ...args);
+  },
+};
 
 // Global session ID - Snowflake-like ID (distributed system friendly)
-const gSessionId = `${(Date.now() << 10) | ((Math.random() * 1024) | 0)}`;
+let gSessionId = `${(Date.now() << 10) | ((Math.random() * 1024) | 0)}`;
 
 // Parse CLI arguments for flags (--prompt with value, --debug as boolean)
 const parseCliArgs = (flag: string) => {
@@ -26,7 +43,7 @@ const parseCliArgs = (flag: string) => {
 // Load and parse YAML prompt file
 const loadPromptFile = async (filePath: any) => {
   if (typeof filePath !== "string") {
-    console.error("Prompt file path must be a string.");
+    logger.error("Prompt file path must be a string.");
     process.exit(1);
   }
   try {
@@ -34,8 +51,8 @@ const loadPromptFile = async (filePath: any) => {
     const parsed = Bun.YAML.parse(content);
     return parsed;
   } catch (error) {
-    console.error(`Failed to load prompt file: ${filePath}`);
-    console.error(error);
+    logger.error(`Failed to load prompt file: ${filePath}`);
+    logger.error(error);
     process.exit(1);
   }
 };
@@ -59,7 +76,7 @@ const setupSignalHandlers = (
 
       const errors = await Promise.race([client.stop(), timeout]);
       if (errors.length > 0) {
-        console.error("Cleanup errors:", errors);
+        logger.error("Cleanup errors:", errors);
       }
     } catch {
       await client.forceStop();
@@ -75,13 +92,37 @@ const setupSignalHandlers = (
   };
 };
 
+// Handle stream destruction errors gracefully
+process.stdout.on("error", (error: any) => {
+  if (error.code === "ERR_STREAM_DESTROYED") {
+    logger.error(
+      "\n❌ Connection lost. Stream was destroyed. Please try again."
+    );
+    process.exit(1);
+  }
+  throw error;
+});
+
+// Handle unhandled promise rejections and errors
+const unHandle = (reason: any) => {
+  if (
+    reason?.message?.includes("Connection is closed") ||
+    reason?.code === "ERR_STREAM_DESTROYED"
+  ) {
+    logger.error("\n❌ Please confirm you already install Copilot CLI.");
+    process.exit(1);
+  }
+};
+process.on("unhandledRejection", unHandle);
+process.on("uncaughtException", unHandle);
+
 const client = new CopilotClient();
 let session: CopilotSession | undefined;
 
 const initSession = async (systemPrompt: string, options: any = {}) => {
   const { model = "gpt-4.1", mcpServers } = options;
-  console.log(`🚀 Initializing session with model: ${model}...`);
-  console.log(`📌 Session ID: ${gSessionId}`);
+  logger.log(`🚀 Initializing session with model: ${model}...`);
+  logger.log(`📌 Session ID: ${gSessionId}`);
   const sessionOptoins = {
     model,
     mcpServers,
@@ -172,7 +213,7 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
 
     if (event.type === "session.start") {
       // Session created - agent is ready
-      console.log(`\n📍 Session started: ${event.data.sessionId}`);
+      logger.log(`\n📍 Session started: ${event.data.sessionId}`);
     }
 
     if (event.type === "session.idle") {
@@ -182,18 +223,18 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
 
     if (event.type === "session.error") {
       // Session encountered an error
-      console.log(`\n❌ Session error: ${event.data.message}`);
+      logger.log(`\n❌ Session error: ${event.data.message}`);
     }
 
     if (event.type === "session.info") {
       // Session information (debugging info)
-      console.log(`\nℹ️  Session info: ${event.data.message}`);
+      logger.log(`\nℹ️  Session info: ${event.data.message}`);
     }
 
     if (event.type === "session.usage_info") {
       // Token usage and cost information
       if (event.data.currentTokens || event.data.tokenLimit) {
-        console.log(
+        logger.log(
           `\n📊 Usage - Current: ${event.data.currentTokens}, Limit: ${event.data.tokenLimit}`
         );
       }
@@ -205,14 +246,14 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
 
     if (event.type === "assistant.turn_start") {
       // Agent starts processing - beginning of step-by-step execution
-      console.log(
+      logger.log(
         `\n─── Assistant ${gSessionId} Turn ${event.data.turnId?.slice(0, 8) || "unknown"} ───`
       );
     }
 
     if (event.type === "assistant.turn_end") {
       // Turn complete
-      console.log(`\n✓ Turn ended (${event.data.turnId?.slice(0, 8)})`);
+      logger.log(`\n✓ Turn ended (${event.data.turnId?.slice(0, 8)})`);
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -221,12 +262,12 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
 
     if (event.type === "assistant.intent") {
       // Agent deciding what action to take next
-      console.log(`\n🎯 Agent Intent: ${event.data.intent}`);
+      logger.log(`\n🎯 Agent Intent: ${event.data.intent}`);
     }
 
     if (event.type === "assistant.reasoning") {
       // Complete reasoning from agent
-      console.log(`\n💭 Reasoning:\n${event.data.content}`);
+      logger.log(`\n💭 Reasoning:\n${event.data.content}`);
     }
 
     if (event.type === "assistant.reasoning_delta") {
@@ -240,20 +281,20 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
 
     if (event.type === "tool.execution_start") {
       // Tool execution starting (file edits, reads, bash commands, etc.)
-      console.log(`\n🔧 Executing tool: ${event.data.toolName}`);
+      logger.log(`\n🔧 Executing tool: ${event.data.toolName}`);
       if (event.data.arguments) {
-        console.log(`   Arguments: ${JSON.stringify(event.data.arguments)}`);
+        logger.log(`   Arguments: ${JSON.stringify(event.data.arguments)}`);
       }
     }
 
     if (event.type === "tool.execution_progress") {
       // Progress updates during tool execution (streaming)
-      console.log(`   ⏳ ${event.data.progressMessage}`);
+      logger.log(`   ⏳ ${event.data.progressMessage}`);
     }
 
     if (event.type === "tool.execution_partial_result") {
       // Partial result from tool (before completion)
-      console.log(
+      logger.log(
         `   📦 Partial Output: ${event.data.partialOutput?.split("\n").slice(-5).join("\n")}`
       );
     }
@@ -261,15 +302,15 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
     if (event.type === "tool.execution_complete") {
       // Tool execution finished
       if (event.data.success) {
-        console.log(`   ✓ Tool completed`);
+        logger.log(`   ✓ Tool completed`);
         if (event.data.result?.content) {
           const preview = event.data.result.content.slice(0, 150);
-          console.log(
+          logger.log(
             `   Result: ${preview}${event.data.result.content.length > 150 ? "..." : ""}`
           );
         }
       } else {
-        console.log(`   ✗ Tool failed: ${event.data.error?.message}`);
+        logger.log(`   ✗ Tool failed: ${event.data.error?.message}`);
       }
     }
 
@@ -279,22 +320,22 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
 
     if (event.type === "subagent.started") {
       // Subagent (delegated agent) started - recursive agentic workflows
-      console.log(`\n🤖 Subagent started: ${event.data.agentDisplayName}`);
+      logger.log(`\n🤖 Subagent started: ${event.data.agentDisplayName}`);
     }
 
     if (event.type === "subagent.selected") {
       // Subagent was selected for task
-      console.log(`   → Selected agent: ${event.data.agentName}`);
+      logger.log(`   → Selected agent: ${event.data.agentName}`);
     }
 
     if (event.type === "subagent.completed") {
       // Subagent finished successfully
-      console.log(`   ✓ Subagent completed: ${event.data.agentName}`);
+      logger.log(`   ✓ Subagent completed: ${event.data.agentName}`);
     }
 
     if (event.type === "subagent.failed") {
       // Subagent encountered error
-      console.log(`   ✗ Subagent failed: ${event.data.error}`);
+      logger.log(`   ✗ Subagent failed: ${event.data.error}`);
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -309,7 +350,7 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
     if (event.type === "assistant.usage") {
       // Usage info for this message
       if (event.data.outputTokens) {
-        console.log(`   [Tokens used: ${event.data.outputTokens}]`);
+        logger.log(`   [Tokens used: ${event.data.outputTokens}]`);
       }
     }
 
@@ -319,22 +360,22 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
 
     if (event.type === "hook.start") {
       // Webhook/hook started
-      console.log(`\n🪝 Hook started: ${event.data.hookType}`);
+      logger.log(`\n🪝 Hook started: ${event.data.hookType}`);
     }
 
     if (event.type === "hook.end") {
       // Webhook/hook completed
-      console.log(`   ✓ Hook completed: ${event.data.hookType}`);
+      logger.log(`   ✓ Hook completed: ${event.data.hookType}`);
     }
 
     if (event.type === "abort") {
       // Operation was aborted
-      console.log(`\n⛔ Operation aborted: ${event.data.reason}`);
+      logger.log(`\n⛔ Operation aborted: ${event.data.reason}`);
     }
 
     if (event.type === "session.model_change") {
       // Model was changed
-      console.log(`\n🔄 Model changed to: ${event.data.newModel}`);
+      logger.log(`\n🔄 Model changed to: ${event.data.newModel}`);
     }
   });
 };
@@ -342,12 +383,19 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
 const aiCommand = async (prompt: any, systemPrompt: string) => {
   await initSession(systemPrompt, promptConfig);
   try {
-    const timeoutMs = 86400000 * 7; // 7 day
-    const response = await session!.sendAndWait({ prompt }, timeoutMs);
+    const response = await session!.sendAndWait(
+      { prompt },
+      promptConfig.timeoutMs
+    );
     session?.destroy();
-    return response?.data?.content || "";
+    const message = response?.data?.content || "";
+    appendFileSync(
+      `/tmp/copilot-loop-${gSessionId}-log.txt`,
+      `Assistant: ${message}\n`
+    );
+    return message;
   } catch (error) {
-    console.error(
+    logger.error(
       "Error during AI command execution:",
       (error as Error).message
     );
@@ -357,7 +405,7 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
 };
 
 const printHelp = () => {
-  console.log(`
+  logger.log(`
 Usage: copilot-loop [options]
 
 Options:
@@ -367,6 +415,8 @@ Options:
   --model <model>     Specify the AI model to use
   --max <iterations>  Set maximum iterations for agent loop
   --promise <phrase>  Set completion promise phrase
+  --session-id <id>   Specify session ID for resuming sessions
+  --timeout-ms <ms>   Set timeout in milliseconds (default: 7 days)
   --debug             Use confirm mode instead of yolo mode
 
 Examples:
@@ -389,6 +439,8 @@ const main = async () => {
   const maxIterationsOverride: any = parseCliArgs("--max");
   const promiseOverride = parseCliArgs("--promise");
   const modelOverride = parseCliArgs("--model");
+  const sessionOverride = parseCliArgs("--session-id");
+  const timeoutMs = parseCliArgs("--timeout-ms") || 86400000 * 7; // 7 day
   configFile = parseCliArgs("--config");
 
   if (!configFile && !directPrompt && !parseCliArgs("--debug")) {
@@ -398,8 +450,8 @@ const main = async () => {
   let initialPrompt = "";
 
   if (configFile) {
-    console.log(`🤖 Load config file ${configFile}...`);
-    console.log();
+    logger.log(`🤖 Load config file ${configFile}...`);
+    logger.log();
     promptConfig = await loadPromptFile(configFile);
     initialPrompt =
       promptConfig.prompt || promptConfig.message || initialPrompt;
@@ -414,6 +466,9 @@ const main = async () => {
   const mode = parseCliArgs("--debug") ? "confirm" : "yolo";
 
   // Apply CLI overrides to promptConfig
+  if (sessionOverride && typeof sessionOverride === "string") {
+    gSessionId = sessionOverride;
+  }
   if (modelOverride) {
     promptConfig.model = modelOverride;
   }
@@ -423,6 +478,7 @@ const main = async () => {
   if (promiseOverride) {
     promptConfig.promise = promiseOverride;
   }
+  promptConfig.timeoutMs = timeoutMs;
 
   const completionPromise = promptConfig.promise;
   const maxIterations = promptConfig["max-iterations"];
