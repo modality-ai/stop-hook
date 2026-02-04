@@ -24,7 +24,7 @@ const CONFIG = {
 const DEFAULT_COMPLETION_PROMISE = "DONE";
 const DEFAULT_MAX_ITERATIONS = 3;
 const DEFAULT_FUNC = async (val: any, _systePromp: string) => val;
-const DEFAULT_SYSTEM_PROMPT = `You're execute on PDCA (Plan-Do-Check-Act) LOOP ([CURRENT] / [MAX]) to achieve mission. When you get perfect fit, output '<promise>[PROMISE]</promise>' in your final line.`;
+const DEFAULT_SYSTEM_PROMPT = `You are executing the PDCA (Plan-Do-Check-Act) LOOP ([CURRENT] / [MAX]) to achieve the mission. Only when you achieve a perfect fit, output '<promise>[PROMISE]</promise>' in your final line and provide the promise carefully.`;
 
 class SweAgent {
   protected mode: Mode = Mode.CONFIRM;

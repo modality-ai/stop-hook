@@ -388,13 +388,27 @@ const initSession = async (systemPrompt: string, options: any = {}) => {
 
 const aiCommand = async (prompt: any, systemPrompt: string) => {
   await initSession(systemPrompt, promptConfig);
-  const timeoutMs = promptConfig.timeout * 1000;
-  const timeoutHandle = setTimeout(() => {
-    if (session) {
-      logger.error("Command timeout - forcing abort");
-      session.abort?.().catch(() => {});
+  const abortController = new AbortController();
+
+  // Periodic server health check via ping
+  const healthCheckIntervalMs = 30000; // 30 seconds
+  const pingTimeoutMs = 5000; // 5 second timeout for ping response
+  const healthCheckHandle = setInterval(async () => {
+    if (abortController.signal.aborted || !session) return;
+
+    try {
+      await Promise.race([
+        client.ping("health-check"),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Ping timeout")), pingTimeoutMs)
+        ),
+      ]);
+    } catch (error) {
+      logger.error(`⚠️  Server hang detected: ${(error as Error).message}`);
+      abortController.abort();
+      session?.abort?.().catch(() => {});
     }
-  }, timeoutMs);
+  }, healthCheckIntervalMs);
 
   try {
     if (!session) {
@@ -402,18 +416,32 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
       return "";
     }
 
-    const response = await session.sendAndWait({ prompt }, timeoutMs);
+    // Race between sendAndWait and abort signal
+    const response = await Promise.race([
+      session.sendAndWait({ prompt }, promptConfig.timeout * 1000),
+      new Promise<never>((_, reject) => {
+        abortController.signal.addEventListener("abort", () => {
+          reject(new Error("Operation aborted due to server hang"));
+        });
+      }),
+    ]);
     const message = response?.data?.content || "";
     logger.store("log", message);
     return message;
   } catch (error) {
-    logger.error(
-      "Error during AI command execution:",
-      (error as Error).message
-    );
+    if (abortController.signal.aborted) {
+      logger.error(
+        "Returning to readline due to server hang - next loop will handle recovery"
+      );
+    } else {
+      logger.error(
+        "Error during AI command execution:",
+        (error as Error).message
+      );
+    }
     return "";
   } finally {
-    clearTimeout(timeoutHandle);
+    clearInterval(healthCheckHandle);
     session?.destroy?.().catch(() => {});
   }
 };
