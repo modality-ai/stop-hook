@@ -58,6 +58,11 @@ const loadPromptFile = async (filePath: any) => {
   }
 };
 
+const getPersonaPrompt = (personaName: string) => {
+  const personaPropmpt = `Deploy ${personaName} persona to activate and maintain persistence throughout the entire workflow.`;
+  return personaPropmpt;
+};
+
 const setupSignalHandlers = (
   client: CopilotClient,
   getSession: () => CopilotSession | undefined
@@ -97,9 +102,7 @@ const setupSignalHandlers = (
 // Handle stream destruction errors gracefully
 process.stdout.on("error", (error: any) => {
   if (error.code === "ERR_STREAM_DESTROYED") {
-    logger.error(
-      "\n❌ Connection lost. Stream was destroyed. Please try again."
-    );
+    logger.error("❌ Connection lost. Stream was destroyed. Please try again.");
     process.exit(1);
   }
   throw error;
@@ -111,7 +114,7 @@ const unHandle = (reason: any) => {
     reason?.message?.includes("Connection is closed") ||
     reason?.code === "ERR_STREAM_DESTROYED"
   ) {
-    logger.error("\n❌ Please confirm you already install Copilot CLI.");
+    logger.error("❌ Please confirm you already install Copilot CLI.");
     process.exit(1);
   }
 };
@@ -224,7 +227,7 @@ const initSession = async (
 
         case "session.start":
           // Session created - agent is ready
-          logger.log(`\n📍 Session started: ${event.data.sessionId}`);
+          logger.log(`📍 Session started: ${event.data.sessionId}`);
           break;
 
         case "session.idle":
@@ -234,19 +237,19 @@ const initSession = async (
 
         case "session.error":
           // Session encountered an error
-          logger.log(`\n❌ Session error: ${event.data.message}`);
+          logger.log(`❌ Session error: ${event.data.message}`);
           break;
 
         case "session.info":
           // Session information (debugging info)
-          logger.log(`\nℹ️  Session info: ${event.data.message}`);
+          logger.log(`ℹ️  Session info: ${event.data.message}`);
           break;
 
         case "session.usage_info":
           // Token usage and cost information
           if (event.data.currentTokens || event.data.tokenLimit) {
             logger.log(
-              `\n📊 Usage - Current: ${event.data.currentTokens}, Limit: ${event.data.tokenLimit}`
+              `📊 Usage - Current: ${event.data.currentTokens}, Limit: ${event.data.tokenLimit}`
             );
           }
           break;
@@ -258,13 +261,13 @@ const initSession = async (
         case "assistant.turn_start":
           // Agent starts processing - beginning of step-by-step execution
           logger.log(
-            `\n─── Assistant Turn ${event.data.turnId?.slice(0, 8) || "unknown"} ───`
+            `─── Assistant Turn ${event.data.turnId?.slice(0, 8) || "unknown"} ───`
           );
           break;
 
         case "assistant.turn_end":
           // Turn complete
-          logger.log(`\n✓ Turn ended (${event.data.turnId?.slice(0, 8)})`);
+          logger.log(`✓ Turn ended (${event.data.turnId?.slice(0, 8)})`);
           break;
 
         // ─────────────────────────────────────────────────────────────
@@ -273,12 +276,12 @@ const initSession = async (
 
         case "assistant.intent":
           // Agent deciding what action to take next
-          logger.log(`\n🎯 Agent Intent: ${event.data.intent}`);
+          logger.log(`🎯 Agent Intent: ${event.data.intent}`);
           break;
 
         case "assistant.reasoning":
           // Complete reasoning from agent
-          logger.store("log", `\n💭 Reasoning:\n${event.data.content}`);
+          logger.store("log", `💭 Reasoning:\n${event.data.content}`);
           break;
 
         case "assistant.reasoning_delta":
@@ -292,7 +295,7 @@ const initSession = async (
 
         case "tool.execution_start":
           // Tool execution starting (file edits, reads, bash commands, etc.)
-          logger.log(`\n🔧 Executing tool: ${event.data.toolName}`);
+          logger.log(`🔧 Executing tool: ${event.data.toolName}`);
           if (event.data.arguments) {
             logger.log(`   Arguments: ${JSON.stringify(event.data.arguments)}`);
           }
@@ -331,7 +334,7 @@ const initSession = async (
 
         case "subagent.started":
           // Subagent (delegated agent) started - recursive agentic workflows
-          logger.log(`\n🤖 Subagent started: ${event.data.agentDisplayName}`);
+          logger.log(`🤖 Subagent started: ${event.data.agentDisplayName}`);
           break;
 
         case "subagent.selected":
@@ -354,7 +357,7 @@ const initSession = async (
         // ─────────────────────────────────────────────────────────────
 
         case "assistant.message":
-          logger.store("log", `\n💭 ASSISTANT:\n${event.data.content}`);
+          logger.store("log", `💭 ASSISTANT:\n${event.data.content}`);
           break;
 
         case "assistant.message_delta":
@@ -375,7 +378,7 @@ const initSession = async (
 
         case "hook.start":
           // Webhook/hook started
-          logger.log(`\n🪝 Hook started: ${event.data.hookType}`);
+          logger.log(`🪝 Hook started: ${event.data.hookType}`);
           break;
 
         case "hook.end":
@@ -385,20 +388,30 @@ const initSession = async (
 
         case "abort":
           // Operation was aborted
-          logger.log(`\n⛔ Operation aborted: ${event.data.reason}`);
+          logger.log(`⛔ Operation aborted: ${event.data.reason}`);
           break;
 
         case "session.model_change":
           // Model was changed
-          logger.log(`\n🔄 Model changed to: ${event.data.newModel}`);
+          logger.log(`🔄 Model changed to: ${event.data.newModel}`);
           break;
 
         case "user.message":
-          logger.store("log", `\n💭 USER:\n${event.data.content}`);
+          logger.store("log", `💭 USER:\n${event.data.content}`);
           break;
 
+        case "session.truncation":
+        case "session.compaction_complete":
+          if (null != promptConfig.persona) {
+            session?.send({
+              prompt: getPersonaPrompt(promptConfig.persona),
+            });
+          }
+          break;
+        case "pending_messages.modified":
+          break;
         default:
-          process.stdout.write(`\n❓ Unhandled event type: ${event.type}\n`);
+          process.stdout.write(`❓ Unhandled event type: ${event.type}\n`);
           break;
       }
     } catch (error) {
@@ -417,13 +430,13 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
   const healthCheckHandle = setInterval(async () => {
     if (abortController.signal.aborted || !session) return;
     try {
-      const result: any = await Promise.race([
+      await Promise.race([
         client.ping("O.K."),
         new Promise((_, reject) =>
           setTimeout(() => reject(new Error("Ping timeout")), pingTimeoutMs)
         ),
       ]);
-      process.stdout.write(result?.message);
+      process.stdout.write(".");
     } catch (error) {
       logger.error(`⚠️  Server hang detected: ${(error as Error).message}`);
       abortController.abort();
@@ -438,6 +451,11 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
     }
 
     // Race between sendAndWait and abort signal
+    if (null != promptConfig.persona) {
+      await session.sendAndWait({
+        prompt: getPersonaPrompt(promptConfig.persona),
+      });
+    }
     const response = await Promise.race([
       session.sendAndWait({ prompt }, promptConfig.timeout * 1000),
       new Promise<never>((_, reject) => {
@@ -506,6 +524,7 @@ const main = async () => {
   const maxIterationsOverride: any = parseCliArgs("--max");
   const promiseOverride = parseCliArgs("--promise");
   const modelOverride = parseCliArgs("--model");
+  const personaOverride = parseCliArgs("--persona");
   const timeout = parseCliArgs("--timeout") || 86400 * 7; // 7 days
 
   // Accept config file from first positional argument or --config flag
@@ -545,6 +564,9 @@ const main = async () => {
   }
   if (promiseOverride) {
     promptConfig.promise = promiseOverride;
+  }
+  if (personaOverride) {
+    promptConfig.persona = personaOverride;
   }
   promptConfig.timeout = timeout;
 
