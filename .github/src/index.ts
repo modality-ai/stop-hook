@@ -4,6 +4,8 @@ import { SweAgentInteraction } from "./utils/SweAgentInteraction";
 import { CopilotClient, type CopilotSession } from "@github/copilot-sdk";
 import { appendFileSync } from "fs";
 
+// Global session ID - Snowflake-like ID (distributed system friendly)
+let gSessionId = `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
 // Simple logger wrapper
 const logger = {
   store: (logType: string, message: string) => {
@@ -13,17 +15,14 @@ const logger = {
 
   log: (message?: any, ...args: any[]) => {
     logger.store("log", message);
-    console.log(message, ...args);
+    console.log(`${gSessionId} ${message}`, ...args);
   },
 
   error: (message?: any, ...args: any[]) => {
     logger.store("error", message);
-    console.error(message, ...args);
+    console.error(`${gSessionId} ${message}`, ...args);
   },
 };
-
-// Global session ID - Snowflake-like ID (distributed system friendly)
-let gSessionId = `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
 
 // Parse CLI arguments for flags (--prompt with value, --debug as boolean)
 const parseCliArgs = (flag: string) => {
@@ -259,7 +258,7 @@ const initSession = async (
         case "assistant.turn_start":
           // Agent starts processing - beginning of step-by-step execution
           logger.log(
-            `\n─── Assistant ${gSessionId} Turn ${event.data.turnId?.slice(0, 8) || "unknown"} ───`
+            `\n─── Assistant Turn ${event.data.turnId?.slice(0, 8) || "unknown"} ───`
           );
           break;
 
@@ -507,7 +506,8 @@ const main = async () => {
 
   // Accept config file from first positional argument or --config flag
   const firstArg = process.argv[2];
-  configFile = (firstArg && !firstArg.startsWith("-")) ? firstArg : parseCliArgs("--config");
+  configFile =
+    firstArg && !firstArg.startsWith("-") ? firstArg : parseCliArgs("--config");
 
   if (!configFile && !directPrompt && !parseCliArgs("--debug")) {
     printHelp();
