@@ -179,7 +179,7 @@ const initSession = async (
   //   - session.compaction_complete → Context compaction finished
   //
   // USER MESSAGES (user.*):
-  //   - user.message         → User sent a message
+  //   - user.message              → User sent a message
   //   - pending_messages.modified → Pending message list changed
   //
   // ASSISTANT REASONING & OUTPUT (assistant.*):
@@ -393,8 +393,12 @@ const initSession = async (
           logger.log(`\n🔄 Model changed to: ${event.data.newModel}`);
           break;
 
+        case "user.message":
+          logger.store("log", `\n💭 USER:\n${event.data.content}`);
+          break;
+
         default:
-          //    logger.error(`\n❓ Unhandled event type: ${event.type}`, event.data);
+          process.stdout.write(`\n❓ Unhandled event type: ${event.type}\n`);
           break;
       }
     } catch (error) {
