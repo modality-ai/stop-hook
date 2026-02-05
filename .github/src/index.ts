@@ -420,7 +420,7 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
           setTimeout(() => reject(new Error("Ping timeout")), pingTimeoutMs)
         ),
       ]);
-      logger.log(result.message);
+      process.stdout.write(result?.message);
     } catch (error) {
       logger.error(`⚠️  Server hang detected: ${(error as Error).message}`);
       abortController.abort();
