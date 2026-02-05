@@ -465,10 +465,13 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
 
 const printHelp = () => {
   process.stdout.write(`
-Usage: copilot-loop [options]
+Usage: copilot-loop [config-file] [options]
+
+Arguments:
+  [config-file]       Load configuration from YAML file (positional argument)
 
 Options:
-  --config <file>     Load configuration from YAML file
+  --config <file>     Load configuration from YAML file (alternative to positional)
   -p <prompt>         Directly input a prompt
   -a <prompt>         Append a prompt to existing prompt
   -s <id>             Specify session ID for resuming sessions
@@ -479,10 +482,11 @@ Options:
   --debug             Use confirm mode instead of yolo mode
 
 Examples:
+  copilot-loop config.yaml
   copilot-loop --config config.yaml
   copilot-loop -p "your prompt here"
   copilot-loop -a "additional prompt text"
-  copilot-loop --config config.yaml --debug
+  copilot-loop config.yaml --debug
   copilot-loop --model gpt-4.1 --max 10 --promise "Task completed"
   copilot-loop -p "your prompt" --model claude-3-sonnet --max 5
   `);
@@ -500,7 +504,10 @@ const main = async () => {
   const promiseOverride = parseCliArgs("--promise");
   const modelOverride = parseCliArgs("--model");
   const timeout = parseCliArgs("--timeout") || 86400 * 7; // 7 days
-  configFile = parseCliArgs("--config");
+
+  // Accept config file from first positional argument or --config flag
+  const firstArg = process.argv[2];
+  configFile = (firstArg && !firstArg.startsWith("-")) ? firstArg : parseCliArgs("--config");
 
   if (!configFile && !directPrompt && !parseCliArgs("--debug")) {
     printHelp();
