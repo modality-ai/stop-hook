@@ -1,0 +1,649 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Universal CLI Execution Tool - ACTUATOR
+# Version: 1.0.0 (MVP - Phase 1)
+# =============================================================================
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
+readonly DEFAULT_TIMEOUT=0
+readonly STATUS_INTERVAL="${ACTUATOR_STATUS_INTERVAL:-2}"
+
+# =============================================================================
+# JSON Helpers (no jq dependency)
+# =============================================================================
+
+json_escape() {
+  local str="$1"
+  str="${str//\\/\\\\}"
+  str="${str//\"/\\\"}"
+  str="${str//$'\n'/\\n}"
+  str="${str//$'\r'/\\r}"
+  str="${str//$'\t'/\\t}"
+  printf '%s' "$str"
+}
+
+json_output() {
+  local status="$1" exit_code="$2" command="$3"
+  local stdout_data="$4" stderr_data="$5"
+  local start_time="$6" end_time="$7"
+  local job_id="${8:-}" pid="${9:-}"
+  local duration=0
+
+  if [[ -n "$start_time" && -n "$end_time" ]]; then
+    duration=$(( end_time - start_time ))
+  fi
+
+  cat <<ENDJSON
+{
+  "version": "${VERSION}",
+  "status": "$(json_escape "$status")",
+  "exit_code": ${exit_code},
+  "command": "$(json_escape "$command")",
+  "stdout": "$(json_escape "$stdout_data")",
+  "stderr": "$(json_escape "$stderr_data")",
+  "metadata": {
+    "start_time": ${start_time:-0},
+    "end_time": ${end_time:-0},
+    "duration_seconds": ${duration},
+    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  }$(if [[ -n "$job_id" ]]; then printf ',\n  "job": {\n    "id": "%s",\n    "pid": %s\n  }' "$job_id" "${pid:-0}"; fi)
+}
+ENDJSON
+}
+
+json_status_update() {
+  local status="$1" job_id="$2" message="${3:-}"
+  cat <<ENDJSON
+{"event": "status_update", "status": "$(json_escape "$status")", "job_id": "$(json_escape "$job_id")", "message": "$(json_escape "$message")", "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+ENDJSON
+}
+
+json_stream_line() {
+  local stream="$1" data="$2"
+  printf '{"event":"%s","data":"%s","timestamp":"%s"}\n' \
+    "$stream" "$(json_escape "$data")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+# =============================================================================
+# Job Management
+# =============================================================================
+
+init_jobs_dir() {
+  mkdir -p "$JOBS_DIR"
+}
+
+generate_job_id() {
+  printf '%s_%s' "$(date +%s)" "$$"
+}
+
+save_job_state() {
+  local job_id="$1" pid="$2" command="$3" status="$4" start_time="$5"
+  local job_file="${JOBS_DIR}/${job_id}.job"
+  cat > "$job_file" <<EOF
+JOB_ID='${job_id}'
+PID='${pid}'
+COMMAND='${command//\'/\'\\\'\'}'
+STATUS='${status}'
+START_TIME='${start_time}'
+STDOUT_FILE='${JOBS_DIR}/${job_id}.stdout'
+STDERR_FILE='${JOBS_DIR}/${job_id}.stderr'
+EOF
+}
+
+update_job_status() {
+  local job_id="$1" status="$2" exit_code="${3:-}"
+  local job_file="${JOBS_DIR}/${job_id}.job"
+  [[ -f "$job_file" ]] || return 0  # Don't fail if file doesn't exist yet
+
+  if command -v sed &>/dev/null; then
+    sed -i.bak "s/^STATUS=.*/STATUS='${status}'/" "$job_file" 2>/dev/null || \
+      sed -i '' "s/^STATUS=.*/STATUS='${status}'/" "$job_file" || true
+    rm -f "${job_file}.bak"
+  fi
+
+  if [[ -n "$exit_code" ]]; then
+    echo "EXIT_CODE='${exit_code}'" >> "$job_file"
+    echo "END_TIME='$(date +%s)'" >> "$job_file"
+  fi
+}
+
+load_job_state() {
+  local job_id="$1"
+  local job_file="${JOBS_DIR}/${job_id}.job"
+  [[ -f "$job_file" ]] || { echo "Job not found: ${job_id}" >&2; return 1; }
+  # shellcheck disable=SC1090
+  source "$job_file"
+}
+
+# =============================================================================
+# Signal Handling & Cleanup
+# =============================================================================
+
+kill_child() {
+  local pid="$1" signal="${2:-TERM}"
+  kill -"$signal" "$pid" 2>/dev/null || true
+}
+
+# Global state for signal handler (avoids quote escaping issues in trap strings)
+TRAP_CMD_PID=""
+TRAP_STDOUT_FILE=""
+TRAP_STDERR_FILE=""
+TRAP_COMMAND=""
+TRAP_START_TIME=""
+TIMEOUT_MONITOR_PID=""
+
+handle_signal() {
+  local signal_name="$1"
+  local exit_code
+
+  case "$signal_name" in
+    INT)  exit_code=130 ;;
+    TERM) exit_code=143 ;;
+    *)    exit_code=1 ;;
+  esac
+
+  # Kill child process immediately
+  if [[ -n "$TRAP_CMD_PID" ]]; then
+    kill_child "$TRAP_CMD_PID" KILL
+    wait "$TRAP_CMD_PID" 2>/dev/null || true
+  fi
+
+  # Kill timeout monitor if active
+  if [[ -n "${TIMEOUT_MONITOR_PID:-}" ]]; then
+    kill_child "$TIMEOUT_MONITOR_PID" KILL
+    wait "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
+  fi
+
+  local end_time
+  end_time=$(date +%s)
+
+  # Capture whatever output was produced before interruption
+  local stdout_data="" stderr_data=""
+  [[ -f "$TRAP_STDOUT_FILE" ]] && stdout_data=$(cat "$TRAP_STDOUT_FILE" 2>/dev/null || true)
+  [[ -f "$TRAP_STDERR_FILE" ]] && stderr_data=$(cat "$TRAP_STDERR_FILE" 2>/dev/null || true)
+
+  rm -f "$TRAP_STDOUT_FILE" "$TRAP_STDERR_FILE"
+
+  json_output "interrupted" "$exit_code" "$TRAP_COMMAND" "$stdout_data" "$stderr_data" "$TRAP_START_TIME" "$end_time"
+  exit "$exit_code"
+}
+
+# =============================================================================
+# Timeout Monitor
+# =============================================================================
+
+start_timeout_monitor() {
+  local pid="$1" timeout="$2"
+
+  {
+    sleep "$timeout" 2>/dev/null
+    if kill -0 "$pid" 2>/dev/null; then
+      kill_child "$pid" TERM
+      sleep 2
+      kill -0 "$pid" 2>/dev/null && kill_child "$pid" KILL
+    fi
+  } &
+  TIMEOUT_MONITOR_PID=$!
+}
+
+# =============================================================================
+# Core Execution: Synchronous
+# =============================================================================
+
+execute_sync() {
+  local command="$1"
+  local timeout="${2:-$DEFAULT_TIMEOUT}"
+  local stream_output="${3:-false}"
+
+  local stdout_file stderr_file start_time end_time exit_code=0
+  stdout_file=$(mktemp)
+  stderr_file=$(mktemp)
+  start_time=$(date +%s)
+
+  if [[ "$stream_output" == "true" ]]; then
+    json_status_update "started" "sync" "Executing: ${command}"
+  fi
+
+  # Execute command in subshell for clean signal handling
+  bash -c "$command" > "$stdout_file" 2> "$stderr_file" &
+  local cmd_pid=$!
+
+  # Set global state for signal handler
+  TRAP_CMD_PID="$cmd_pid"
+  TRAP_STDOUT_FILE="$stdout_file"
+  TRAP_STDERR_FILE="$stderr_file"
+  TRAP_COMMAND="$command"
+  TRAP_START_TIME="$start_time"
+
+  trap 'handle_signal INT' INT
+  trap 'handle_signal TERM' TERM
+
+  # Start timeout monitor if configured
+  TIMEOUT_MONITOR_PID=""
+  if [[ "$timeout" -gt 0 ]]; then
+    start_timeout_monitor "$cmd_pid" "$timeout"
+  fi
+
+  # Wait for command with signal-responsive loop
+  if [[ "$stream_output" == "true" ]]; then
+    # Poll for new lines and emit as JSON events (no background processes to leak)
+    local stdout_lines=0 stderr_lines=0
+    local poll_count=0
+    local heartbeat_every=$(( ${STATUS_INTERVAL%.*} * 5 ))  # heartbeat every N polls
+    [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
+
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+      local had_output=false
+
+      # Emit new stdout lines
+      local current_out
+      current_out=$(wc -l < "$stdout_file" 2>/dev/null | tr -d ' ')
+      if [[ "${current_out:-0}" -gt "$stdout_lines" ]]; then
+        tail -n +"$((stdout_lines + 1))" "$stdout_file" 2>/dev/null | while IFS= read -r line; do
+          json_stream_line "stdout" "$line"
+        done
+        stdout_lines="$current_out"
+        had_output=true
+      fi
+
+      # Emit new stderr lines
+      local current_err
+      current_err=$(wc -l < "$stderr_file" 2>/dev/null | tr -d ' ')
+      if [[ "${current_err:-0}" -gt "$stderr_lines" ]]; then
+        tail -n +"$((stderr_lines + 1))" "$stderr_file" 2>/dev/null | while IFS= read -r line; do
+          json_stream_line "stderr" "$line"
+        done
+        stderr_lines="$current_err"
+        had_output=true
+      fi
+
+      # Heartbeat: emit status even when no new output
+      (( poll_count++ )) || true
+      if [[ "$had_output" == "false" && $(( poll_count % heartbeat_every )) -eq 0 ]]; then
+        local elapsed=$(( $(date +%s) - start_time ))
+        local out_bytes err_bytes
+        out_bytes=$(wc -c < "$stdout_file" 2>/dev/null | tr -d ' ')
+        err_bytes=$(wc -c < "$stderr_file" 2>/dev/null | tr -d ' ')
+        printf '{"event":"heartbeat","status":"running","elapsed_seconds":%d,"stdout_bytes":%s,"stderr_bytes":%s,"pid":%d,"timestamp":"%s"}\n' \
+          "$elapsed" "${out_bytes:-0}" "${err_bytes:-0}" "$cmd_pid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      fi
+
+      sleep 0.2 &
+      wait $! 2>/dev/null || true
+    done
+
+    # Flush any remaining lines after process exits
+    tail -n +"$((stdout_lines + 1))" "$stdout_file" 2>/dev/null | while IFS= read -r line; do
+      json_stream_line "stdout" "$line"
+    done
+    tail -n +"$((stderr_lines + 1))" "$stderr_file" 2>/dev/null | while IFS= read -r line; do
+      json_stream_line "stderr" "$line"
+    done
+  else
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+      sleep 0.1 &
+      wait $! 2>/dev/null || true
+    done
+  fi
+
+  wait "$cmd_pid" 2>/dev/null || exit_code=$?
+  end_time=$(date +%s)
+
+  # Kill timeout monitor if active
+  if [[ -n "$TIMEOUT_MONITOR_PID" ]]; then
+    kill "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
+    wait "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
+  fi
+
+  # Check if killed by timeout (SIGTERM=143, SIGKILL=137)
+  local status="completed"
+  if [[ "$timeout" -gt 0 && ( "$exit_code" -eq 137 || "$exit_code" -eq 143 ) ]]; then
+    status="timeout"
+  elif [[ "$exit_code" -ne 0 ]]; then
+    status="failed"
+  fi
+
+  local stdout_data stderr_data
+  stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
+  stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
+
+  rm -f "$stdout_file" "$stderr_file"
+
+  json_output "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time"
+}
+
+# =============================================================================
+# Core Execution: Asynchronous
+# =============================================================================
+
+execute_async() {
+  local command="$1"
+  local timeout="${2:-$DEFAULT_TIMEOUT}"
+
+  init_jobs_dir
+  local job_id
+  job_id=$(generate_job_id)
+  local stdout_file="${JOBS_DIR}/${job_id}.stdout"
+  local stderr_file="${JOBS_DIR}/${job_id}.stderr"
+  local start_time
+  start_time=$(date +%s)
+
+  # Save job state BEFORE launching background process
+  save_job_state "$job_id" "0" "$command" "running" "$start_time"
+
+  # Launch command in background subshell
+  (
+    local exit_code=0
+    eval "$command" > "$stdout_file" 2> "$stderr_file" || exit_code=$?
+
+    # Update job state on completion
+    if [[ "$exit_code" -eq 0 ]]; then
+      update_job_status "$job_id" "completed" "$exit_code"
+    else
+      update_job_status "$job_id" "failed" "$exit_code"
+    fi
+  ) &
+  local cmd_pid=$!
+
+  # Update with actual process ID
+  sed -i '' "s/^PID=.*/PID='${cmd_pid}'/" "${JOBS_DIR}/${job_id}.job"
+
+  # Start timeout monitor if configured
+  if [[ "$timeout" -gt 0 ]]; then
+    start_timeout_monitor "$cmd_pid" "$timeout"
+  fi
+
+  json_output "running" "-1" "$command" "" "" "$start_time" "" "$job_id" "$cmd_pid"
+}
+
+# =============================================================================
+# Job Operations
+# =============================================================================
+
+poll_job() {
+  local job_id="$1"
+  local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME
+
+  load_job_state "$job_id" || {
+    printf '{"error": "Job not found", "job_id": "%s"}\n' "$job_id"
+    return 1
+  }
+
+  # Check if process is still running
+  if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2>/dev/null; then
+    wait "$PID" 2>/dev/null
+    local actual_exit=$?
+    if [[ "$actual_exit" -eq 0 ]]; then
+      STATUS="completed"
+    else
+      STATUS="failed"
+    fi
+    update_job_status "$job_id" "$STATUS" "$actual_exit"
+    EXIT_CODE="$actual_exit"
+    END_TIME=$(date +%s)
+  fi
+
+  local stdout_data="" stderr_data=""
+  [[ -f "$STDOUT_FILE" ]] && stdout_data=$(cat "$STDOUT_FILE" 2>/dev/null || true)
+  [[ -f "$STDERR_FILE" ]] && stderr_data=$(cat "$STDERR_FILE" 2>/dev/null || true)
+
+  json_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
+    "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID"
+}
+
+terminate_job() {
+  local job_id="$1"
+  local signal="${2:-TERM}"
+  local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE
+
+  load_job_state "$job_id" || {
+    printf '{"error": "Job not found", "job_id": "%s"}\n' "$job_id"
+    return 1
+  }
+
+  if kill -0 "$PID" 2>/dev/null; then
+    kill -"$signal" "$PID" 2>/dev/null
+    sleep 1
+    if kill -0 "$PID" 2>/dev/null && [[ "$signal" != "KILL" ]]; then
+      kill -KILL "$PID" 2>/dev/null
+    fi
+    update_job_status "$job_id" "terminated" "143"
+    json_status_update "terminated" "$job_id" "Process terminated with signal ${signal}"
+  else
+    json_status_update "already_stopped" "$job_id" "Process is not running"
+  fi
+}
+
+list_jobs() {
+  init_jobs_dir
+  local first=true
+  printf '{"jobs": ['
+
+  for job_file in "${JOBS_DIR}"/*.job; do
+    [[ -f "$job_file" ]] || continue
+
+    local JOB_ID="" PID="" COMMAND="" STATUS="" START_TIME="" EXIT_CODE="" END_TIME=""
+    # shellcheck disable=SC1090
+    source "$job_file"
+
+    # Refresh status for running jobs
+    if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2>/dev/null; then
+      STATUS="completed"
+    fi
+
+    [[ "$first" == "true" ]] || printf ','
+    first=false
+
+    printf '{"job_id": "%s", "pid": %s, "status": "%s", "command": "%s", "start_time": %s}' \
+      "$JOB_ID" "$PID" "$STATUS" "$(json_escape "$COMMAND")" "$START_TIME"
+  done
+
+  printf '], "count": %d, "timestamp": "%s"}\n' \
+    "$(find "$JOBS_DIR" -name '*.job' 2>/dev/null | wc -l | tr -d ' ')" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+cleanup_jobs() {
+  init_jobs_dir
+  local cleaned=0
+  shopt -s nullglob  # Make glob expand to nothing if no matches
+  for job_file in "${JOBS_DIR}"/*.job; do
+    local JOB_ID="" PID="" STATUS=""
+    # shellcheck disable=SC1090
+    source "$job_file" || continue
+
+    # Check if job is finished or process is dead
+    local should_clean=false
+    if [[ "$STATUS" != "running" ]]; then
+      should_clean=true
+    elif ! kill -0 "$PID" 2>/dev/null; then
+      should_clean=true
+    fi
+
+    if [[ "$should_clean" == "true" ]]; then
+      rm -f "$job_file" "${JOBS_DIR}/${JOB_ID}.stdout" "${JOBS_DIR}/${JOB_ID}.stderr"
+      ((cleaned++))
+    fi
+  done
+  shopt -u nullglob  # Reset
+  printf '{"cleaned": %d, "timestamp": "%s"}\n' "$cleaned" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+# =============================================================================
+# Usage
+# =============================================================================
+
+usage() {
+  cat <<'EOF'
+Universal CLI Execution Tool v1.0.0
+
+USAGE:
+  actuator [OPTIONS] <command>
+  actuator [OPTIONS] -- <command args...>
+  actuator [OPTIONS] --stdin
+  echo "command" | actuator [OPTIONS]
+  actuator --poll <job_id>
+  actuator --terminate <job_id> [signal]
+  actuator --list
+  actuator --cleanup
+
+OPTIONS:
+  -c, --command <cmd>     Command to execute
+  -a, --async             Execute asynchronously (returns job ID)
+  -s, --stream            Stream real-time status updates (sync mode)
+  -t, --timeout <sec>     Timeout in seconds (0 = no timeout)
+  -p, --poll <job_id>     Poll status of async job
+  -k, --terminate <id>    Terminate async job
+  -l, --list              List all tracked jobs
+  --cleanup               Remove completed job artifacts
+  --stdin                 Read command from stdin (for shell metacharacters)
+  --plain                 Output plain text instead of JSON
+  -v, --version           Show version
+  -h, --help              Show this help
+
+EXAMPLES:
+  # Synchronous execution
+  actuator "echo 'hello world'"
+  actuator -c "ls -la /tmp"
+  actuator -- ls -la /tmp
+
+  # With timeout (30 seconds)
+  actuator -t 30 "sleep 60"
+  actuator -t 30 -- sleep 60
+
+  # Stream real-time status
+  actuator -s -- make build
+
+  # Async execution
+  actuator -a -- npm install
+  actuator --poll 1738800000_12345
+  actuator --terminate 1738800000_12345
+
+  # Commands with shell metacharacters (;, |, &&)
+  actuator --stdin <<< 'while :; do echo tick; sleep 1; done'
+  echo 'ls -la | grep txt' | actuator
+  actuator -t 5 --stdin <<< 'while :; do echo tick; sleep 1; done'
+
+  # Multi-line commands using heredoc
+  cat << 'HEREDOC' | actuator
+    ls -la
+    echo "---"
+    pwd
+  HEREDOC
+  
+  # With timeout
+  cat << 'HEREDOC' | actuator -t 30
+    sleep 5
+    echo "done"
+  HEREDOC
+  
+  # Async multi-line
+  cat << 'HEREDOC' | actuator -a
+    npm install
+    npm run build
+  HEREDOC
+
+  # Job management
+  actuator --list
+  actuator --cleanup
+
+ENVIRONMENT:
+  ACTUATOR_JOBS_DIR        Job storage directory (default: /tmp/actuator-jobs)
+  ACTUATOR_STATUS_INTERVAL Status update interval in seconds (default: 2)
+
+OUTPUT:
+  All output is JSON-structured for AI consumption.
+  Use --plain for human-readable plain text output.
+EOF
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+main() {
+  local command="" mode="sync" timeout="$DEFAULT_TIMEOUT"
+  local stream="false" plain="false"
+  local poll_id="" terminate_id="" terminate_signal="TERM"
+
+  # Auto-detect piped stdin when no args
+  if [[ $# -eq 0 ]]; then
+    if [[ ! -t 0 ]]; then
+      command=$(cat)
+    else
+      usage
+      exit 0
+    fi
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -c|--command)
+        command="$2"; shift 2 ;;
+      -a|--async)
+        mode="async"; shift ;;
+      -s|--stream)
+        stream="true"; shift ;;
+      -t|--timeout)
+        timeout="$2"; shift 2 ;;
+      -p|--poll)
+        poll_id="$2"; shift 2 ;;
+      -k|--terminate)
+        terminate_id="$2"
+        shift 2
+        [[ $# -gt 0 && "$1" != -* ]] && { terminate_signal="$1"; shift; }
+        ;;
+      -l|--list)
+        list_jobs; exit 0 ;;
+      --cleanup)
+        cleanup_jobs || true  # Ignore any errors from cleanup
+        wait  # Wait for any remaining background jobs
+        exit 0 ;;
+      --stdin)
+        command=$(cat); shift ;;
+      --plain)
+        plain="true"; shift ;;
+      -v|--version)
+        printf '{"version": "%s"}\n' "$VERSION"; exit 0 ;;
+      -h|--help)
+        usage; exit 0 ;;
+      --)
+        shift; command="$*"; break ;;
+      -*)
+        printf '{"error": "Unknown option: %s"}\n' "$1" >&2; exit 1 ;;
+      *)
+        command="$*"; break ;;
+    esac
+  done
+
+  # Handle job operations
+  if [[ -n "$poll_id" ]]; then
+    poll_job "$poll_id"
+    exit $?
+  fi
+
+  if [[ -n "$terminate_id" ]]; then
+    terminate_job "$terminate_id" "$terminate_signal"
+    exit $?
+  fi
+
+  # Validate command
+  if [[ -z "$command" ]]; then
+    printf '{"error": "No command specified. Use -h for help."}\n' >&2
+    exit 1
+  fi
+
+  # Execute
+  case "$mode" in
+    sync)
+      execute_sync "$command" "$timeout" "$stream"
+      ;;
+    async)
+      execute_async "$command" "$timeout"
+      ;;
+  esac
+}
+
+main "$@"
