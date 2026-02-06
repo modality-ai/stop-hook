@@ -308,9 +308,7 @@ const initSession = async (
 
         case "tool.execution_partial_result":
           // Partial result from tool (before completion)
-          logger.log(
-            `   📦 Partial Output: ${event.data.partialOutput?.split("\n").slice(-5).join("\n")}`
-          );
+          logger.log(`   📦 Partial Output: ${event.data.partialOutput}`);
           break;
 
         case "tool.execution_complete":
