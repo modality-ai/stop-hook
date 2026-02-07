@@ -19,6 +19,7 @@ EXEC_SEQUENCE=0
 # =============================================================================
 
 get_next_sequence() {
+  init_jobs_dir
   local current=0
   if [[ -f "$SEQUENCE_FILE" ]]; then
     current=$(cat "$SEQUENCE_FILE" 2>/dev/null || echo 0)
@@ -257,6 +258,128 @@ execute_sync() {
   # Stdin stays as-is so commands like cdiff detect isatty(stdin) for VCS mode
   # and interactive commands like ssh get terminal input.
   if [[ "$use_tty" == "true" ]]; then
+    # TTY Mode: Direct foreground execution OR polling for streaming with heartbeat
+    if [[ "$stream_output" == "true" ]]; then
+      # Streaming + TTY: Use polling loop to emit heartbeat events while maintaining TTY output
+      # Background command but keep output flowing to terminal and files
+      bash -c "$command" < /dev/stdin > "$stdout_file" 2> "$stderr_file" &
+      local cmd_pid=$!
+
+      # Set global state for signal handler
+      TRAP_CMD_PID="$cmd_pid"
+      TRAP_STDOUT_FILE="$stdout_file"
+      TRAP_STDERR_FILE="$stderr_file"
+      TRAP_COMMAND="$command"
+      TRAP_START_TIME="$start_time"
+
+      trap 'handle_signal INT' INT
+      trap 'handle_signal TERM' TERM
+
+      # Start timeout monitor if configured
+      TIMEOUT_MONITOR_PID=""
+      if [[ "$timeout" -gt 0 ]]; then
+        start_timeout_monitor "$cmd_pid" "$timeout"
+      fi
+
+      # Also display output to terminal in real-time via tee
+      if [[ "$quiet" != "true" ]]; then
+        # Continuously tail output to terminal while polling for events
+        tail -f "$stdout_file" 2>/dev/null &
+        local tail_pid=$!
+        tail -f "$stderr_file" 2>/dev/null >&2 &
+        local tail_err_pid=$!
+      fi
+
+      # Polling loop with heartbeat events
+      local stdout_lines=0 stderr_lines=0
+      local poll_count=0
+      local heartbeat_every=$(( ${STATUS_INTERVAL%.*} * 5 ))
+      [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
+
+      while kill -0 "$cmd_pid" 2>/dev/null; do
+        local had_output=false
+
+        # Emit new stdout lines
+        local current_out
+        current_out=$(wc -l < "$stdout_file" 2>/dev/null | tr -d ' ')
+        if [[ "${current_out:-0}" -gt "$stdout_lines" ]]; then
+          tail -n +"$((stdout_lines + 1))" "$stdout_file" 2>/dev/null | while IFS= read -r line; do
+            json_stream_line "stdout" "$line"
+          done
+          stdout_lines="$current_out"
+          had_output=true
+        fi
+
+        # Emit new stderr lines
+        local current_err
+        current_err=$(wc -l < "$stderr_file" 2>/dev/null | tr -d ' ')
+        if [[ "${current_err:-0}" -gt "$stderr_lines" ]]; then
+          tail -n +"$((stderr_lines + 1))" "$stderr_file" 2>/dev/null | while IFS= read -r line; do
+            json_stream_line "stderr" "$line"
+          done
+          stderr_lines="$current_err"
+          had_output=true
+        fi
+
+        # Heartbeat: emit status even when no new output
+        (( poll_count++ )) || true
+        if [[ "$had_output" == "false" && $(( poll_count % heartbeat_every )) -eq 0 ]]; then
+          local elapsed=$(( $(date +%s) - start_time ))
+          local out_bytes err_bytes
+          out_bytes=$(wc -c < "$stdout_file" 2>/dev/null | tr -d ' ')
+          err_bytes=$(wc -c < "$stderr_file" 2>/dev/null | tr -d ' ')
+          printf '{"event":"heartbeat","status":"running","elapsed_seconds":%d,"stdout_bytes":%s,"stderr_bytes":%s,"pid":%d,"timestamp":"%s"}\n' \
+            "$elapsed" "${out_bytes:-0}" "${err_bytes:-0}" "$cmd_pid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        fi
+
+        sleep 0.2 &
+        wait $! 2>/dev/null || true
+      done
+
+      # Clean up tail processes if used
+      if [[ "$quiet" != "true" ]]; then
+        kill "$tail_pid" "$tail_err_pid" 2>/dev/null || true
+        wait "$tail_pid" "$tail_err_pid" 2>/dev/null || true
+      fi
+
+      # Flush any remaining lines after process exits
+      tail -n +"$((stdout_lines + 1))" "$stdout_file" 2>/dev/null | while IFS= read -r line; do
+        json_stream_line "stdout" "$line"
+      done
+      tail -n +"$((stderr_lines + 1))" "$stderr_file" 2>/dev/null | while IFS= read -r line; do
+        json_stream_line "stderr" "$line"
+      done
+
+      wait "$cmd_pid" 2>/dev/null || exit_code=$?
+      end_time=$(date +%s)
+
+      # Kill timeout monitor if active
+      if [[ -n "$TIMEOUT_MONITOR_PID" ]]; then
+        kill "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
+        wait "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
+      fi
+
+      local status="completed"
+      if [[ "$timeout" -gt 0 && ( "$exit_code" -eq 137 || "$exit_code" -eq 143 ) ]]; then
+        status="timeout"
+      elif [[ "$exit_code" -ne 0 ]]; then
+        status="failed"
+      fi
+
+      local stdout_data stderr_data
+      stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
+      stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
+      rm -f "$stdout_file" "$stderr_file"
+
+      if [[ "$plain" == "true" ]]; then
+        plain_output "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time"
+      else
+        json_output "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE"
+      fi
+      return
+    fi
+
+    # Non-streaming TTY: Direct foreground execution (original behavior)
     if [[ "$timeout" -gt 0 ]]; then
       start_timeout_monitor "$$" "$timeout"
     fi
@@ -500,6 +623,99 @@ poll_job() {
     "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE"
 }
 
+poll_job_stream() {
+  local job_id="$1"
+  local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME
+  local poll_count=0
+  local heartbeat_every=$(( ${STATUS_INTERVAL%.*} * 5 ))
+  [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
+
+  load_job_state "$job_id" || {
+    printf '{"error": "Job not found", "job_id": "%s"}\n' "$job_id"
+    return 1
+  }
+
+  json_status_update "monitoring" "$job_id" "Monitoring job: $COMMAND"
+
+  local stdout_lines=0 stderr_lines=0
+  local initial_status="$STATUS"
+
+  # Polling loop with heartbeat events
+  while true; do
+    # Reload job state
+    load_job_state "$job_id" || break
+
+    # Check if process is still running
+    if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2>/dev/null; then
+      wait "$PID" 2>/dev/null
+      local actual_exit=$?
+      if [[ "$actual_exit" -eq 0 ]]; then
+        STATUS="completed"
+      else
+        STATUS="failed"
+      fi
+      update_job_status "$job_id" "$STATUS" "$actual_exit"
+      EXIT_CODE="$actual_exit"
+      END_TIME=$(date +%s)
+    fi
+
+    local had_output=false
+    local lines_to_emit
+
+    # Emit new stdout lines
+    if [[ -f "$STDOUT_FILE" ]]; then
+      local current_out
+      current_out=$(wc -l < "$STDOUT_FILE" 2>/dev/null | tr -d ' ')
+      if [[ "${current_out:-0}" -gt "$stdout_lines" ]]; then
+        lines_to_emit=$(tail -n +"$((stdout_lines + 1))" "$STDOUT_FILE" 2>/dev/null)
+        while IFS= read -r line; do
+          json_stream_line "stdout" "$line"
+        done <<< "$lines_to_emit"
+        stdout_lines="$current_out"
+        had_output=true
+      fi
+    fi
+
+    # Emit new stderr lines
+    if [[ -f "$STDERR_FILE" ]]; then
+      local current_err
+      current_err=$(wc -l < "$STDERR_FILE" 2>/dev/null | tr -d ' ')
+      if [[ "${current_err:-0}" -gt "$stderr_lines" ]]; then
+        lines_to_emit=$(tail -n +"$((stderr_lines + 1))" "$STDERR_FILE" 2>/dev/null)
+        while IFS= read -r line; do
+          json_stream_line "stderr" "$line"
+        done <<< "$lines_to_emit"
+        stderr_lines="$current_err"
+        had_output=true
+      fi
+    fi
+
+    # Heartbeat: emit status even when no new output
+    (( poll_count++ )) || true
+    if [[ "$had_output" == "false" && $(( poll_count % heartbeat_every )) -eq 0 ]]; then
+      local out_bytes=0 err_bytes=0
+      [[ -f "$STDOUT_FILE" ]] && out_bytes=$(wc -c < "$STDOUT_FILE" 2>/dev/null | tr -d ' ')
+      [[ -f "$STDERR_FILE" ]] && err_bytes=$(wc -c < "$STDERR_FILE" 2>/dev/null | tr -d ' ')
+      printf '{"event":"heartbeat","status":"%s","job_id":"%s","pid":%d,"stdout_bytes":%s,"stderr_bytes":%s,"timestamp":"%s"}\n' \
+        "$STATUS" "$job_id" "$PID" "${out_bytes:-0}" "${err_bytes:-0}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    fi
+
+    # Break if job is done
+    if [[ "$STATUS" != "running" ]]; then
+      # Emit final state
+      local stdout_data="" stderr_data=""
+      [[ -f "$STDOUT_FILE" ]] && stdout_data=$(cat "$STDOUT_FILE" 2>/dev/null || true)
+      [[ -f "$STDERR_FILE" ]] && stderr_data=$(cat "$STDERR_FILE" 2>/dev/null || true)
+      json_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
+        "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE"
+      break
+    fi
+
+    sleep 0.2 &
+    wait $! 2>/dev/null || true
+  done
+}
+
 terminate_job() {
   local job_id="$1"
   local signal="${2:-TERM}"
@@ -555,8 +771,48 @@ terminate_all_jobs() {
     "$terminated_count" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 
+format_jobs_pretty() {
+  local job_count=0
+
+  # Header
+  printf '%-20s %-8s %-12s %-50s %s\n' "JOB ID" "PID" "STATUS" "COMMAND" "START TIME"
+  # Separator line (130 dashes)
+  printf '%*s\n' 130 | tr ' ' '-'
+
+  # Rows
+  for job_file in "${JOBS_DIR}"/*.job; do
+    [[ -f "$job_file" ]] || continue
+
+    local JOB_ID="" PID="" COMMAND="" STATUS="" START_TIME="" EXIT_CODE="" END_TIME=""
+    # shellcheck disable=SC1090
+    source "$job_file"
+
+    # Refresh status for running jobs
+    if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2>/dev/null; then
+      STATUS="completed"
+    fi
+
+    # Truncate long commands
+    local cmd_display="${COMMAND:0:48}"
+    [[ ${#COMMAND} -gt 48 ]] && cmd_display="${cmd_display}..."
+    printf '%-20s %-8s %-12s %-50s %s\n' "$JOB_ID" "$PID" "$STATUS" "$cmd_display" "$START_TIME"
+    ((++job_count))
+  done
+
+  # Footer
+  [[ $job_count -gt 0 ]] && printf '%*s\n' 130 | tr ' ' '-'
+  printf 'Total: %d job(s) | Updated: %s\n' "$job_count" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
 list_jobs() {
   init_jobs_dir
+  local pretty="${1:-false}"
+
+  if [[ "$pretty" == "true" ]]; then
+    format_jobs_pretty
+    return
+  fi
+
   local first=true
   printf '{"jobs": ['
 
@@ -632,12 +888,13 @@ USAGE:
 OPTIONS:
   -c, --command <cmd>     Command to execute
   -a, --async             Execute asynchronously (returns job ID)
-  -s, --stream            Stream real-time status updates (sync mode)
+  -s, --stream            Stream real-time status updates (sync mode or with -p for async)
   -t, --timeout <sec>     Timeout in seconds (0 = no timeout)
-  -p, --poll <job_id>     Poll status of async job
+  -p, --poll <job_id>     Poll status of async job (use -s for continuous monitoring)
   -k, --terminate <id>    Terminate async job
   --terminate-all         Terminate all running jobs
-  -l, --list              List all tracked jobs
+  -l, --list              List all tracked jobs (JSON output)
+  --pretty                Format output as aligned table (use with -l)
   --cleanup               Remove completed job artifacts
   --stdin                 Read command from stdin (for shell metacharacters)
   --plain                 Output plain text instead of JSON
@@ -664,7 +921,8 @@ EXAMPLES:
 
   # Async execution
   actuator -a -- npm install
-  actuator --poll 1738800000_12345
+  actuator --poll 1738800000_12345                 # Single poll
+  actuator -p 1738800000_12345 -s                  # Continuous polling with heartbeat
   actuator --terminate 1738800000_12345
 
   # Commands with shell metacharacters (;, |, &&)
@@ -692,7 +950,8 @@ EXAMPLES:
   HEREDOC
 
   # Job management
-  actuator --list
+  actuator --list                    # JSON output
+  actuator --pretty --list           # Formatted table
   actuator --terminate-all
   actuator --cleanup
 
@@ -712,8 +971,8 @@ EOF
 
 main() {
   local command="" mode="sync" timeout="$DEFAULT_TIMEOUT"
-  local stream="false" plain="false" use_tty="false" quiet="false"
-  local poll_id="" terminate_id="" terminate_signal="TERM"
+  local stream="false" plain="false" use_tty="false" quiet="false" pretty="false"
+  local poll_id="" terminate_id="" terminate_signal="TERM" list_jobs_flag="false"
 
   # Get execution sequence number (global for all functions)
   EXEC_SEQUENCE=$(get_next_sequence)
@@ -736,6 +995,13 @@ main() {
     use_tty="true"
   fi
 
+  # Disable TTY when streaming is requested - streaming requires polling mode
+  # to emit heartbeat events. This ensures -s flag always gets heartbeat support.
+  if [[ "$stream" == "true" ]]; then
+    use_tty="false"
+  fi
+
+  # First pass: collect all flags
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -c|--command)
@@ -753,14 +1019,8 @@ main() {
         shift 2
         [[ $# -gt 0 && "$1" != -* ]] && { terminate_signal="$1"; shift; }
         ;;
-      -l|--list)
-        list_jobs; exit 0 ;;
-      --terminate-all)
-        terminate_all_jobs; exit 0 ;;
-      --cleanup)
-        cleanup_jobs || true  # Ignore any errors from cleanup
-        wait  # Wait for any remaining background jobs
-        exit 0 ;;
+      --pretty)
+        pretty="true"; shift ;;
       --stdin)
         command=$(cat); shift ;;
       --plain)
@@ -771,6 +1031,14 @@ main() {
         printf '{"version": "%s"}\n' "$VERSION"; exit 0 ;;
       -h|--help)
         usage; exit 0 ;;
+      -l|--list)
+        list_jobs_flag="true"; shift ;;
+      --terminate-all)
+        terminate_all_jobs; exit 0 ;;
+      --cleanup)
+        cleanup_jobs || true  # Ignore any errors from cleanup
+        wait  # Wait for any remaining background jobs
+        exit 0 ;;
       --)
         shift; command="$*"; break ;;
       -*)
@@ -780,9 +1048,19 @@ main() {
     esac
   done
 
+  # Handle deferred actions
+  if [[ "$list_jobs_flag" == "true" ]]; then
+    list_jobs "$pretty"
+    exit 0
+  fi
+
   # Handle job operations
   if [[ -n "$poll_id" ]]; then
-    poll_job "$poll_id"
+    if [[ "$stream" == "true" ]]; then
+      poll_job_stream "$poll_id"
+    else
+      poll_job "$poll_id"
+    fi
     exit $?
   fi
 
