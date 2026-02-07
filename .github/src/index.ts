@@ -123,41 +123,12 @@ process.on("uncaughtException", unHandle);
 
 const client = new CopilotClient();
 let session: CopilotSession | undefined;
-
 let sessionTimout: NodeJS.Timeout;
-const initSession = async (
-  systemPrompt: string,
-  options: any = {},
+
+const setupSessionEventListener = (
+  session: any,
   abortController: AbortController
 ) => {
-  const { model = "gpt-4.1", mcpServers } = options;
-  logger.log(`🚀 Initializing session with model: ${model}...`);
-  logger.log(`📌 Session ID: ${gSessionId}`);
-  const sessionOptoins = {
-    model,
-    mcpServers,
-    streaming: true,
-    systemMessage: {
-      mode: "append" as const, // [append | replace] - whether to append to or replace the default system SDK security guardrails
-      content: systemPrompt,
-    },
-  };
-
-  try {
-    if (null == session) {
-      session = await client.createSession({
-        ...sessionOptoins,
-        sessionId: gSessionId,
-      });
-    } else {
-      session = await client.resumeSession(gSessionId, sessionOptoins);
-    }
-  } catch (error) {
-    session = await client.createSession({
-      ...sessionOptoins,
-      sessionId: gSessionId,
-    });
-  }
   // ============================================================================
   // Session Event Listener - Comprehensive Event Tracking
   // ============================================================================
@@ -216,7 +187,8 @@ const initSession = async (
   //
   // ============================================================================
 
-  session!.on((event) => {
+  // Keep reference to unsubscribe function to prevent listener from being garbage collected
+  return session.on((event: any) => {
     clearTimeout(sessionTimout);
     sessionTimout = setTimeout(() => abortController.abort(), 10 * 60 * 1000); // 10 minutes
     try {
@@ -416,6 +388,45 @@ const initSession = async (
       console.error("Event handler error:", error);
     }
   });
+};
+
+const initSession = async (
+  systemPrompt: string,
+  options: any = {},
+  abortController: AbortController
+) => {
+  const { model = "gpt-4.1", mcpServers } = options;
+  logger.log(`🚀 Initializing session with model: ${model}...`);
+  logger.log(`📌 Session ID: ${gSessionId}`);
+  const sessionOptoins = {
+    model,
+    mcpServers,
+    streaming: true,
+    systemMessage: {
+      mode: "append" as const, // [append | replace] - whether to append to or replace the default system SDK security guardrails
+      content: systemPrompt,
+    },
+  };
+
+  try {
+    if (null == session) {
+      session = await client.createSession({
+        ...sessionOptoins,
+        sessionId: gSessionId,
+      });
+    } else {
+      session = await client.resumeSession(gSessionId, sessionOptoins);
+    }
+  } catch (error) {
+    session = await client.createSession({
+      ...sessionOptoins,
+      sessionId: gSessionId,
+    });
+  }
+
+  // Attach event listener immediately after session is created
+  // Store the unsubscribe function to keep the listener alive
+  setupSessionEventListener(session, abortController);
 };
 
 const aiCommand = async (prompt: any, systemPrompt: string) => {

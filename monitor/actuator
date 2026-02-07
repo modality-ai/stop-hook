@@ -7,8 +7,26 @@ set -euo pipefail
 
 readonly VERSION="1.0.0"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
+readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
 readonly STATUS_INTERVAL="${ACTUATOR_STATUS_INTERVAL:-2}"
+
+# Global execution sequence (set in main before any command execution)
+EXEC_SEQUENCE=0
+
+# =============================================================================
+# Sequence Counter (execution order tracking)
+# =============================================================================
+
+get_next_sequence() {
+  local current=0
+  if [[ -f "$SEQUENCE_FILE" ]]; then
+    current=$(cat "$SEQUENCE_FILE" 2>/dev/null || echo 0)
+  fi
+  local next=$((current + 1))
+  printf '%d' "$next" > "$SEQUENCE_FILE" 2>/dev/null || true
+  printf '%d' "$next"
+}
 
 # =============================================================================
 # JSON Helpers (no jq dependency)
@@ -28,7 +46,7 @@ json_output() {
   local status="$1" exit_code="$2" command="$3"
   local stdout_data="$4" stderr_data="$5"
   local start_time="$6" end_time="$7"
-  local job_id="${8:-}" pid="${9:-}"
+  local job_id="${8:-}" pid="${9:-}" sequence="${10:-0}"
   local duration=0
 
   if [[ -n "$start_time" && -n "$end_time" ]]; then
@@ -37,7 +55,7 @@ json_output() {
 
   cat <<ENDJSON
 {
-  "version": "${VERSION}",
+  "version": ${sequence},
   "status": "$(json_escape "$status")",
   "exit_code": ${exit_code},
   "command": "$(json_escape "$command")",
@@ -51,6 +69,30 @@ json_output() {
   }$(if [[ -n "$job_id" ]]; then printf ',\n  "job": {\n    "id": "%s",\n    "pid": %s\n  }' "$job_id" "${pid:-0}"; fi)
 }
 ENDJSON
+}
+
+plain_output() {
+  local status="$1" exit_code="$2" command="$3"
+  local stdout_data="$4" stderr_data="$5"
+  local start_time="$6" end_time="$7"
+  local duration=0
+
+  if [[ -n "$start_time" && -n "$end_time" ]]; then
+    duration=$(( end_time - start_time ))
+  fi
+
+  printf '=== Command Execution Result ===\n'
+  printf 'Status: %s\n' "$status"
+  printf 'Exit Code: %d\n' "$exit_code"
+  printf 'Duration: %d seconds\n' "$duration"
+
+  if [[ -n "$stdout_data" ]]; then
+    printf '\n--- Standard Output ---\n%s\n' "$stdout_data"
+  fi
+
+  if [[ -n "$stderr_data" ]]; then
+    printf '\n--- Standard Error ---\n%s\n' "$stderr_data"
+  fi
 }
 
 json_status_update() {
@@ -166,7 +208,7 @@ handle_signal() {
 
   rm -f "$TRAP_STDOUT_FILE" "$TRAP_STDERR_FILE"
 
-  json_output "interrupted" "$exit_code" "$TRAP_COMMAND" "$stdout_data" "$stderr_data" "$TRAP_START_TIME" "$end_time"
+  json_output "interrupted" "$exit_code" "$TRAP_COMMAND" "$stdout_data" "$stderr_data" "$TRAP_START_TIME" "$end_time" "" "" "$EXEC_SEQUENCE"
   exit "$exit_code"
 }
 
@@ -196,6 +238,9 @@ execute_sync() {
   local command="$1"
   local timeout="${2:-$DEFAULT_TIMEOUT}"
   local stream_output="${3:-false}"
+  local plain="${4:-false}"
+  local use_tty="${5:-false}"
+  local quiet="${6:-false}"
 
   local stdout_file stderr_file start_time end_time exit_code=0
   stdout_file=$(mktemp)
@@ -206,8 +251,57 @@ execute_sync() {
     json_status_update "started" "sync" "Executing: ${command}"
   fi
 
-  # Execute command in subshell for clean signal handling
-  bash -c "$command" > "$stdout_file" 2> "$stderr_file" &
+  # Foreground mode: run command directly (not backgrounded) to avoid
+  # SIGTTIN/SIGTTOU signals that suspend backgrounded terminal processes.
+  # Uses tee to BOTH display output on terminal AND capture to files.
+  # Stdin stays as-is so commands like cdiff detect isatty(stdin) for VCS mode
+  # and interactive commands like ssh get terminal input.
+  if [[ "$use_tty" == "true" ]]; then
+    if [[ "$timeout" -gt 0 ]]; then
+      start_timeout_monitor "$$" "$timeout"
+    fi
+
+    if [[ "$quiet" == "true" ]]; then
+      # Quiet mode: suppress terminal output entirely
+      bash -c "$command" > "$stdout_file" 2> "$stderr_file" || exit_code=$?
+    else
+      # Normal mode: display to terminal while capturing
+      bash -c "$command" > >(tee "$stdout_file") 2> >(tee "$stderr_file" >&2) || exit_code=$?
+    fi
+    end_time=$(date +%s)
+
+    if [[ -n "$TIMEOUT_MONITOR_PID" ]]; then
+      kill "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
+      wait "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
+    fi
+
+    # Allow tee processes to flush
+    wait 2>/dev/null || true
+
+    local status="completed"
+    if [[ "$timeout" -gt 0 && ( "$exit_code" -eq 137 || "$exit_code" -eq 143 ) ]]; then
+      status="timeout"
+    elif [[ "$exit_code" -ne 0 ]]; then
+      status="failed"
+    fi
+
+    local stdout_data stderr_data
+    stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
+    stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
+    rm -f "$stdout_file" "$stderr_file"
+
+    if [[ "$plain" == "true" ]]; then
+      plain_output "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time"
+    else
+      json_output "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE"
+    fi
+    return
+  fi
+
+  # Non-TTY mode: background with output capture
+  # This path is used when stdin is piped (not a terminal).
+  # NOTE: < /dev/stdin preserves piped input to child process
+  bash -c "$command" < /dev/stdin > "$stdout_file" 2> "$stderr_file" &
   local cmd_pid=$!
 
   # Set global state for signal handler
@@ -311,7 +405,11 @@ execute_sync() {
 
   rm -f "$stdout_file" "$stderr_file"
 
-  json_output "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time"
+  if [[ "$plain" == "true" ]]; then
+    plain_output "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time"
+  else
+    json_output "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE"
+  fi
 }
 
 # =============================================================================
@@ -321,6 +419,9 @@ execute_sync() {
 execute_async() {
   local command="$1"
   local timeout="${2:-$DEFAULT_TIMEOUT}"
+  local plain="${3:-false}"
+  local use_tty="${4:-false}"
+  local quiet="${5:-false}"
 
   init_jobs_dir
   local job_id
@@ -334,9 +435,15 @@ execute_async() {
   save_job_state "$job_id" "0" "$command" "running" "$start_time"
 
   # Launch command in background subshell
+  # NOTE: < /dev/stdin preserves piped input to child process
+  # For TTY mode: pass through directly (no output capture)
   (
     local exit_code=0
-    eval "$command" > "$stdout_file" 2> "$stderr_file" || exit_code=$?
+    if [[ "$use_tty" == "true" ]]; then
+      eval "$command" || exit_code=$?
+    else
+      eval "$command" < /dev/stdin > "$stdout_file" 2> "$stderr_file" || exit_code=$?
+    fi
 
     # Update job state on completion
     if [[ "$exit_code" -eq 0 ]]; then
@@ -355,7 +462,7 @@ execute_async() {
     start_timeout_monitor "$cmd_pid" "$timeout"
   fi
 
-  json_output "running" "-1" "$command" "" "" "$start_time" "" "$job_id" "$cmd_pid"
+  json_output "running" "-1" "$command" "" "" "$start_time" "" "$job_id" "$cmd_pid" "$EXEC_SEQUENCE" "$quiet"
 }
 
 # =============================================================================
@@ -390,7 +497,7 @@ poll_job() {
   [[ -f "$STDERR_FILE" ]] && stderr_data=$(cat "$STDERR_FILE" 2>/dev/null || true)
 
   json_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
-    "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID"
+    "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE"
 }
 
 terminate_job() {
@@ -414,6 +521,38 @@ terminate_job() {
   else
     json_status_update "already_stopped" "$job_id" "Process is not running"
   fi
+}
+
+terminate_all_jobs() {
+  init_jobs_dir
+  local terminated_count=0
+  local first=true
+  printf '{"terminated_jobs": ['
+
+  for job_file in "${JOBS_DIR}"/*.job; do
+    [[ -f "$job_file" ]] || continue
+
+    local JOB_ID="" PID="" COMMAND="" STATUS=""
+    # shellcheck disable=SC1090
+    source "$job_file" || continue
+
+    # Only terminate if running
+    if [[ "$STATUS" == "running" ]] && kill -0 "$PID" 2>/dev/null; then
+      kill -TERM "$PID" 2>/dev/null || true
+      sleep 0.5
+      kill -0 "$PID" 2>/dev/null && kill -KILL "$PID" 2>/dev/null || true
+      update_job_status "$JOB_ID" "terminated" "143" || true
+
+      [[ "$first" == "true" ]] || printf ','
+      first=false
+      printf '{"job_id": "%s", "pid": %s, "command": "%s"}' \
+        "$JOB_ID" "$PID" "$(json_escape "$COMMAND")" || true
+      ((terminated_count++)) || true
+    fi
+  done
+
+  printf '], "count": %d, "timestamp": "%s"}\n' \
+    "$terminated_count" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 
 list_jobs() {
@@ -486,6 +625,7 @@ USAGE:
   echo "command" | actuator [OPTIONS]
   actuator --poll <job_id>
   actuator --terminate <job_id> [signal]
+  actuator --terminate-all
   actuator --list
   actuator --cleanup
 
@@ -496,10 +636,12 @@ OPTIONS:
   -t, --timeout <sec>     Timeout in seconds (0 = no timeout)
   -p, --poll <job_id>     Poll status of async job
   -k, --terminate <id>    Terminate async job
+  --terminate-all         Terminate all running jobs
   -l, --list              List all tracked jobs
   --cleanup               Remove completed job artifacts
   --stdin                 Read command from stdin (for shell metacharacters)
   --plain                 Output plain text instead of JSON
+  -q, --quiet             Suppress command output from terminal and metadata
   -v, --version           Show version
   -h, --help              Show this help
 
@@ -515,6 +657,10 @@ EXAMPLES:
 
   # Stream real-time status
   actuator -s -- make build
+
+  # Suppress command output, keep metadata only
+  actuator -q "git diff --staged ./"
+  actuator --quiet --plain "npm test"
 
   # Async execution
   actuator -a -- npm install
@@ -547,6 +693,7 @@ EXAMPLES:
 
   # Job management
   actuator --list
+  actuator --terminate-all
   actuator --cleanup
 
 ENVIRONMENT:
@@ -565,8 +712,11 @@ EOF
 
 main() {
   local command="" mode="sync" timeout="$DEFAULT_TIMEOUT"
-  local stream="false" plain="false"
+  local stream="false" plain="false" use_tty="false" quiet="false"
   local poll_id="" terminate_id="" terminate_signal="TERM"
+
+  # Get execution sequence number (global for all functions)
+  EXEC_SEQUENCE=$(get_next_sequence)
 
   # Auto-detect piped stdin when no args
   if [[ $# -eq 0 ]]; then
@@ -576,6 +726,14 @@ main() {
       usage
       exit 0
     fi
+  fi
+
+  # Auto-enable TTY if stdin is a terminal (nothing piped)
+  # TTY mode runs commands in the FOREGROUND so they get real terminal access.
+  # This allows interactive commands (ssh) and isatty-dependent commands (cdiff)
+  # to work correctly. Output goes directly to the user's terminal.
+  if [[ -t 0 && "$use_tty" == "false" ]]; then
+    use_tty="true"
   fi
 
   while [[ $# -gt 0 ]]; do
@@ -597,6 +755,8 @@ main() {
         ;;
       -l|--list)
         list_jobs; exit 0 ;;
+      --terminate-all)
+        terminate_all_jobs; exit 0 ;;
       --cleanup)
         cleanup_jobs || true  # Ignore any errors from cleanup
         wait  # Wait for any remaining background jobs
@@ -605,6 +765,8 @@ main() {
         command=$(cat); shift ;;
       --plain)
         plain="true"; shift ;;
+      -q|--quiet)
+        quiet="true"; shift ;;
       -v|--version)
         printf '{"version": "%s"}\n' "$VERSION"; exit 0 ;;
       -h|--help)
@@ -638,10 +800,10 @@ main() {
   # Execute
   case "$mode" in
     sync)
-      execute_sync "$command" "$timeout" "$stream"
+      execute_sync "$command" "$timeout" "$stream" "$plain" "$use_tty" "$quiet"
       ;;
     async)
-      execute_async "$command" "$timeout"
+      execute_async "$command" "$timeout" "$plain" "$use_tty" "$quiet"
       ;;
   esac
 }
