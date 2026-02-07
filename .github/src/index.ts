@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 
-import { SweAgentInteraction } from "./utils/SweAgentInteraction";
+import { SweAgentInteraction } from "./SweAgentInteraction";
 import { CopilotClient, type CopilotSession } from "@github/copilot-sdk";
 import { appendFileSync } from "fs";
+import { execSync } from "child_process";
 
 // Global session ID - Snowflake-like ID (distributed system friendly)
 let gSessionId = `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
@@ -121,7 +122,19 @@ const unHandle = (reason: any) => {
 process.on("unhandledRejection", unHandle);
 process.on("uncaughtException", unHandle);
 
-const client = new CopilotClient();
+const getCopilotPathFromWhich = (): string | null => {
+  try {
+    const output = execSync("which copilot", { encoding: "utf-8" });
+    return output.trim();
+  } catch (error) {
+    return null;
+  }
+};
+
+const client = new CopilotClient({
+  cliPath: getCopilotPathFromWhich() || undefined,
+});
+
 let session: CopilotSession | undefined;
 let sessionTimout: NodeJS.Timeout;
 
