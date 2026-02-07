@@ -1,6 +1,6 @@
 {
   "version": "0.0.0",
-  "name": "copilot-loop",
+  "name": "@modality-ai/copilot-loop",
   "author": "Hill <hill@kimo.com>",
   "license": "ISC",
   "devDependencies": {

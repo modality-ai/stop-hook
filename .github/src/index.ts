@@ -578,8 +578,8 @@ const main = async () => {
   const mode = parseCliArgs("--debug") ? "confirm" : "yolo";
 
   // Apply CLI overrides to promptConfig
-  if (sessionOverride && typeof sessionOverride === "string") {
-    gSessionId = sessionOverride;
+  if (sessionOverride) {
+    gSessionId = sessionOverride as string;
   }
   if (modelOverride) {
     promptConfig.model = modelOverride;
