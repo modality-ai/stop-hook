@@ -408,8 +408,11 @@ const initSession = async (
   options: any = {},
   abortController: AbortController
 ) => {
-  const { model = "gpt-4.1", reasoningEffort, mcpServers } = options;
-  logger.log(`🚀 Initializing session with model: ${model}...`);
+  const defaultModel = options.reasoningEffort ? "gpt-5-mini" : "gpt-4.1";
+  const { model = defaultModel, reasoningEffort, mcpServers } = options;
+  logger.log(
+    `🚀 Initializing session with model: ${model} ${reasoningEffort ? "reasoningEffort: " + reasoningEffort : "..."}`
+  );
   logger.log(`📌 Session ID: ${gSessionId}`);
   const sessionOptoins = {
     model,
