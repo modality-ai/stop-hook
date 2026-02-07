@@ -21,10 +21,11 @@ const CONFIG = {
   PROMISE_LINES: 10,
 } as const;
 
-const DEFAULT_COMPLETION_PROMISE = "DONE";
+const DEFAULT_COMPLETION_PROMISE = "PDCA_LOOP_COMPLETED";
 const DEFAULT_MAX_ITERATIONS = 3;
 const DEFAULT_FUNC = async (val: any, _systePromp: string) => val;
-const DEFAULT_SYSTEM_PROMPT = `You are executing the PDCA (Plan-Do-Check-Act) LOOP ([CURRENT] / [MAX]) to achieve the mission. Upon achieving excellence standards, output '<promise>[PROMISE]</promise>' in your final line and provide the promise carefully to guarantee high-quality outcomes.`;
+const DEFAULT_SYSTEM_PROMPT = `You are executing the PDCA (Plan-Do-Check-Act) LOOP ([CURRENT] / [MAX]),
+  EXPLAIN and EXECUTE your four PDCA rounds in the best way until you achieve excellence standards, then output '<promise>[PROMISE]</promise>' in your final line.`;
 
 class SweAgent {
   protected mode: Mode = Mode.CONFIRM;

@@ -408,7 +408,7 @@ const initSession = async (
   options: any = {},
   abortController: AbortController
 ) => {
-  const { model = "gpt-4.1", mcpServers } = options;
+  const { model = "gpt-4.1", reasoningEffort, mcpServers } = options;
   logger.log(`🚀 Initializing session with model: ${model}...`);
   logger.log(`📌 Session ID: ${gSessionId}`);
   const sessionOptoins = {
@@ -419,6 +419,7 @@ const initSession = async (
       mode: "append" as const, // [append | replace] - whether to append to or replace the default system SDK security guardrails
       content: systemPrompt,
     },
+    reasoningEffort, // [low|medium|high|xhigh] Ensure maximum reasoning effort for new sessions
   };
 
   try {
@@ -519,6 +520,7 @@ Options:
   -a <prompt>         Append a prompt to existing prompt
   -s <id>             Specify session ID for resuming sessions
   --model <model>     Specify the AI model to use
+  --think <level>     Set reasoning effort (low|medium|high|xhigh)
   --max <iterations>  Set maximum iterations for agent loop
   --promise <phrase>  Set completion promise phrase
   --timeout-ms <ms>   Set timeout in milliseconds (default: 7 days)
@@ -547,6 +549,7 @@ const main = async () => {
   const promiseOverride = parseCliArgs("--promise");
   const modelOverride = parseCliArgs("--model");
   const personaOverride = parseCliArgs("--persona");
+  const reasoningEffortOverride = parseCliArgs("--think");
   const timeout = parseCliArgs("--timeout") || 86400 * 7; // 7 days
 
   // Accept config file from first positional argument or --config flag
@@ -589,6 +592,9 @@ const main = async () => {
   }
   if (personaOverride) {
     promptConfig.persona = personaOverride;
+  }
+  if (reasoningEffortOverride) {
+    promptConfig.reasoningEffort = reasoningEffortOverride;
   }
   promptConfig.timeout = timeout;
 
