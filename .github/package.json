@@ -13,19 +13,19 @@
   },
   "exports": {
     "types": "./dist/types/index.d.ts",
-    "require": "./dist/index.js",
-    "import": "./dist/index.js"
+    "require": "./dist/index.mjs",
+    "import": "./dist/index.mjs"
   },
   "types": "./dist/types/index.d.ts",
-  "main": "./dist/index.js",
-  "module": "./dist/index.js",
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
   "bin": {
-    "copilot-loop": "./dist/index.js"
+    "copilot-loop": "./dist/index.mjs"
   },
   "scripts": {
     "build:clean": "find ./dist -name '*.*' | xargs rm -rf",
     "build:types": "bun tsc -p ./",
-    "build:src": "bun build src/index.ts --outdir dist --target node",
+    "build:src": "bun build src/index.ts --outfile dist/index.mjs --target node",
     "build": "bun run build:clean && bun run build:types && bun run build:src",
     "dev": "bunx concurrently 'bun --watch tsc  -p ./' 'bun build:src -- --watch --sourcemap=inline'",
     "test": "npm run build",
