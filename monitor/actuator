@@ -5,7 +5,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.0.1"
+readonly VERSION="1.0.2"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -141,9 +141,12 @@ update_job_status() {
   [[ -f "$job_file" ]] || return 0  # Don't fail if file doesn't exist yet
 
   if command -v sed &>/dev/null; then
-    sed -i.bak "s/^STATUS=.*/STATUS='${status}'/" "$job_file" 2>/dev/null || \
-      sed -i '' "s/^STATUS=.*/STATUS='${status}'/" "$job_file" || true
-    rm -f "${job_file}.bak"
+    local escaped_status="${status//&/\\&}"  # Escape ampersand for sed replacement
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+      sed -i '' "s|^STATUS=.*|STATUS='${escaped_status//\'/\'\\\'\'}'|" "$job_file" || true
+    else
+      sed -i "s|^STATUS=.*|STATUS='${escaped_status//\'/\'\\\'\'}'|" "$job_file" || true
+    fi
   fi
 
   if [[ -n "$exit_code" ]]; then
@@ -545,10 +548,15 @@ execute_async() {
   local plain="${3:-false}"
   local use_tty="${4:-false}"
   local quiet="${5:-false}"
+  local custom_job_id="${6:-}"
 
   init_jobs_dir
   local job_id
-  job_id=$(generate_job_id)
+  if [[ -n "$custom_job_id" ]]; then
+    job_id="$custom_job_id"
+  else
+    job_id=$(generate_job_id)
+  fi
   local stdout_file="${JOBS_DIR}/${job_id}.stdout"
   local stderr_file="${JOBS_DIR}/${job_id}.stderr"
   local start_time
@@ -556,29 +564,38 @@ execute_async() {
 
   # Save job state BEFORE launching background process
   save_job_state "$job_id" "0" "$command" "running" "$start_time"
+  
+  # Create output files to ensure they exist
+  touch "$stdout_file" "$stderr_file"
 
-  # Launch command in background subshell
-  # NOTE: < /dev/stdin preserves piped input to child process
-  # For TTY mode: pass through directly (no output capture)
-  (
-    local exit_code=0
-    if [[ "$use_tty" == "true" ]]; then
-      eval "$command" || exit_code=$?
+  # Launch command in background process with proper exit code handling
+  {
+    bash -c "$command" >"$stdout_file" 2>"$stderr_file" || true
+    exit_code=$?
+    
+    # Update job state on completion  
+    if [[ $exit_code -eq 0 ]]; then
+      # Need to source the job file to get variables needed by update_job_status
+      source "${JOBS_DIR}/${job_id}.job" 2>/dev/null || true
+      echo "STATUS='completed'" >> "${JOBS_DIR}/${job_id}.job"
+      echo "EXIT_CODE='0'" >> "${JOBS_DIR}/${job_id}.job"
+      echo "END_TIME='$(date +%s)'" >> "${JOBS_DIR}/${job_id}.job"
     else
-      eval "$command" < /dev/stdin > "$stdout_file" 2> "$stderr_file" || exit_code=$?
+      source "${JOBS_DIR}/${job_id}.job" 2>/dev/null || true
+      echo "STATUS='failed'" >> "${JOBS_DIR}/${job_id}.job"
+      echo "EXIT_CODE='${exit_code}'" >> "${JOBS_DIR}/${job_id}.job"
+      echo "END_TIME='$(date +%s)'" >> "${JOBS_DIR}/${job_id}.job"
     fi
-
-    # Update job state on completion
-    if [[ "$exit_code" -eq 0 ]]; then
-      update_job_status "$job_id" "completed" "$exit_code"
-    else
-      update_job_status "$job_id" "failed" "$exit_code"
-    fi
-  ) &
+  } &
   local cmd_pid=$!
 
   # Update with actual process ID
-  sed -i '' "s/^PID=.*/PID='${cmd_pid}'/" "${JOBS_DIR}/${job_id}.job"
+  # Use sed -i with optional suffix for compatibility (macOS uses -i '', Linux uses -i)
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    sed -i '' "s/^PID=.*/PID='${cmd_pid}'/" "${JOBS_DIR}/${job_id}.job"
+  else
+    sed -i "s/^PID=.*/PID='${cmd_pid}'/" "${JOBS_DIR}/${job_id}.job"
+  fi
 
   # Start timeout monitor if configured
   if [[ "$timeout" -gt 0 ]]; then
@@ -752,8 +769,8 @@ terminate_all_jobs() {
     # shellcheck disable=SC1090
     source "$job_file" || continue
 
-    # Only terminate if running
-    if [[ "$STATUS" == "running" ]] && kill -0 "$PID" 2>/dev/null; then
+    # Only terminate if running and PID is valid (not 0 or empty)
+    if [[ "$STATUS" == "running" ]] && [[ -n "$PID" && "$PID" != "0" ]] && kill -0 "$PID" 2>/dev/null; then
       kill -TERM "$PID" 2>/dev/null || true
       sleep 0.5
       kill -0 "$PID" 2>/dev/null && kill -KILL "$PID" 2>/dev/null || true
@@ -853,7 +870,11 @@ cleanup_jobs() {
     local should_clean=false
     if [[ "$STATUS" != "running" ]]; then
       should_clean=true
+    elif [[ -z "$PID" || "$PID" == "0" ]]; then
+      # Invalid PID - clean up orphaned job
+      should_clean=true
     elif ! kill -0 "$PID" 2>/dev/null; then
+      # Process is dead
       should_clean=true
     fi
 
@@ -888,6 +909,7 @@ USAGE:
 OPTIONS:
   -c, --command <cmd>     Command to execute
   -a, --async             Execute asynchronously (returns job ID)
+  -j, --job-id <id>       Custom job ID for async execution (default: auto-generated)
   -s, --stream            Stream real-time status updates (sync mode or with -p for async)
   -t, --timeout <sec>     Timeout in seconds (0 = no timeout)
   -p, --poll <job_id>     Poll status of async job (use -s for continuous monitoring)
@@ -921,6 +943,7 @@ EXAMPLES:
 
   # Async execution
   actuator -a -- npm install
+  actuator -a -j my_build -- npm run build        # Custom job ID
   actuator --poll 1738800000_12345                 # Single poll
   actuator -p 1738800000_12345 -s                  # Continuous polling with heartbeat
   actuator --terminate 1738800000_12345
@@ -973,6 +996,7 @@ main() {
   local command="" mode="sync" timeout="$DEFAULT_TIMEOUT"
   local stream="false" plain="false" use_tty="false" quiet="false" pretty="false"
   local poll_id="" terminate_id="" terminate_signal="TERM" list_jobs_flag="false"
+  local custom_job_id=""
 
   # Get execution sequence number (global for all functions)
   EXEC_SEQUENCE=$(get_next_sequence)
@@ -1008,6 +1032,8 @@ main() {
         command="$2"; shift 2 ;;
       -a|--async)
         mode="async"; shift ;;
+      -j|--job-id)
+        custom_job_id="$2"; shift 2 ;;
       -s|--stream)
         stream="true"; shift ;;
       -t|--timeout)
@@ -1081,7 +1107,7 @@ main() {
       execute_sync "$command" "$timeout" "$stream" "$plain" "$use_tty" "$quiet"
       ;;
     async)
-      execute_async "$command" "$timeout" "$plain" "$use_tty" "$quiet"
+      execute_async "$command" "$timeout" "$plain" "$use_tty" "$quiet" "$custom_job_id"
       ;;
   esac
 }
