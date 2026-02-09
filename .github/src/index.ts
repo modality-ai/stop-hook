@@ -423,6 +423,9 @@ const initSession = async (
       content: systemPrompt,
     },
     reasoningEffort, // [low|medium|high|xhigh] Ensure maximum reasoning effort for new sessions
+    infiniteSessions: { // https://github.com/github/copilot-sdk/blob/main/nodejs/src/types.ts#L584
+      backgroundCompactionThreshold: 0.65
+    },
   };
 
   try {

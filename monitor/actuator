@@ -5,7 +5,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.0.2"
+readonly VERSION="1.0.3"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -34,13 +34,18 @@ get_next_sequence() {
 # =============================================================================
 
 json_escape() {
-  local str="$1"
-  str="${str//\\/\\\\}"
-  str="${str//\"/\\\"}"
-  str="${str//$'\n'/\\n}"
-  str="${str//$'\r'/\\r}"
-  str="${str//$'\t'/\\t}"
-  printf '%s' "$str"
+  # Use awk for efficient escaping - bash ${str//} is O(n²) on large strings
+  printf '%s' "$1" | awk '
+    BEGIN { ORS="" }
+    {
+      gsub(/\\/, "\\\\")
+      gsub(/"/, "\\\"")
+      gsub(/\t/, "\\t")
+      gsub(/\r/, "\\r")
+      if (NR > 1) printf "\\n"
+      printf "%s", $0
+    }
+  '
 }
 
 json_output() {
