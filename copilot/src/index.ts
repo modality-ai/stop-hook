@@ -439,7 +439,9 @@ const initSession = async (
       onPreToolUse: async (input: any): Promise<PreToolUseHookOutput> => {
         // Automatically wrap bash commands with 'actuator -s'
         if (input.toolName === "bash" || input.toolName === "shell") {
-          if (-1 === input.toolArgs.indexOf(">")) {
+          // Strip '2>/dev/null' first, then detect '>'
+          const strippedArgs = input.toolArgs.replace(/2>\/dev\/null/g, "");
+          if (-1 === strippedArgs.indexOf(">")) {
             try {
               const toolArgs = JSON.parse(input.toolArgs);
               const originalCmd = toolArgs?.command || "";
