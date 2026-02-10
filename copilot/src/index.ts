@@ -426,6 +426,18 @@ const initSession = async (
     infiniteSessions: { // https://github.com/github/copilot-sdk/blob/main/nodejs/src/types.ts#L584
       backgroundCompactionThreshold: 0.65
     },
+    onPreToolUse: async (input: any) => {
+      // Automatically wrap bash commands with 'actuator -s'
+      if (input.toolName === "bash" || input.toolName === "shell") {
+        const originalCmd = input.toolArgs?.[0] || "";
+        const wrappedCmd = `actuator -s ${originalCmd}`;
+        return {
+          permissionDecision: "allow",
+          modifiedArgs: [wrappedCmd],
+        };
+      }
+      return { permissionDecision: "allow" };
+    },
   };
 
   try {

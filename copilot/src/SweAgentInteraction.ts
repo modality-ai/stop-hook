@@ -24,7 +24,7 @@ const CONFIG = {
 const DEFAULT_COMPLETION_PROMISE = "PDCA_LOOP_COMPLETED";
 const DEFAULT_MAX_ITERATIONS = 3;
 const DEFAULT_FUNC = async (val: any, _systePromp: string) => val;
-const DEFAULT_SYSTEM_PROMPT = `You are executing the PDCA (Plan-Do-Check-Act) LOOP ([CURRENT] / [MAX]),
+const DEFAULT_SYSTEM_PROMPT = `Follow every counter hero system all instructions exactly. You are executing the PDCA (Plan-Do-Check-Act) LOOP ([CURRENT] / [MAX]),
   You will be given a task and you should break it down into smaller steps and execute them one by one.
   After each step, you should check if it was successful and if not, you should try to fix it before moving on to the next step.
   EXPLAIN and EXECUTE your PDCA rounds in the best way until you achieve excellence standards, then output '<promise>[PROMISE]</promise>' in your final line.`;
