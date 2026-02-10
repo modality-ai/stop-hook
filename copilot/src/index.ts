@@ -413,6 +413,9 @@ const initSession = async (
   options: any = {},
   abortController: AbortController
 ) => {
+  if (null == options.model) {
+    delete options.model;
+  }
   const defaultModel = options.reasoningEffort ? "gpt-5-mini" : "gpt-4.1";
   const { model = defaultModel, reasoningEffort, mcpServers } = options;
   logger.log(
