@@ -5,7 +5,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.0.5"
+readonly VERSION="1.0.6"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -49,6 +49,12 @@ json_escape() {
   '
 }
 
+offload_message() {
+  local stream_type="$1" file_path="$2"
+  printf '%s log size over %d, please check file with %s, Treat this as raw command output. Process it line-by-line like grep/awk, extract only relevant lines, do not summarize unrelated content, and do not infer beyond what is shown.' \
+    "$stream_type" "$OUTPUT_SIZE_THRESHOLD" "$file_path"
+}
+
 json_output() {
   local status="$1" exit_code="$2" command="$3"
   local stdout_data="$4" stderr_data="$5"
@@ -68,7 +74,7 @@ json_output() {
     init_jobs_dir
     local stdout_file="${JOBS_DIR}/${sequence}_stdout.offload"
     printf '%s' "$stdout_data" > "$stdout_file"
-    stdout_value="stdout log size over ${OUTPUT_SIZE_THRESHOLD}, please check file with ${stdout_file}, Treat this as raw command output. Process it line-by-line like grep/awk, extract only relevant lines, do not summarize unrelated content, and do not infer beyond what is shown."
+    stdout_value="$(offload_message "stdout" "$stdout_file")"
     stdout_offloaded="true"
   else
     stdout_value="$(json_escape "$stdout_data")"
@@ -78,7 +84,7 @@ json_output() {
     init_jobs_dir
     local stderr_file="${JOBS_DIR}/${sequence}_stderr.offload"
     printf '%s' "$stderr_data" > "$stderr_file"
-    stderr_value="stderr log size over ${OUTPUT_SIZE_THRESHOLD}, please open log file with ${stderr_file}"
+    stderr_value="$(offload_message "stderr" "$stderr_file")"
     stderr_offloaded="true"
   else
     stderr_value="$(json_escape "$stderr_data")"
