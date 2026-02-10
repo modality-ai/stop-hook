@@ -443,7 +443,9 @@ const initSession = async (
             try {
               const toolArgs = JSON.parse(input.toolArgs);
               const originalCmd = toolArgs?.command || "";
-              const command = `actuator -q -s -- ${originalCmd}`;
+              const jobId = input.timestamp;
+              const command = `actuator -j ${jobId} -a -- ${originalCmd}; actuator -s -p ${jobId}`;
+              toolArgs.description = `${toolArgs.description || ""}, Keep monitoring the job status until completion.`;
               return {
                 permissionDecision: "allow",
                 modifiedArgs: { ...toolArgs, command },

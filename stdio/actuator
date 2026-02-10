@@ -5,7 +5,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.0.6"
+readonly VERSION="1.0.7"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -141,7 +141,7 @@ ENDJSON
 
 json_stream_line() {
   local stream="$1" data="$2"
-  printf '{"event":"%s","data":"%s","timestamp":"%s"}\n' \
+  printf '{"event":"%s","status":"running","data":"%s","timestamp":"%s"}\n' \
     "$stream" "$(json_escape "$data")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 
@@ -288,7 +288,7 @@ execute_sync() {
   start_time=$(date +%s)
 
   if [[ "$stream_output" == "true" ]]; then
-    json_status_update "started" "sync" "Executing: ${command}"
+    json_status_update "running" "sync" "Executing: ${command}"
   fi
 
   # Foreground mode: run command directly (not backgrounded) to avoid
@@ -650,7 +650,7 @@ poll_job() {
   local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME
 
   load_job_state "$job_id" || {
-    printf '{"error": "Job not found", "job_id": "%s"}\n' "$job_id"
+    printf '{"status":"error","error": "Job not found", "job_id": "%s"}\n' "$job_id"
     return 1
   }
 
@@ -684,11 +684,11 @@ poll_job_stream() {
   [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
 
   load_job_state "$job_id" || {
-    printf '{"error": "Job not found", "job_id": "%s"}\n' "$job_id"
+    printf '{"status":"error","error": "Job not found", "job_id": "%s"}\n' "$job_id"
     return 1
   }
 
-  json_status_update "monitoring" "$job_id" "Monitoring job: $COMMAND"
+  json_status_update "running" "$job_id" "Monitoring job: $COMMAND"
 
   local stdout_lines=0 stderr_lines=0
   local initial_status="$STATUS"
@@ -775,7 +775,7 @@ terminate_job() {
   local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE
 
   load_job_state "$job_id" || {
-    printf '{"error": "Job not found", "job_id": "%s"}\n' "$job_id"
+    printf '{"status":"error","error": "Job not found", "job_id": "%s"}\n' "$job_id"
     return 1
   }
 
@@ -1111,7 +1111,7 @@ main() {
       --)
         shift; command="$*"; break ;;
       -*)
-        printf '{"error": "Unknown option: %s"}\n' "$1" >&2; exit 1 ;;
+        printf '{"status":"error","error": "Unknown option: %s"}\n' "$1" >&2; exit 1 ;;
       *)
         command="$*"; break ;;
     esac
@@ -1140,7 +1140,7 @@ main() {
 
   # Validate command
   if [[ -z "$command" ]]; then
-    printf '{"error": "No command specified. Use -h for help."}\n' >&2
+    printf '{"status":"error","error": "No command specified. Use -h for help."}\n' >&2
     exit 1
   fi
 
