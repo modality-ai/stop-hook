@@ -436,16 +436,16 @@ const initSession = async (
       onPreToolUse: async (input: any): Promise<PreToolUseHookOutput> => {
         // Automatically wrap bash commands with 'actuator -s'
         if (input.toolName === "bash" || input.toolName === "shell") {
-          try {
-            const toolArgs = JSON.parse(input.toolArgs);
-            const originalCmd = toolArgs?.command || "";
-            const command = `actuator -q -s -- ${originalCmd}`;
-            return {
-              permissionDecision: "allow",
-              modifiedArgs: { ...toolArgs, command },
-            };
-          } catch (error) {
-            return { permissionDecision: "allow" };
+          if (-1 === input.toolArgs.indexOf(">")) {
+            try {
+              const toolArgs = JSON.parse(input.toolArgs);
+              const originalCmd = toolArgs?.command || "";
+              const command = `actuator -q -s -- ${originalCmd}`;
+              return {
+                permissionDecision: "allow",
+                modifiedArgs: { ...toolArgs, command },
+              };
+            } catch (error) {}
           }
         }
         return { permissionDecision: "allow" };
