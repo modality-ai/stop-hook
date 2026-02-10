@@ -5,6 +5,11 @@ import { CopilotClient, type CopilotSession } from "@github/copilot-sdk";
 import { appendFileSync } from "fs";
 import { execSync } from "child_process";
 
+type PreToolUseHookOutput = {
+  permissionDecision: "allow" | "deny" | "ask";
+  modifiedArgs?: Record<string, any>;
+};
+
 // Global session ID - Snowflake-like ID (distributed system friendly)
 let gSessionId = `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
 // Simple logger wrapper
@@ -423,20 +428,28 @@ const initSession = async (
       content: systemPrompt,
     },
     reasoningEffort, // [low|medium|high|xhigh] Ensure maximum reasoning effort for new sessions
-    infiniteSessions: { // https://github.com/github/copilot-sdk/blob/main/nodejs/src/types.ts#L584
-      backgroundCompactionThreshold: 0.65
+    infiniteSessions: {
+      // https://github.com/github/copilot-sdk/blob/main/nodejs/src/types.ts#L584
+      backgroundCompactionThreshold: 0.65,
     },
-    onPreToolUse: async (input: any) => {
-      // Automatically wrap bash commands with 'actuator -s'
-      if (input.toolName === "bash" || input.toolName === "shell") {
-        const originalCmd = input.toolArgs?.[0] || "";
-        const wrappedCmd = `actuator -s ${originalCmd}`;
-        return {
-          permissionDecision: "allow",
-          modifiedArgs: [wrappedCmd],
-        };
-      }
-      return { permissionDecision: "allow" };
+    hooks: {
+      onPreToolUse: async (input: any): Promise<PreToolUseHookOutput> => {
+        // Automatically wrap bash commands with 'actuator -s'
+        if (input.toolName === "bash" || input.toolName === "shell") {
+          try {
+            const toolArgs = JSON.parse(input.toolArgs);
+            const originalCmd = toolArgs?.command || "";
+            const command = `actuator -q -s -- ${originalCmd}`;
+            return {
+              permissionDecision: "allow",
+              modifiedArgs: { ...toolArgs, command },
+            };
+          } catch (error) {
+            return { permissionDecision: "allow" };
+          }
+        }
+        return { permissionDecision: "allow" };
+      },
     },
   };
 
@@ -494,9 +507,12 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
     // Race between sendAndWait and abort signal
     const sendTimeoutMs = promptConfig.timeout * 1000;
     if (null != promptConfig.persona) {
-      await session.sendAndWait({
-        prompt: getPersonaPrompt(promptConfig.persona),
-      }, sendTimeoutMs);
+      await session.sendAndWait(
+        {
+          prompt: getPersonaPrompt(promptConfig.persona),
+        },
+        sendTimeoutMs
+      );
     }
     const response = await Promise.race([
       session.sendAndWait({ prompt }, sendTimeoutMs),
