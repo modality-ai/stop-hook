@@ -5,7 +5,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.0.4"
+readonly VERSION="1.0.5"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -68,7 +68,7 @@ json_output() {
     init_jobs_dir
     local stdout_file="${JOBS_DIR}/${sequence}_stdout.offload"
     printf '%s' "$stdout_data" > "$stdout_file"
-    stdout_value="stdout log size over ${OUTPUT_SIZE_THRESHOLD}, please open log file with ${stdout_file}"
+    stdout_value="stdout log size over ${OUTPUT_SIZE_THRESHOLD}, please check file with ${stdout_file}, Treat this as raw command output. Process it line-by-line like grep/awk, extract only relevant lines, do not summarize unrelated content, and do not infer beyond what is shown."
     stdout_offloaded="true"
   else
     stdout_value="$(json_escape "$stdout_data")"
