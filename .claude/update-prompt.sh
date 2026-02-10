@@ -25,12 +25,12 @@ extract_json_value() {
   # Build patterns based on type
   if [[ "$type" == "number" ]]; then
     local grep_pattern="\"${key}\"\\s*:\\s*\\K[0-9]+"
-    local sed_pattern="s/.*\"${key}\"\\s*:\\s*([0-9]+).*/\\1/"
+    local sed_pattern="s/.*\"${key}\"[ ]*:[ ]*([0-9]+).*/\\1/"
     local awk_sep="\"${key}\":"
     local awk_end='[,}]'
   else
     local grep_pattern="\"${key}\"\\s*:\\s*\"\\K[^\"]*(?=\")"
-    local sed_pattern="s/.*\"${key}\"\\s*:\\s*\"([^\"]*)\".*/\\1/"
+    local sed_pattern="s/.*\"${key}\"[ ]*:[ ]*\"([^\"]*)\".*/\\1/"
     local awk_sep="\"${key}\":\""
     local awk_end='"'
   fi
@@ -75,8 +75,10 @@ fi
 {
   # Extract YAML frontmatter (everything between first and second ---)
   sed -n '/^---$/,/^---$/p' "$STATE"
+  # Preserve existing content after frontmatter
+  tail -n +5 "$STATE"
   echo ""
-  # Add new prompt
+  # Append new prompt
   echo "$PROMPT"
 } > "$STATE.tmp" && cp "$STATE.tmp" "$STATE"
 

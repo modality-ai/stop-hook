@@ -480,13 +480,14 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
     }
 
     // Race between sendAndWait and abort signal
+    const sendTimeoutMs = promptConfig.timeout * 1000;
     if (null != promptConfig.persona) {
       await session.sendAndWait({
         prompt: getPersonaPrompt(promptConfig.persona),
-      });
+      }, sendTimeoutMs);
     }
     const response = await Promise.race([
-      session.sendAndWait({ prompt }, promptConfig.timeout * 1000),
+      session.sendAndWait({ prompt }, sendTimeoutMs),
       new Promise<never>((_, reject) => {
         abortController.signal.addEventListener("abort", () => {
           reject(new Error("Operation aborted due to server hang"));
