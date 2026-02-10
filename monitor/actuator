@@ -5,11 +5,12 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.0.3"
+readonly VERSION="1.0.4"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
 readonly STATUS_INTERVAL="${ACTUATOR_STATUS_INTERVAL:-2}"
+readonly OUTPUT_SIZE_THRESHOLD=23000
 
 # Global execution sequence (set in main before any command execution)
 EXEC_SEQUENCE=0
@@ -59,14 +60,38 @@ json_output() {
     duration=$(( end_time - start_time ))
   fi
 
+  # Offload large stdout/stderr to files when over threshold
+  local stdout_value stderr_value
+  local stdout_offloaded="false" stderr_offloaded="false"
+
+  if [[ ${#stdout_data} -gt $OUTPUT_SIZE_THRESHOLD ]]; then
+    init_jobs_dir
+    local stdout_file="${JOBS_DIR}/${sequence}_stdout.offload"
+    printf '%s' "$stdout_data" > "$stdout_file"
+    stdout_value="stdout log size over ${OUTPUT_SIZE_THRESHOLD}, please open log file with ${stdout_file}"
+    stdout_offloaded="true"
+  else
+    stdout_value="$(json_escape "$stdout_data")"
+  fi
+
+  if [[ ${#stderr_data} -gt $OUTPUT_SIZE_THRESHOLD ]]; then
+    init_jobs_dir
+    local stderr_file="${JOBS_DIR}/${sequence}_stderr.offload"
+    printf '%s' "$stderr_data" > "$stderr_file"
+    stderr_value="stderr log size over ${OUTPUT_SIZE_THRESHOLD}, please open log file with ${stderr_file}"
+    stderr_offloaded="true"
+  else
+    stderr_value="$(json_escape "$stderr_data")"
+  fi
+
   cat <<ENDJSON
 {
   "version": ${sequence},
   "status": "$(json_escape "$status")",
   "exit_code": ${exit_code},
   "command": "$(json_escape "$command")",
-  "stdout": "$(json_escape "$stdout_data")",
-  "stderr": "$(json_escape "$stderr_data")",
+  "stdout": "${stdout_value}",$(if [[ "$stdout_offloaded" == "true" ]]; then printf '\n  "stdout_offloaded": true,'; fi)
+  "stderr": "${stderr_value}",$(if [[ "$stderr_offloaded" == "true" ]]; then printf '\n  "stderr_offloaded": true,'; fi)
   "metadata": {
     "start_time": ${start_time:-0},
     "end_time": ${end_time:-0},
@@ -888,8 +913,15 @@ cleanup_jobs() {
       ((cleaned++))
     fi
   done
+  # Clean up offloaded output files (created when stdout/stderr exceed size threshold)
+  local offloaded=0
+  for offload_file in "${JOBS_DIR}"/*.offload; do
+    [[ -f "$offload_file" ]] || continue
+    rm -f "$offload_file"
+    ((offloaded++))
+  done
   shopt -u nullglob  # Reset
-  printf '{"cleaned": %d, "timestamp": "%s"}\n' "$cleaned" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '{"cleaned": %d, "offloaded_cleaned": %d, "timestamp": "%s"}\n' "$cleaned" "$offloaded" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 
 # =============================================================================
