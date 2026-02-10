@@ -3,6 +3,7 @@
 import { SweAgentInteraction } from "./SweAgentInteraction";
 import { CopilotClient, type CopilotSession } from "@github/copilot-sdk";
 import { appendFileSync } from "fs";
+import { appendFile } from "fs/promises";
 import { execSync } from "child_process";
 
 type PreToolUseHookOutput = {
@@ -440,20 +441,26 @@ const initSession = async (
         // Automatically wrap bash commands with 'actuator -s'
         if (input.toolName === "bash" || input.toolName === "shell") {
           // Strip '2>/dev/null' first, then detect '>'
-          const strippedArgs = input.toolArgs.replace(/2>\/dev\/null/g, "");
-          if (-1 === strippedArgs.indexOf(">")) {
-            try {
-              const toolArgs = JSON.parse(input.toolArgs);
-              const originalCmd = toolArgs?.command || "";
+          try {
+            const toolArgs = JSON.parse(input.toolArgs);
+            const originalCmd = toolArgs?.command || "";
+            appendFile(
+              "/tmp/copilot-loop-command.log",
+              `${new Date().toISOString()} [${gSessionId}] ${originalCmd}\n`
+            ).catch(() => {});
+            const strippedCmd = originalCmd.replace(/2>\/dev\/null/g, "");
+            if (-1 === strippedCmd.indexOf(">")) {
               const jobId = input.timestamp;
               const command = `actuator -j ${jobId} -a -- ${originalCmd}; actuator -s -p ${jobId}`;
-              toolArgs.description = `${toolArgs.description || ""}, Keep monitoring the job status until completion.`;
               return {
                 permissionDecision: "allow",
-                modifiedArgs: { ...toolArgs, command },
+                modifiedArgs: {
+                  ...toolArgs,
+                  command,
+                },
               };
-            } catch (error) {}
-          }
+            }
+          } catch (error) {}
         }
         return { permissionDecision: "allow" };
       },
