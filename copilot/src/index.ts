@@ -144,9 +144,9 @@ const unHandle = (reason: any) => {
 process.on("unhandledRejection", unHandle);
 process.on("uncaughtException", unHandle);
 
-const getCopilotPathFromWhich = (): string | null => {
+const whichCli = (cli: string): string | null => {
   try {
-    const output = execSync("which copilot", { encoding: "utf-8" });
+    const output = execSync(`which ${cli}`, { encoding: "utf-8" });
     return output.trim();
   } catch (error) {
     return null;
@@ -154,7 +154,7 @@ const getCopilotPathFromWhich = (): string | null => {
 };
 
 const client = new CopilotClient({
-  cliPath: getCopilotPathFromWhich() || undefined,
+  cliPath: whichCli("copilot") || undefined,
 });
 
 let session: CopilotSession | undefined;
