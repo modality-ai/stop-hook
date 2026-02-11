@@ -48,6 +48,22 @@ const parseCliArgs = (flag: string) => {
   return flag === "--debug" ? true : null;
 };
 
+// Collect positional args from argv[2..] using '---' as boundary separator
+// Bun strips '--' from process.argv, so we use '---' which Bun preserves
+// Usage: `bun script.ts --- exec ls -la` → argv includes '---' → positional = [exec, ls, -la]
+const getPositionalArgs = (): string[] => {
+  const ddIndex = process.argv.indexOf("---");
+  if (ddIndex !== -1) {
+    return process.argv.slice(ddIndex + 1);
+  }
+  const args: string[] = [];
+  for (let i = 2; i < process.argv.length; i++) {
+    if (process.argv[i].startsWith("-")) break;
+    args.push(process.argv[i]);
+  }
+  return args;
+};
+
 // Load and parse YAML prompt file
 const loadPromptFile = async (filePath: any) => {
   if (typeof filePath !== "string") {
@@ -451,7 +467,7 @@ const initSession = async (
             const strippedCmd = originalCmd.replace(/2>\/dev\/null/g, "");
             if (-1 === strippedCmd.indexOf(">")) {
               const jobId = input.timestamp;
-              const command = `actuator -j ${jobId} -a -- ${originalCmd}; actuator -s -p ${jobId}`;
+              const command = `actuator --plain -j ${jobId} -a --- ${originalCmd}; actuator --plain -s -p ${jobId}`;
               return {
                 permissionDecision: "allow",
                 modifiedArgs: {
@@ -574,12 +590,14 @@ Options:
   --promise <phrase>  Set completion promise phrase
   --timeout-ms <ms>   Set timeout in milliseconds (default: 7 days)
   --debug             Use confirm mode instead of yolo mode
+  --- <args>          Pass remaining arguments as prompt (Bun strips '--', so use '---')
 
 Examples:
   copilot-loop config.yaml
   copilot-loop --config config.yaml
   copilot-loop -p "your prompt here"
   copilot-loop -a "additional prompt text"
+  copilot-loop --- ls -la
   copilot-loop config.yaml --debug
   copilot-loop --model gpt-4.1 --max 10 --promise "Task completed"
   copilot-loop -p "your prompt" --model claude-3-sonnet --max 5
@@ -601,12 +619,18 @@ const main = async () => {
   const reasoningEffortOverride = parseCliArgs("--think");
   const timeout = parseCliArgs("--timeout") || 86400 * 7; // 7 days
 
-  // Accept config file from first positional argument or --config flag
-  const firstArg = process.argv[2];
-  configFile =
-    firstArg && !firstArg.startsWith("-") ? firstArg : parseCliArgs("--config");
+  // Positional args: everything from argv[2] until first "-" prefixed arg
+  // Handles `bun script.ts -- ls -la` since Bun strips "--" and passes [ls, -la]
+  const positionalArgs = getPositionalArgs();
+  const firstArg = positionalArgs[0];
+  const isYamlFile = firstArg?.endsWith(".yaml") || firstArg?.endsWith(".yml");
 
-  if (!configFile && !directPrompt && !parseCliArgs("--debug")) {
+  configFile = isYamlFile ? firstArg : parseCliArgs("--config");
+  const commandPrompt = !isYamlFile && !directPrompt && positionalArgs.length > 0
+    ? positionalArgs.join(" ")
+    : null;
+
+  if (!configFile && !directPrompt && !commandPrompt && !parseCliArgs("--debug")) {
     printHelp();
   }
 
@@ -619,6 +643,8 @@ const main = async () => {
   }
   if (directPrompt) {
     initialPrompt = directPrompt;
+  } else if (commandPrompt) {
+    initialPrompt = commandPrompt;
   } else if (appendPrompt) {
     initialPrompt += "\n" + appendPrompt;
   }

@@ -5,7 +5,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.0.7"
+readonly VERSION="1.1.0"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -14,6 +14,8 @@ readonly OUTPUT_SIZE_THRESHOLD=23000
 
 # Global execution sequence (set in main before any command execution)
 EXEC_SEQUENCE=0
+PLAIN_MODE="false"
+QUIET_MODE="false"
 
 # =============================================================================
 # Sequence Counter (execution order tracking)
@@ -93,8 +95,7 @@ json_output() {
   cat <<ENDJSON
 {
   "version": ${sequence},
-  "status": "$(json_escape "$status")",
-  "exit_code": ${exit_code},
+  "status": "$(json_escape "$status")",$(if [[ "$exit_code" -ne -1 ]]; then printf '\n  "exit_code": %d,' "$exit_code"; fi)
   "command": "$(json_escape "$command")",
   "stdout": "${stdout_value}",$(if [[ "$stdout_offloaded" == "true" ]]; then printf '\n  "stdout_offloaded": true,'; fi)
   "stderr": "${stderr_value}",$(if [[ "$stderr_offloaded" == "true" ]]; then printf '\n  "stderr_offloaded": true,'; fi)
@@ -112,6 +113,7 @@ plain_output() {
   local status="$1" exit_code="$2" command="$3"
   local stdout_data="$4" stderr_data="$5"
   local start_time="$6" end_time="$7"
+  local job_id="${8:-}" pid="${9:-}"
   local duration=0
 
   if [[ -n "$start_time" && -n "$end_time" ]]; then
@@ -120,8 +122,13 @@ plain_output() {
 
   printf '=== Command Execution Result ===\n'
   printf 'Status: %s\n' "$status"
-  printf 'Exit Code: %d\n' "$exit_code"
+  [[ "$exit_code" -ne -1 ]] && printf 'Exit Code: %d\n' "$exit_code"
   printf 'Duration: %d seconds\n' "$duration"
+
+  if [[ -n "$job_id" ]]; then
+    printf 'Job ID: %s\n' "$job_id"
+    printf 'PID: %s\n' "${pid:-0}"
+  fi
 
   if [[ -n "$stdout_data" ]]; then
     printf '\n--- Standard Output ---\n%s\n' "$stdout_data"
@@ -133,6 +140,7 @@ plain_output() {
 }
 
 json_status_update() {
+  [[ "$PLAIN_MODE" == "true" ]] && return
   local status="$1" job_id="$2" message="${3:-}"
   cat <<ENDJSON
 {"event": "status_update", "status": "$(json_escape "$status")", "job_id": "$(json_escape "$job_id")", "message": "$(json_escape "$message")", "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
@@ -141,6 +149,15 @@ ENDJSON
 
 json_stream_line() {
   local stream="$1" data="$2"
+  if [[ "$PLAIN_MODE" == "true" ]]; then
+    [[ "$QUIET_MODE" == "true" ]] && return
+    if [[ "$stream" == "stderr" ]]; then
+      printf '[stderr] %s\n' "$data"
+    else
+      printf '%s\n' "$data"
+    fi
+    return
+  fi
   printf '{"event":"%s","status":"running","data":"%s","timestamp":"%s"}\n' \
     "$stream" "$(json_escape "$data")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
@@ -367,8 +384,13 @@ execute_sync() {
           local out_bytes err_bytes
           out_bytes=$(wc -c < "$stdout_file" 2>/dev/null | tr -d ' ')
           err_bytes=$(wc -c < "$stderr_file" 2>/dev/null | tr -d ' ')
-          printf '{"event":"heartbeat","status":"running","elapsed_seconds":%d,"stdout_bytes":%s,"stderr_bytes":%s,"pid":%d,"timestamp":"%s"}\n' \
-            "$elapsed" "${out_bytes:-0}" "${err_bytes:-0}" "$cmd_pid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if [[ "$PLAIN_MODE" == "true" ]]; then
+            [[ "$QUIET_MODE" != "true" ]] && printf '[heartbeat] running %ds stdout=%sB stderr=%sB\n' \
+              "$elapsed" "${out_bytes:-0}" "${err_bytes:-0}"
+          else
+            printf '{"event":"heartbeat","status":"running","elapsed_seconds":%d,"stdout_bytes":%s,"stderr_bytes":%s,"pid":%d,"timestamp":"%s"}\n' \
+              "$elapsed" "${out_bytes:-0}" "${err_bytes:-0}" "$cmd_pid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          fi
         fi
 
         sleep 0.2 &
@@ -522,8 +544,13 @@ execute_sync() {
         local out_bytes err_bytes
         out_bytes=$(wc -c < "$stdout_file" 2>/dev/null | tr -d ' ')
         err_bytes=$(wc -c < "$stderr_file" 2>/dev/null | tr -d ' ')
-        printf '{"event":"heartbeat","status":"running","elapsed_seconds":%d,"stdout_bytes":%s,"stderr_bytes":%s,"pid":%d,"timestamp":"%s"}\n' \
-          "$elapsed" "${out_bytes:-0}" "${err_bytes:-0}" "$cmd_pid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        if [[ "$PLAIN_MODE" == "true" ]]; then
+          printf '[heartbeat] running %ds stdout=%sB stderr=%sB\n' \
+            "$elapsed" "${out_bytes:-0}" "${err_bytes:-0}"
+        else
+          printf '{"event":"heartbeat","status":"running","elapsed_seconds":%d,"stdout_bytes":%s,"stderr_bytes":%s,"pid":%d,"timestamp":"%s"}\n' \
+            "$elapsed" "${out_bytes:-0}" "${err_bytes:-0}" "$cmd_pid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        fi
       fi
 
       sleep 0.2 &
@@ -638,7 +665,11 @@ execute_async() {
     start_timeout_monitor "$cmd_pid" "$timeout"
   fi
 
-  json_output "running" "-1" "$command" "" "" "$start_time" "" "$job_id" "$cmd_pid" "$EXEC_SEQUENCE" "$quiet"
+  if [[ "$plain" == "true" ]]; then
+    plain_output "running" "-1" "$command" "" "" "$start_time" "" "$job_id" "$cmd_pid"
+  else
+    json_output "running" "-1" "$command" "" "" "$start_time" "" "$job_id" "$cmd_pid" "$EXEC_SEQUENCE"
+  fi
 }
 
 # =============================================================================
@@ -647,10 +678,15 @@ execute_async() {
 
 poll_job() {
   local job_id="$1"
+  local plain="${2:-false}"
   local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME
 
   load_job_state "$job_id" || {
-    printf '{"status":"error","error": "Job not found", "job_id": "%s"}\n' "$job_id"
+    if [[ "$plain" == "true" ]]; then
+      printf 'Error: Job not found: %s\n' "$job_id" >&2
+    else
+      printf '{"status":"error","error": "Job not found", "job_id": "%s"}\n' "$job_id"
+    fi
     return 1
   }
 
@@ -672,23 +708,37 @@ poll_job() {
   [[ -f "$STDOUT_FILE" ]] && stdout_data=$(cat "$STDOUT_FILE" 2>/dev/null || true)
   [[ -f "$STDERR_FILE" ]] && stderr_data=$(cat "$STDERR_FILE" 2>/dev/null || true)
 
-  json_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
-    "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE"
+  if [[ "$plain" == "true" ]]; then
+    plain_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
+      "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID"
+  else
+    json_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
+      "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE"
+  fi
 }
 
 poll_job_stream() {
   local job_id="$1"
+  local plain="${2:-false}"
   local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME
   local poll_count=0
   local heartbeat_every=$(( ${STATUS_INTERVAL%.*} * 5 ))
   [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
 
   load_job_state "$job_id" || {
-    printf '{"status":"error","error": "Job not found", "job_id": "%s"}\n' "$job_id"
+    if [[ "$plain" == "true" ]]; then
+      printf 'Error: Job not found: %s\n' "$job_id" >&2
+    else
+      printf '{"status":"error","error": "Job not found", "job_id": "%s"}\n' "$job_id"
+    fi
     return 1
   }
 
-  json_status_update "running" "$job_id" "Monitoring job: $COMMAND"
+  if [[ "$plain" == "true" ]]; then
+    printf '[monitoring] Job %s: %s\n' "$job_id" "$COMMAND"
+  else
+    json_status_update "running" "$job_id" "Monitoring job: $COMMAND"
+  fi
 
   local stdout_lines=0 stderr_lines=0
   local initial_status="$STATUS"
@@ -722,7 +772,11 @@ poll_job_stream() {
       if [[ "${current_out:-0}" -gt "$stdout_lines" ]]; then
         lines_to_emit=$(tail -n +"$((stdout_lines + 1))" "$STDOUT_FILE" 2>/dev/null)
         while IFS= read -r line; do
-          json_stream_line "stdout" "$line"
+          if [[ "$plain" == "true" ]]; then
+            printf '%s\n' "$line"
+          else
+            json_stream_line "stdout" "$line"
+          fi
         done <<< "$lines_to_emit"
         stdout_lines="$current_out"
         had_output=true
@@ -736,7 +790,11 @@ poll_job_stream() {
       if [[ "${current_err:-0}" -gt "$stderr_lines" ]]; then
         lines_to_emit=$(tail -n +"$((stderr_lines + 1))" "$STDERR_FILE" 2>/dev/null)
         while IFS= read -r line; do
-          json_stream_line "stderr" "$line"
+          if [[ "$plain" == "true" ]]; then
+            printf '[stderr] %s\n' "$line"
+          else
+            json_stream_line "stderr" "$line"
+          fi
         done <<< "$lines_to_emit"
         stderr_lines="$current_err"
         had_output=true
@@ -749,8 +807,14 @@ poll_job_stream() {
       local out_bytes=0 err_bytes=0
       [[ -f "$STDOUT_FILE" ]] && out_bytes=$(wc -c < "$STDOUT_FILE" 2>/dev/null | tr -d ' ')
       [[ -f "$STDERR_FILE" ]] && err_bytes=$(wc -c < "$STDERR_FILE" 2>/dev/null | tr -d ' ')
-      printf '{"event":"heartbeat","status":"%s","job_id":"%s","pid":%d,"stdout_bytes":%s,"stderr_bytes":%s,"timestamp":"%s"}\n' \
-        "$STATUS" "$job_id" "$PID" "${out_bytes:-0}" "${err_bytes:-0}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      if [[ "$plain" == "true" ]]; then
+        local elapsed=$(( $(date +%s) - START_TIME ))
+        printf '[heartbeat] %s %ds stdout=%sB stderr=%sB\n' \
+          "$STATUS" "$elapsed" "${out_bytes:-0}" "${err_bytes:-0}"
+      else
+        printf '{"event":"heartbeat","status":"%s","job_id":"%s","pid":%d,"stdout_bytes":%s,"stderr_bytes":%s,"timestamp":"%s"}\n' \
+          "$STATUS" "$job_id" "$PID" "${out_bytes:-0}" "${err_bytes:-0}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      fi
     fi
 
     # Break if job is done
@@ -759,8 +823,13 @@ poll_job_stream() {
       local stdout_data="" stderr_data=""
       [[ -f "$STDOUT_FILE" ]] && stdout_data=$(cat "$STDOUT_FILE" 2>/dev/null || true)
       [[ -f "$STDERR_FILE" ]] && stderr_data=$(cat "$STDERR_FILE" 2>/dev/null || true)
-      json_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
-        "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE"
+      if [[ "$plain" == "true" ]]; then
+        plain_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
+          "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID"
+      else
+        json_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
+          "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE"
+      fi
       break
     fi
 
@@ -859,9 +928,9 @@ format_jobs_pretty() {
 
 list_jobs() {
   init_jobs_dir
-  local pretty="${1:-false}"
+  local plain="${1:-false}"
 
-  if [[ "$pretty" == "true" ]]; then
+  if [[ "$plain" == "true" ]]; then
     format_jobs_pretty
     return
   fi
@@ -940,7 +1009,7 @@ Universal CLI Execution Tool v1.0.0
 
 USAGE:
   actuator [OPTIONS] <command>
-  actuator [OPTIONS] -- <command args...>
+  actuator [OPTIONS] --- <command args...>
   actuator [OPTIONS] --stdin
   echo "command" | actuator [OPTIONS]
   actuator --poll <job_id>
@@ -958,8 +1027,7 @@ OPTIONS:
   -p, --poll <job_id>     Poll status of async job (use -s for continuous monitoring)
   -k, --terminate <id>    Terminate async job
   --terminate-all         Terminate all running jobs
-  -l, --list              List all tracked jobs (JSON output)
-  --pretty                Format output as aligned table (use with -l)
+  -l, --list              List all tracked jobs (JSON output, use --plain for table format)
   --cleanup               Remove completed job artifacts
   --stdin                 Read command from stdin (for shell metacharacters)
   --plain                 Output plain text instead of JSON
@@ -971,22 +1039,22 @@ EXAMPLES:
   # Synchronous execution
   actuator "echo 'hello world'"
   actuator -c "ls -la /tmp"
-  actuator -- ls -la /tmp
+  actuator --- ls -la /tmp
 
   # With timeout (30 seconds)
   actuator -t 30 "sleep 60"
-  actuator -t 30 -- sleep 60
+  actuator -t 30 --- sleep 60
 
   # Stream real-time status
-  actuator -s -- make build
+  actuator -s --- make build
 
   # Suppress command output, keep metadata only
   actuator -q "git diff --staged ./"
   actuator --quiet --plain "npm test"
 
   # Async execution
-  actuator -a -- npm install
-  actuator -a -j my_build -- npm run build        # Custom job ID
+  actuator -a --- npm install
+  actuator -a -j my_build --- npm run build       # Custom job ID
   actuator --poll 1738800000_12345                 # Single poll
   actuator -p 1738800000_12345 -s                  # Continuous polling with heartbeat
   actuator --terminate 1738800000_12345
@@ -1017,7 +1085,7 @@ EXAMPLES:
 
   # Job management
   actuator --list                    # JSON output
-  actuator --pretty --list           # Formatted table
+  actuator --list --plain            # Formatted table
   actuator --terminate-all
   actuator --cleanup
 
@@ -1037,7 +1105,7 @@ EOF
 
 main() {
   local command="" mode="sync" timeout="$DEFAULT_TIMEOUT"
-  local stream="false" plain="false" use_tty="false" quiet="false" pretty="false"
+  local stream="false" plain="false" use_tty="false" quiet="false"
   local poll_id="" terminate_id="" terminate_signal="TERM" list_jobs_flag="false"
   local custom_job_id=""
 
@@ -1062,12 +1130,6 @@ main() {
     use_tty="true"
   fi
 
-  # Disable TTY when streaming is requested - streaming requires polling mode
-  # to emit heartbeat events. This ensures -s flag always gets heartbeat support.
-  if [[ "$stream" == "true" ]]; then
-    use_tty="false"
-  fi
-
   # First pass: collect all flags
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1088,8 +1150,6 @@ main() {
         shift 2
         [[ $# -gt 0 && "$1" != -* ]] && { terminate_signal="$1"; shift; }
         ;;
-      --pretty)
-        pretty="true"; shift ;;
       --stdin)
         command=$(cat); shift ;;
       --plain)
@@ -1108,7 +1168,7 @@ main() {
         cleanup_jobs || true  # Ignore any errors from cleanup
         wait  # Wait for any remaining background jobs
         exit 0 ;;
-      --)
+      ---)
         shift; command="$*"; break ;;
       -*)
         printf '{"status":"error","error": "Unknown option: %s"}\n' "$1" >&2; exit 1 ;;
@@ -1117,18 +1177,28 @@ main() {
     esac
   done
 
+  # Disable TTY when streaming is requested - streaming requires polling mode
+  # to emit heartbeat events. This ensures -s flag always gets heartbeat support.
+  if [[ "$stream" == "true" ]]; then
+    use_tty="false"
+  fi
+
+  # Set global mode flags for json helper functions
+  PLAIN_MODE="$plain"
+  QUIET_MODE="$quiet"
+
   # Handle deferred actions
   if [[ "$list_jobs_flag" == "true" ]]; then
-    list_jobs "$pretty"
+    list_jobs "$plain"
     exit 0
   fi
 
   # Handle job operations
   if [[ -n "$poll_id" ]]; then
     if [[ "$stream" == "true" ]]; then
-      poll_job_stream "$poll_id"
+      poll_job_stream "$poll_id" "$plain"
     else
-      poll_job "$poll_id"
+      poll_job "$poll_id" "$plain"
     fi
     exit $?
   fi
