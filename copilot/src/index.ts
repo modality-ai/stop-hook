@@ -481,7 +481,13 @@ const initSession = async (
                     }
                     if (toolResultData.status !== "running") {
                       gActuatorId = null;
-                      gLlm = `Bash Tool Execution Result: ${toolResultData.stderr || toolResultData.stdout}`;
+                      gLlm = `[Tool Result] ${input.toolArgs.description}\nExit Code: ${toolResultData.exit_code}`;
+                      if (toolResultData.stderr) {
+                        gLlm += `\nStderr:\n${toolResultData.stderr}`;
+                      }
+                      if (toolResultData.stdout) {
+                        gLlm += `\nStdout:\n${toolResultData.stdout}`;
+                      }
                       return gLlm;
                     }
                   }
@@ -519,6 +525,7 @@ const initSession = async (
                   writeMode = "-w";
                 }
                 gActuatorId = input.timestamp;
+                console.log(`Bash Job: ${gActuatorId}`);
                 const command = `actuator ${writeMode} --plain -j ${gActuatorId} -a --- ${originalCmd}; actuator -s -p ${gActuatorId}`;
                 return {
                   permissionDecision: "allow",
