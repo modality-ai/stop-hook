@@ -512,17 +512,19 @@ const initSession = async (
               ).catch(() => {});
               if (hasActuator) {
                 const strippedCmd = originalCmd.replace(/2>\/dev\/null/g, "");
+                let writeMode = "";
                 if (-1 === strippedCmd.indexOf(">")) {
-                  gActuatorId = input.timestamp;
-                  const command = `actuator --plain -j ${gActuatorId} -a --- ${originalCmd}; actuator -s -p ${gActuatorId}`;
-                  return {
-                    permissionDecision: "allow",
-                    modifiedArgs: {
-                      ...toolArgs,
-                      command,
-                    },
-                  };
+                  writeMode = "-w";
                 }
+                gActuatorId = input.timestamp;
+                const command = `actuator ${writeMode} --plain -j ${gActuatorId} -a --- ${originalCmd}; actuator -s -p ${gActuatorId}`;
+                return {
+                  permissionDecision: "allow",
+                  modifiedArgs: {
+                    ...toolArgs,
+                    command,
+                  },
+                };
               }
             } catch (error) {}
             break;
@@ -764,7 +766,8 @@ const main = async () => {
   }
 
   // Use confirm mode for --debug or bare --resume (no session ID provided)
-  const mode = parseCliArgs("--debug") || sessionOverride === true ? "confirm" : "yolo";
+  const mode =
+    parseCliArgs("--debug") || sessionOverride === true ? "confirm" : "yolo";
 
   // Apply CLI overrides to promptConfig
   if (sessionOverride === true) {
