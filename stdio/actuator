@@ -5,7 +5,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.2.2"
+readonly VERSION="1.3.0"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -218,38 +218,75 @@ generate_job_id() {
   printf '%s_%s' "$(date +%s)" "$$"
 }
 
+# Write complete job file atomically (temp file + mv)
+# Usage: write_job_file "$job_file" "KEY1='val1'" "KEY2='val2'" ...
+write_job_file() {
+  local job_file="$1"
+  shift
+  local tmp_file="${job_file}.tmp.${BASHPID:-$$}.${RANDOM}"
+  printf '%s\n' "$@" > "$tmp_file"
+  mv -f "$tmp_file" "$job_file"
+}
+
+# Update specific fields in job file atomically
+# Reads current file, replaces matching keys or appends new ones,
+# writes to temp file, then mv (POSIX atomic rename).
+# Usage: update_job_fields "$job_file" "STATUS='completed'" "EXIT_CODE='0'"
+update_job_fields() {
+  local job_file="$1"
+  shift
+  [[ -f "$job_file" ]] || return 0
+
+  local tmp_file="${job_file}.tmp.${BASHPID:-$$}.${RANDOM}"
+  local updates=("$@")
+
+  {
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      local key="${line%%=*}"
+      local replaced=false
+      for i in "${!updates[@]}"; do
+        local update_key="${updates[$i]%%=*}"
+        if [[ "$key" == "$update_key" ]]; then
+          printf '%s\n' "${updates[$i]}"
+          unset 'updates[$i]'
+          replaced=true
+          break
+        fi
+      done
+      [[ "$replaced" == "false" ]] && printf '%s\n' "$line"
+    done < "$job_file"
+
+    # Append any new fields not already in the file
+    for update in "${updates[@]}"; do
+      [[ -n "$update" ]] && printf '%s\n' "$update"
+    done
+  } > "$tmp_file"
+
+  mv -f "$tmp_file" "$job_file"
+}
+
 save_job_state() {
   local job_id="$1" pid="$2" command="$3" status="$4" start_time="$5"
   local job_file="${JOBS_DIR}/${job_id}.job"
-  cat > "$job_file" <<EOF
-JOB_ID='${job_id}'
-PID='${pid}'
-COMMAND='${command//\'/\'\\\'\'}'
-STATUS='${status}'
-START_TIME='${start_time}'
-STDOUT_FILE='${JOBS_DIR}/${job_id}.stdout'
-STDERR_FILE='${JOBS_DIR}/${job_id}.stderr'
-EOF
+  write_job_file "$job_file" \
+    "JOB_ID='${job_id}'" \
+    "PID='${pid}'" \
+    "COMMAND='${command//\'/\'\\\'\'}'" \
+    "STATUS='${status}'" \
+    "START_TIME='${start_time}'" \
+    "STDOUT_FILE='${JOBS_DIR}/${job_id}.stdout'" \
+    "STDERR_FILE='${JOBS_DIR}/${job_id}.stderr'"
 }
 
 update_job_status() {
   local job_id="$1" status="$2" exit_code="${3:-}"
   local job_file="${JOBS_DIR}/${job_id}.job"
-  [[ -f "$job_file" ]] || return 0  # Don't fail if file doesn't exist yet
 
-  if command -v sed &>/dev/null; then
-    local escaped_status="${status//&/\\&}"  # Escape ampersand for sed replacement
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-      sed -i '' "s|^STATUS=.*|STATUS='${escaped_status//\'/\'\\\'\'}'|" "$job_file" || true
-    else
-      sed -i "s|^STATUS=.*|STATUS='${escaped_status//\'/\'\\\'\'}'|" "$job_file" || true
-    fi
-  fi
-
+  local updates=("STATUS='${status}'")
   if [[ -n "$exit_code" ]]; then
-    echo "EXIT_CODE='${exit_code}'" >> "$job_file"
-    echo "END_TIME='$(date +%s)'" >> "$job_file"
+    updates+=("EXIT_CODE='${exit_code}'" "END_TIME='$(date +%s)'")
   fi
+  update_job_fields "$job_file" "${updates[@]}"
 }
 
 load_job_state() {
@@ -691,30 +728,20 @@ execute_async() {
 
   # Background mode: fire-and-forget with job tracking
   {
-    bash -c "$command" >"$stdout_file" 2>"$stderr_file" || true
-    exit_code=$?
+    local exit_code=0
+    bash -c "$command" >"$stdout_file" 2>"$stderr_file" || exit_code=$?
 
-    # Update job state on completion
+    # Update job state atomically on completion
     if [[ $exit_code -eq 0 ]]; then
-      source "${JOBS_DIR}/${job_id}.job" 2>/dev/null || true
-      echo "STATUS='completed'" >> "${JOBS_DIR}/${job_id}.job"
-      echo "EXIT_CODE='0'" >> "${JOBS_DIR}/${job_id}.job"
-      echo "END_TIME='$(date +%s)'" >> "${JOBS_DIR}/${job_id}.job"
+      update_job_status "$job_id" "completed" "0"
     else
-      source "${JOBS_DIR}/${job_id}.job" 2>/dev/null || true
-      echo "STATUS='failed'" >> "${JOBS_DIR}/${job_id}.job"
-      echo "EXIT_CODE='${exit_code}'" >> "${JOBS_DIR}/${job_id}.job"
-      echo "END_TIME='$(date +%s)'" >> "${JOBS_DIR}/${job_id}.job"
+      update_job_status "$job_id" "failed" "$exit_code"
     fi
   } &
   local cmd_pid=$!
 
-  # Update with actual process ID
-  if [[ "$OSTYPE" == "darwin"* ]]; then
-    sed -i '' "s/^PID=.*/PID='${cmd_pid}'/" "${JOBS_DIR}/${job_id}.job"
-  else
-    sed -i "s/^PID=.*/PID='${cmd_pid}'/" "${JOBS_DIR}/${job_id}.job"
-  fi
+  # Update with actual process ID (atomic)
+  update_job_fields "${JOBS_DIR}/${job_id}.job" "PID='${cmd_pid}'"
 
   # Start timeout monitor if configured
   if [[ "$timeout" -gt 0 ]]; then
@@ -1065,8 +1092,8 @@ cleanup_jobs() {
 # =============================================================================
 
 usage() {
+  printf 'Universal CLI Execution Tool v%s\n' "$VERSION"
   cat <<'EOF'
-Universal CLI Execution Tool v1.0.0
 
 USAGE:
   actuator [OPTIONS] <command>
