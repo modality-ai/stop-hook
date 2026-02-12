@@ -8,39 +8,86 @@ Files
 
 Usage
 - Run `copilot-loop [config-file] [options]`
-- Common flags supported (extracted from the entrypoint):
+- CLI flags:
   - [config-file]            Load YAML config (positional) or use `--config <file>`
-  - -p <prompt>              Directly input a prompt
-  - -a <prompt>              Append additional prompt text
-  - -s <id>                  Specify session ID for resuming sessions
-  - --model <model>          Specify model (default gpt-4.1)
-  - --think <level>         Set reasoning effort (low|medium|high|xhigh)
-  - --max <iterations>      Set maximum iterations for the PDCA loop
-  - --promise <phrase>      Set completion promise phrase (default: PDCA_LOOP_COMPLETED)
-  - --timeout <seconds>     Set RPC timeout in seconds
-  - --debug                 Use confirm mode instead of yolo mode
-  - --persona <name>        Deploy persona at session start (the tool will send a persona prompt when provided)
+  - -p <prompt>              Execute a prompt in non-interactive mode
+  - -a <prompt>              Append additional prompt text to config prompt
+  - --resume [sessionId]     Resume from a previous session (optionally specify session ID; without ID, resumes last session from `/tmp/copilot-loop-last-session`)
+  - -r                       Shorthand for `--resume` (sets confirm mode)
+  - --model <model>          Specify the AI model to use
+  - --think <level>          Set reasoning effort (choices: low, medium, high, xhigh)
+  - --max <iterations>       Set maximum iterations for agent loop
+  - --promise <phrase>       Set completion promise phrase for task completion
+  - --timeout <seconds>      Set timeout in seconds (default: 604800 / 7 days)
+  - --persona <name>         Deploy a specific persona to activate and maintain persistence
+  - --debug                  Use confirm mode for permission prompts instead of automatic approval
+  - -h, --help               Display help for command
 
 Behavior notes
-- The tool implements a PDCA (Plan-Do-Check-Act) loop and expects the assistant to emit a completion promise (default: `PDCA_LOOP_COMPLETED`) to terminate.
-- Signal handling (SIGINT/SIGTERM) will attempt graceful session abort and client cleanup; the script also listens for stdout stream destruction and common Copilot disconnect errors.
-- The interactive loop supports two modes: `yolo` (auto-iterate) and `confirm` (ask before executing commands).
+- The tool implements a PDCA (Plan-Do-Check-Act) loop and expects the assistant to emit a completion promise phrase to terminate (configurable via `--promise`, no hardcoded default).
+- Signal handling (SIGINT/SIGTERM) attempts graceful session abort and client cleanup; the script also listens for stdout stream destruction and Copilot disconnect errors.
+- The interactive loop supports two modes: `yolo` (auto-iterate without prompts) and `confirm` (ask before executing commands). Use `--debug` flag or `--resume` without session ID to enable confirm mode.
+- Sessions are tracked via Snowflake-like IDs (generated from timestamp + random bits). Last session ID is saved to `/tmp/copilot-loop-last-session` for easy resumption.
+- Execution logs are written to `/tmp/copilot-loop-[sessionId]-log.txt`, `/tmp/copilot-loop-[sessionId]-error.txt` for debugging.
+- Health checks run every 3 seconds via `client.ping()` to detect server hangs; timeout per prompt is configurable (default 7 days).
 
-Example
-- copilot-loop prompt.yaml
+Examples
 
-- prompt.yaml example:
+Start with a config file:
+```bash
+$ copilot-loop config.yaml
+```
+
+Execute a prompt directly (non-interactive):
+```bash
+$ copilot-loop -p "Fix the bug in main.js"
+```
+
+Resume the last session in confirm mode:
+```bash
+$ copilot-loop --resume
+```
+
+Resume a specific session:
+```bash
+$ copilot-loop --resume abc123def456
+```
+
+Use specific model and reasoning with custom timeout:
+```bash
+$ copilot-loop --model gpt-5-mini --think high --timeout 3600 -p "Optimize this code"
+```
+
+Enable debug mode with persona deployment:
+```bash
+$ copilot-loop config.yaml --debug --persona "JAMES"
+```
+
+YAML configuration file example (`config.yaml`):
 ```yaml
 mcpServers:
   counter:
     type: http
-    url: http://localhost:65534/mcp
+    url: http://localhost:3000/mcp
     tools: ["*"]
-model: "gpt-5-mini" 
-reasoningEffort: null
-max-iterations: 1 
-promise: null
-persona: James
+
+model: "gpt-5-mini"
+reasoningEffort: "high"
+max-iterations: 5
+timeout: 3600
+promise: "TASK_COMPLETED_SUCCESSFULLY"
+persona: "JAMES"
+
 prompt: |
   Say Hi, and exit the loop.
 ```
+
+Configuration field reference:
+- `mcpServers`: MCP server configuration (passed to Copilot SDK)
+- `model`: AI model identifier
+- `reasoningEffort`: Reasoning level (low, medium, high, xhigh)
+- `max-iterations`: Maximum loop iterations before timeout
+- `timeout`: RPC timeout in seconds (default: 604800)
+- `promise`: Completion signal phrase for the agent
+- `persona`: Persona name to deploy at session start
+- `prompt`: Initial prompt for the agent loop

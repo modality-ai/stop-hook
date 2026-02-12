@@ -2,9 +2,11 @@
 
 import { SweAgentInteraction } from "./SweAgentInteraction";
 import { CopilotClient, type CopilotSession } from "@github/copilot-sdk";
-import { appendFileSync } from "fs";
+import { appendFileSync, readFileSync, writeFileSync, existsSync } from "fs";
 import { appendFile } from "fs/promises";
 import { execSync } from "child_process";
+
+const LAST_SESSION_FILE = "/tmp/copilot-loop-last-session";
 
 type PreToolUseHookOutput = {
   permissionDecision: "allow" | "deny" | "ask";
@@ -34,12 +36,12 @@ const logger = {
   },
 };
 
-// Parse CLI arguments for flags (--prompt with value, --debug as boolean)
+// Parse CLI arguments for flags (-p, -a with value, --debug as boolean)
 const parseCliArgs = (flag: string) => {
   const index = process.argv.indexOf(flag);
   if (index === -1) return null;
 
-  // For flags with values (like --prompt)
+  // For flags with values (like -p, -a)
   if (
     index + 1 < process.argv.length &&
     !process.argv[index + 1]?.startsWith("--")
@@ -47,8 +49,9 @@ const parseCliArgs = (flag: string) => {
     return process.argv[index + 1];
   }
 
-  // For boolean flags (like --debug)
-  return flag === "--debug" ? true : null;
+  // For boolean flags (like --debug, --resume, -r)
+  const booleanFlags = ["--debug", "--resume", "-r"];
+  return booleanFlags.includes(flag) ? true : null;
 };
 
 // Collect positional args from argv[2..] using '---' as boundary separator
@@ -545,6 +548,9 @@ const initSession = async (
     });
   }
 
+  // Track session ID for --resume support
+  writeFileSync(LAST_SESSION_FILE, gSessionId);
+
   // Attach event listener immediately after session is created
   // Store the unsubscribe function to keep the listener alive
   setupSessionEventListener(session, abortController);
@@ -653,31 +659,55 @@ const printHelp = () => {
   process.stdout.write(`
 Usage: copilot-loop [config-file] [options]
 
-Arguments:
-  [config-file]       Load configuration from YAML file (positional argument)
+AI-powered agent loop for Copilot CLI
 
 Options:
-  --config <file>     Load configuration from YAML file (alternative to positional)
-  -p <prompt>         Directly input a prompt
-  -a <prompt>         Append a prompt to existing prompt
-  -s <id>             Specify session ID for resuming sessions
-  --model <model>     Specify the AI model to use
-  --think <level>     Set reasoning effort (low|medium|high|xhigh)
-  --max <iterations>  Set maximum iterations for agent loop
-  --promise <phrase>  Set completion promise phrase
-  --timeout-ms <ms>   Set timeout in milliseconds (default: 7 days)
-  --debug             Use confirm mode instead of yolo mode
-  --- <args>          Pass remaining arguments as prompt (Bun strips '--', so use '---')
+  -p <text>               Execute a prompt in non-interactive mode
+  -a <text>               Append a prompt to existing prompt
+  --resume [sessionId]    Resume from a previous session (optionally specify
+                          session ID)
+  --config <file>         Load configuration from YAML file (alternative to
+                          positional argument)
+  --model <model>         Set the AI model to use
+  --think <level>         Set reasoning effort (choices: low, medium, high,
+                          xhigh)
+  --max <iterations>      Set maximum iterations for agent loop
+  --promise <phrase>      Set completion promise phrase for task completion
+  --timeout <seconds>     Set timeout in seconds (default: 604800 / 7 days)
+  --persona <name>        Deploy a specific persona to activate and maintain
+                          persistence
+  --debug                 Use confirm mode for permission prompts instead of
+                          automatic approval
+  -h, --help              display help for command
+
+Arguments:
+  [config-file]           Load configuration from YAML file (positional
+                          argument; alternative to --config option)
 
 Examples:
-  copilot-loop config.yaml
-  copilot-loop --config config.yaml
-  copilot-loop -p "your prompt here"
-  copilot-loop -a "additional prompt text"
-  copilot-loop --- ls -la
-  copilot-loop config.yaml --debug
-  copilot-loop --model gpt-4.1 --max 10 --promise "Task completed"
-  copilot-loop -p "your prompt" --model claude-3-sonnet --max 5
+  # Start with a config file
+  $ copilot-loop config.yaml
+
+  # Execute a prompt in non-interactive mode
+  $ copilot-loop -p "Fix the bug in main.js"
+
+  # Append additional prompt
+  $ copilot-loop config.yaml -a "Also add error handling"
+
+  # Resume a previous session
+  $ copilot-loop --resume
+
+  # Resume with specific session ID
+  $ copilot-loop --resume abc123def456
+
+  # Use specific model and reasoning effort
+  $ copilot-loop --model gpt-5-mini --think high -p "Optimize this code"
+
+  # Set max iterations and completion promise
+  $ copilot-loop config.yaml --max 10 --promise "Task completed"
+
+  # Enable debug mode with persona
+  $ copilot-loop config.yaml --debug --persona "JAMES"
   `);
   process.exit(0);
 };
@@ -688,7 +718,7 @@ const promptConfig: any = {};
 const main = async () => {
   const directPrompt: any = parseCliArgs("-p");
   const appendPrompt: any = parseCliArgs("-a");
-  const sessionOverride = parseCliArgs("-s");
+  const sessionOverride = parseCliArgs("-r") || parseCliArgs("--resume");
   const maxIterationsOverride: any = parseCliArgs("--max");
   const promiseOverride = parseCliArgs("--promise");
   const modelOverride = parseCliArgs("--model");
@@ -712,6 +742,7 @@ const main = async () => {
     !configFile &&
     !directPrompt &&
     !commandPrompt &&
+    !sessionOverride &&
     !parseCliArgs("--debug")
   ) {
     printHelp();
@@ -732,11 +763,20 @@ const main = async () => {
     initialPrompt += "\n" + appendPrompt;
   }
 
-  // Use --debug flag to change mode to "confirm"
-  const mode = parseCliArgs("--debug") ? "confirm" : "yolo";
+  // Use confirm mode for --debug or bare --resume (no session ID provided)
+  const mode = parseCliArgs("--debug") || sessionOverride === true ? "confirm" : "yolo";
 
   // Apply CLI overrides to promptConfig
-  if (sessionOverride) {
+  if (sessionOverride === true) {
+    // --resume without session ID: read last session from tracking file
+    if (existsSync(LAST_SESSION_FILE)) {
+      gSessionId = readFileSync(LAST_SESSION_FILE, "utf-8").trim();
+      logger.log(`🔄 Resuming last session: ${gSessionId}`);
+    } else {
+      logger.error("No previous session found to resume.");
+      process.exit(1);
+    }
+  } else if (sessionOverride) {
     gSessionId = sessionOverride as string;
   }
   if (modelOverride) {
