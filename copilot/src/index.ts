@@ -16,7 +16,7 @@ type PreToolUseHookOutput = {
 // Global session ID - Snowflake-like ID (distributed system friendly)
 let gSessionId = `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
 let gLlm = "";
-let gActuatorId: string;
+let gActuatorId: string | null;
 
 // Simple logger wrapper
 const logger = {
@@ -493,6 +493,7 @@ const initSession = async (
                   }, 3000);
                 }
               } catch (error) {
+                gActuatorId = null;
                 console.error("Failed to parse tool result for LLM:", error);
               }
             }
@@ -513,7 +514,7 @@ const initSession = async (
               if (hasActuator) {
                 const strippedCmd = originalCmd.replace(/2>\/dev\/null/g, "");
                 let writeMode = "";
-                if (-1 === strippedCmd.indexOf(">")) {
+                if (-1 !== strippedCmd.indexOf(">")) {
                   writeMode = "-w";
                 }
                 gActuatorId = input.timestamp;
