@@ -467,27 +467,33 @@ const initSession = async (
               try {
                 let alreadyStop = false;
                 const checkResult = () => {
-                  const toolResultJson = execSync(
-                    `actuator -p ${gActuatorId}`,
-                    {
-                      encoding: "utf-8",
-                    }
-                  );
+                  const actuatorCmd = `actuator -p ${gActuatorId}`;
+                  const toolResultJson = execSync(actuatorCmd, {
+                    encoding: "utf-8",
+                  });
                   const toolResultData = JSON.parse(toolResultJson);
                   if (toolResultData) {
                     if (!alreadyStop) {
                       alreadyStop = true;
                       session?.abort?.().catch(() => {});
+                      console.log(
+                        "🛠️ Aborting current session for actuator result...",
+                        actuatorCmd,
+                        input.toolArgs.description
+                      );
                     }
                     if (toolResultData.status !== "running") {
                       gActuatorId = null;
                       gLlm = `[Tool Result] ${input.toolArgs.description}\nExit Code: ${toolResultData.exit_code}`;
                       if (toolResultData.stderr) {
-                        gLlm += `\nStderr:\n${toolResultData.stderr}`;
+                        gLlm += `\nStderr:\n\`\`\`\n${toolResultData.stderr}\n\`\`\``;
                       }
                       if (toolResultData.stdout) {
-                        gLlm += `\nStdout:\n${toolResultData.stdout}`;
+                        gLlm += `\nStdout:\n\`\`\`\n${toolResultData.stdout}\n\`\`\``;
                       }
+                      console.log(
+                        `\n🛠️  Actuator Tool Result for LLM:\n${gLlm}\n`
+                      );
                       return gLlm;
                     }
                   }
@@ -516,7 +522,7 @@ const initSession = async (
               const originalCmd = toolArgs?.command || "";
               appendFile(
                 "/tmp/copilot-loop-command.log",
-                `${new Date().toISOString()} [${gSessionId}] ${originalCmd}\n`
+                `${new Date().toISOString()} [${gSessionId}] [${input.timestamp}] ${originalCmd}\n`
               ).catch(() => {});
               if (hasActuator) {
                 const strippedCmd = originalCmd.replace(/2>\/dev\/null/g, "");
@@ -525,8 +531,8 @@ const initSession = async (
                   writeMode = "-w";
                 }
                 gActuatorId = input.timestamp;
-                console.log(`Bash Job: ${gActuatorId}`);
-                const command = `actuator ${writeMode} --plain -j ${gActuatorId} -a --- ${originalCmd}; actuator -s -p ${gActuatorId}`;
+                const command = `actuator ${writeMode} -j ${gActuatorId} -a --- ${originalCmd}; actuator -s -p ${gActuatorId}`;
+                console.log(`🛠️ Bash Job: ${command}`);
                 return {
                   permissionDecision: "allow",
                   modifiedArgs: {
