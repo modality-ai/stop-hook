@@ -5,7 +5,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.2.1"
+readonly VERSION="1.2.2"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -109,7 +109,11 @@ json_output() {
 
   json_parts+=("\"metadata\":{\"start_time\":${start_time:-0},\"end_time\":${end_time:-0},\"duration_seconds\":${duration},\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}")
 
-  [[ -n "$job_id" ]] && json_parts+=("\"job\":{\"id\":\"$(json_escape "$job_id")\",\"pid\":${pid:-0}}")
+  if [[ -n "$job_id" ]]; then
+    json_parts+=("\"job\":{\"id\":\"$(json_escape "$job_id")\",\"pid\":${pid:-0}}")
+  elif [[ -n "$pid" && "$pid" != "0" ]]; then
+    json_parts+=("\"pid\":${pid}")
+  fi
 
   # Join all parts with commas and wrap in braces
   local IFS=,
@@ -135,6 +139,8 @@ plain_output() {
   if [[ -n "$job_id" ]]; then
     printf 'Job ID: %s\n' "$job_id"
     printf 'PID: %s\n' "${pid:-0}"
+  elif [[ -n "$pid" && "$pid" != "0" ]]; then
+    printf 'PID: %s\n' "$pid"
   fi
 
   if [[ -n "$stdout_data" ]]; then
@@ -471,7 +477,7 @@ execute_sync() {
       stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
       rm -f "$stdout_file" "$stderr_file"
 
-      emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE"
+      emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "$cmd_pid" "$EXEC_SEQUENCE"
       return
     fi
 
@@ -625,7 +631,7 @@ execute_sync() {
 
   rm -f "$stdout_file" "$stderr_file"
 
-  emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE"
+  emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "$cmd_pid" "$EXEC_SEQUENCE"
 }
 
 # =============================================================================
