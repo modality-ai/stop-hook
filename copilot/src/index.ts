@@ -16,7 +16,7 @@ type PreToolUseHookOutput = {
 // Global session ID - Snowflake-like ID (distributed system friendly)
 let gSessionId = `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
 let gLlm = "";
-let gActuatorId: string;
+let gActuatorId: string | null;
 
 // Simple logger wrapper
 const logger = {
@@ -493,6 +493,7 @@ const initSession = async (
                   }, 3000);
                 }
               } catch (error) {
+                gActuatorId = null;
                 console.error("Failed to parse tool result for LLM:", error);
               }
             }
@@ -512,17 +513,19 @@ const initSession = async (
               ).catch(() => {});
               if (hasActuator) {
                 const strippedCmd = originalCmd.replace(/2>\/dev\/null/g, "");
-                if (-1 === strippedCmd.indexOf(">")) {
-                  gActuatorId = input.timestamp;
-                  const command = `actuator --plain -j ${gActuatorId} -a --- ${originalCmd}; actuator -s -p ${gActuatorId}`;
-                  return {
-                    permissionDecision: "allow",
-                    modifiedArgs: {
-                      ...toolArgs,
-                      command,
-                    },
-                  };
+                let writeMode = "";
+                if (-1 !== strippedCmd.indexOf(">")) {
+                  writeMode = "-w";
                 }
+                gActuatorId = input.timestamp;
+                const command = `actuator ${writeMode} --plain -j ${gActuatorId} -a --- ${originalCmd}; actuator -s -p ${gActuatorId}`;
+                return {
+                  permissionDecision: "allow",
+                  modifiedArgs: {
+                    ...toolArgs,
+                    command,
+                  },
+                };
               }
             } catch (error) {}
             break;
@@ -764,7 +767,8 @@ const main = async () => {
   }
 
   // Use confirm mode for --debug or bare --resume (no session ID provided)
-  const mode = parseCliArgs("--debug") || sessionOverride === true ? "confirm" : "yolo";
+  const mode =
+    parseCliArgs("--debug") || sessionOverride === true ? "confirm" : "yolo";
 
   // Apply CLI overrides to promptConfig
   if (sessionOverride === true) {

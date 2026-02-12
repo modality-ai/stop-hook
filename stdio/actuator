@@ -5,7 +5,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.2.0"
+readonly VERSION="1.2.1"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -653,20 +653,43 @@ execute_async() {
   local start_time
   start_time=$(date +%s)
 
-  # Save job state BEFORE launching background process
+  # Save job state BEFORE launching process
   save_job_state "$job_id" "0" "$command" "running" "$start_time"
-  
+
   # Create output files to ensure they exist
   touch "$stdout_file" "$stderr_file"
 
-  # Launch command in background process with proper exit code handling
+  # Write mode: run foreground to capture stdout for pass-through, still track as job
+  if [[ "$write_mode" == "true" ]]; then
+    local exit_code=0
+    bash -c "$command" >"$stdout_file" 2>"$stderr_file" || exit_code=$?
+    local end_time
+    end_time=$(date +%s)
+
+    local status="completed"
+    if [[ "$timeout" -gt 0 && ( "$exit_code" -eq 137 || "$exit_code" -eq 143 ) ]]; then
+      status="timeout"
+    elif [[ "$exit_code" -ne 0 ]]; then
+      status="failed"
+    fi
+
+    update_job_status "$job_id" "$status" "$exit_code"
+
+    local stdout_data stderr_data
+    stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
+    stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
+
+    emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "$job_id" "$$" "$EXEC_SEQUENCE"
+    return
+  fi
+
+  # Background mode: fire-and-forget with job tracking
   {
     bash -c "$command" >"$stdout_file" 2>"$stderr_file" || true
     exit_code=$?
-    
-    # Update job state on completion  
+
+    # Update job state on completion
     if [[ $exit_code -eq 0 ]]; then
-      # Need to source the job file to get variables needed by update_job_status
       source "${JOBS_DIR}/${job_id}.job" 2>/dev/null || true
       echo "STATUS='completed'" >> "${JOBS_DIR}/${job_id}.job"
       echo "EXIT_CODE='0'" >> "${JOBS_DIR}/${job_id}.job"
@@ -681,7 +704,6 @@ execute_async() {
   local cmd_pid=$!
 
   # Update with actual process ID
-  # Use sed -i with optional suffix for compatibility (macOS uses -i '', Linux uses -i)
   if [[ "$OSTYPE" == "darwin"* ]]; then
     sed -i '' "s/^PID=.*/PID='${cmd_pid}'/" "${JOBS_DIR}/${job_id}.job"
   else
@@ -988,7 +1010,7 @@ list_jobs() {
     fi
 
     jobs_json="${jobs_json}{\"job_id\":\"$(json_escape "$JOB_ID")\",\"pid\":${PID},\"status\":\"${STATUS}\",\"command\":\"$(json_escape "$COMMAND")\",\"start_time\":${START_TIME}}"
-    ((job_count++))
+    ((++job_count))
   done
 
   printf '{"jobs":[%s],"count":%d,"timestamp":"%s"}\n' \
