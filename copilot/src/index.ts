@@ -15,8 +15,6 @@ type PreToolUseHookOutput = {
 
 // Global session ID - Snowflake-like ID (distributed system friendly)
 let gSessionId = `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
-let gLlm = "";
-let gActuatorId: string | null;
 
 // Simple logger wrapper
 const logger = {
@@ -463,27 +461,23 @@ const initSession = async (
         switch (input.toolName) {
           case "bash":
           case "shell":
-            if (hasActuator && gActuatorId) {
+            const meta = input?.toolResult?.sessionLog.split("\n")[0];
+            let actuatorId: string | null = null;
+            try {
+              const metaInfo = JSON.parse(meta);
+              actuatorId = metaInfo?.job.id;
+            } catch (error) {}
+            if (hasActuator && actuatorId) {
               try {
-                let alreadyStop = false;
                 const checkResult = () => {
-                  const actuatorCmd = `actuator -p ${gActuatorId}`;
+                  let gLlm = "";
+                  const actuatorCmd = `actuator -p ${actuatorId}`;
                   const toolResultJson = execSync(actuatorCmd, {
                     encoding: "utf-8",
                   });
                   const toolResultData = JSON.parse(toolResultJson);
                   if (toolResultData) {
-                    if (!alreadyStop) {
-                      alreadyStop = true;
-                      session?.abort?.().catch(() => {});
-                      console.log(
-                        "🛠️ Aborting current session for actuator result...",
-                        actuatorCmd,
-                        input.toolArgs.description
-                      );
-                    }
                     if (toolResultData.status !== "running") {
-                      gActuatorId = null;
                       gLlm = `[Tool Result] ${input.toolArgs.description}\nExit Code: ${toolResultData.exit_code}`;
                       if (toolResultData.stderr) {
                         gLlm += `\nStderr:\n\`\`\`\n${toolResultData.stderr}\n\`\`\``;
@@ -498,15 +492,24 @@ const initSession = async (
                     }
                   }
                 };
-                if (!checkResult()) {
-                  const intervalId = setInterval(() => {
-                    if (checkResult()) {
-                      clearInterval(intervalId);
-                    }
-                  }, 3000);
-                }
+                const content = await new Promise<string>(
+                  (resolve, _reject) => {
+                    const checkInterval = setInterval(() => {
+                      const result = checkResult();
+                      if (result) {
+                        clearInterval(checkInterval);
+                        resolve(result);
+                      }
+                    }, 5000);
+                  }
+                );
+                return {
+                  modifiedResult: {
+                    textResultForLlm: content,
+                    resultType: "success" as const,
+                  },
+                };
               } catch (error) {
-                gActuatorId = null;
                 console.error("Failed to parse tool result for LLM:", error);
               }
             }
@@ -530,8 +533,8 @@ const initSession = async (
                 if (-1 !== strippedCmd.indexOf(">")) {
                   writeMode = "-w";
                 }
-                gActuatorId = input.timestamp;
-                const command = `actuator ${writeMode} -j ${gActuatorId} -a --- ${originalCmd}; actuator -s -p ${gActuatorId}`;
+                const actuatorId = input.timestamp;
+                const command = `actuator ${writeMode} -j ${actuatorId} -a --- ${originalCmd}; actuator -s -p ${actuatorId}`;
                 console.log(`🛠️ Bash Job: ${command}`);
                 return {
                   permissionDecision: "allow",
@@ -596,10 +599,6 @@ const aiThinking = async ({ prompt }: any, sendTimeoutMs: number) => {
       if (mainResponse !== "") {
         clearInterval(checkInterval);
         resolve(mainResponse);
-      }
-      if (gLlm !== "") {
-        say(gLlm);
-        gLlm = "";
       }
     }, 500);
   });
