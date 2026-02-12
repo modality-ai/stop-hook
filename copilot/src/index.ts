@@ -480,6 +480,7 @@ const initSession = async (
                       session?.abort?.().catch(() => {});
                     }
                     if (toolResultData.status !== "running") {
+                      gActuatorId = null;
                       gLlm = `Bash Tool Execution Result: ${toolResultData.stderr || toolResultData.stdout}`;
                       return gLlm;
                     }
