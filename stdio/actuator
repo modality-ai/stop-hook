@@ -5,7 +5,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -16,6 +16,7 @@ readonly OUTPUT_SIZE_THRESHOLD=23000
 EXEC_SEQUENCE=0
 PLAIN_MODE="false"
 QUIET_MODE="false"
+WRITE_MODE="false"
 
 # =============================================================================
 # Sequence Counter (execution order tracking)
@@ -92,21 +93,27 @@ json_output() {
     stderr_value="$(json_escape "$stderr_data")"
   fi
 
-  cat <<ENDJSON
-{
-  "version": ${sequence},
-  "status": "$(json_escape "$status")",$(if [[ "$exit_code" -ne -1 ]]; then printf '\n  "exit_code": %d,' "$exit_code"; fi)
-  "command": "$(json_escape "$command")",
-  "stdout": "${stdout_value}",$(if [[ "$stdout_offloaded" == "true" ]]; then printf '\n  "stdout_offloaded": true,'; fi)
-  "stderr": "${stderr_value}",$(if [[ "$stderr_offloaded" == "true" ]]; then printf '\n  "stderr_offloaded": true,'; fi)
-  "metadata": {
-    "start_time": ${start_time:-0},
-    "end_time": ${end_time:-0},
-    "duration_seconds": ${duration},
-    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  }$(if [[ -n "$job_id" ]]; then printf ',\n  "job": {\n    "id": "%s",\n    "pid": %s\n  }' "$job_id" "${pid:-0}"; fi)
-}
-ENDJSON
+  # Build JSON object as single line (JSONL format)
+  local json_parts=()
+  json_parts+=("\"version\":${sequence}")
+  json_parts+=("\"status\":\"$(json_escape "$status")\"")
+
+  [[ "$exit_code" -ne -1 ]] && json_parts+=("\"exit_code\":${exit_code}")
+
+  json_parts+=("\"command\":\"$(json_escape "$command")\"")
+  json_parts+=("\"stdout\":\"${stdout_value}\"")
+  [[ "$stdout_offloaded" == "true" ]] && json_parts+=("\"stdout_offloaded\":true")
+
+  json_parts+=("\"stderr\":\"${stderr_value}\"")
+  [[ "$stderr_offloaded" == "true" ]] && json_parts+=("\"stderr_offloaded\":true")
+
+  json_parts+=("\"metadata\":{\"start_time\":${start_time:-0},\"end_time\":${end_time:-0},\"duration_seconds\":${duration},\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}")
+
+  [[ -n "$job_id" ]] && json_parts+=("\"job\":{\"id\":\"$(json_escape "$job_id")\",\"pid\":${pid:-0}}")
+
+  # Join all parts with commas and wrap in braces
+  local IFS=,
+  printf '{%s}\n' "${json_parts[*]}"
 }
 
 plain_output() {
@@ -120,7 +127,7 @@ plain_output() {
     duration=$(( end_time - start_time ))
   fi
 
-  printf '=== Command Execution Result ===\n'
+  printf '%s\n' '------ Command Execution Result ------'
   printf 'Status: %s\n' "$status"
   [[ "$exit_code" -ne -1 ]] && printf 'Exit Code: %d\n' "$exit_code"
   printf 'Duration: %d seconds\n' "$duration"
@@ -131,11 +138,42 @@ plain_output() {
   fi
 
   if [[ -n "$stdout_data" ]]; then
-    printf '\n--- Standard Output ---\n%s\n' "$stdout_data"
+    printf '%s\n' ''
+    printf '%s\n' '------ Standard Output ------'
+    printf '%s\n' "$stdout_data"
   fi
 
   if [[ -n "$stderr_data" ]]; then
-    printf '\n--- Standard Error ---\n%s\n' "$stderr_data"
+    printf '%s\n' ''
+    printf '%s\n' '------ Standard Error ------'
+    printf '%s\n' "$stderr_data"
+  fi
+}
+
+emit_result() {
+  local write_mode="$1" plain="$2"
+  shift 2
+  # Remaining: status exit_code command stdout_data stderr_data start_time end_time [job_id] [pid] [sequence]
+  local stdout_data="$4"
+
+  # Write mode: pass command stdout through to actuator's stdout
+  if [[ "$write_mode" == "true" && -n "$stdout_data" ]]; then
+    printf '%s\n' "$stdout_data"
+  fi
+
+  # Output result (stderr in write mode, stdout normally)
+  if [[ "$write_mode" == "true" ]]; then
+    if [[ "$plain" == "true" ]]; then
+      plain_output "$@" >&2
+    else
+      json_output "$@" >&2
+    fi
+  else
+    if [[ "$plain" == "true" ]]; then
+      plain_output "$@"
+    else
+      json_output "$@"
+    fi
   fi
 }
 
@@ -265,7 +303,7 @@ handle_signal() {
 
   rm -f "$TRAP_STDOUT_FILE" "$TRAP_STDERR_FILE"
 
-  json_output "interrupted" "$exit_code" "$TRAP_COMMAND" "$stdout_data" "$stderr_data" "$TRAP_START_TIME" "$end_time" "" "" "$EXEC_SEQUENCE"
+  emit_result "$WRITE_MODE" "false" "interrupted" "$exit_code" "$TRAP_COMMAND" "$stdout_data" "$stderr_data" "$TRAP_START_TIME" "$end_time" "" "" "$EXEC_SEQUENCE"
   exit "$exit_code"
 }
 
@@ -298,6 +336,7 @@ execute_sync() {
   local plain="${4:-false}"
   local use_tty="${5:-false}"
   local quiet="${6:-false}"
+  local write_mode="${7:-false}"
 
   local stdout_file stderr_file start_time end_time exit_code=0
   stdout_file=$(mktemp)
@@ -432,11 +471,7 @@ execute_sync() {
       stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
       rm -f "$stdout_file" "$stderr_file"
 
-      if [[ "$plain" == "true" ]]; then
-        plain_output "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time"
-      else
-        json_output "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE"
-      fi
+      emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE"
       return
     fi
 
@@ -445,8 +480,8 @@ execute_sync() {
       start_timeout_monitor "$$" "$timeout"
     fi
 
-    if [[ "$quiet" == "true" ]]; then
-      # Quiet mode: suppress terminal output entirely
+    if [[ "$quiet" == "true" || "$write_mode" == "true" ]]; then
+      # Quiet/write mode: capture only, no tee (emit_result handles pass-through in write mode)
       bash -c "$command" > "$stdout_file" 2> "$stderr_file" || exit_code=$?
     else
       # Normal mode: display to terminal while capturing
@@ -474,11 +509,7 @@ execute_sync() {
     stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
     rm -f "$stdout_file" "$stderr_file"
 
-    if [[ "$plain" == "true" ]]; then
-      plain_output "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time"
-    else
-      json_output "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE"
-    fi
+    emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE"
     return
   fi
 
@@ -594,11 +625,7 @@ execute_sync() {
 
   rm -f "$stdout_file" "$stderr_file"
 
-  if [[ "$plain" == "true" ]]; then
-    plain_output "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time"
-  else
-    json_output "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE"
-  fi
+  emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE"
 }
 
 # =============================================================================
@@ -612,6 +639,7 @@ execute_async() {
   local use_tty="${4:-false}"
   local quiet="${5:-false}"
   local custom_job_id="${6:-}"
+  local write_mode="${7:-false}"
 
   init_jobs_dir
   local job_id
@@ -665,11 +693,7 @@ execute_async() {
     start_timeout_monitor "$cmd_pid" "$timeout"
   fi
 
-  if [[ "$plain" == "true" ]]; then
-    plain_output "running" "-1" "$command" "" "" "$start_time" "" "$job_id" "$cmd_pid"
-  else
-    json_output "running" "-1" "$command" "" "" "$start_time" "" "$job_id" "$cmd_pid" "$EXEC_SEQUENCE"
-  fi
+  emit_result "$write_mode" "$plain" "running" "-1" "$command" "" "" "$start_time" "" "$job_id" "$cmd_pid" "$EXEC_SEQUENCE"
 }
 
 # =============================================================================
@@ -683,9 +707,10 @@ poll_job() {
 
   load_job_state "$job_id" || {
     if [[ "$plain" == "true" ]]; then
-      printf 'Error: Job not found: %s\n' "$job_id" >&2
+      printf '%s\n' "------ Error ------" >&2
+      printf 'Job not found: %s\n' "$job_id" >&2
     else
-      printf '{"status":"error","error": "Job not found", "job_id": "%s"}\n' "$job_id"
+      printf '{"status":"error","error":"Job not found","job_id":"%s"}\n' "$job_id"
     fi
     return 1
   }
@@ -727,15 +752,17 @@ poll_job_stream() {
 
   load_job_state "$job_id" || {
     if [[ "$plain" == "true" ]]; then
-      printf 'Error: Job not found: %s\n' "$job_id" >&2
+      printf '%s\n' "------ Error ------" >&2
+      printf 'Job not found: %s\n' "$job_id" >&2
     else
-      printf '{"status":"error","error": "Job not found", "job_id": "%s"}\n' "$job_id"
+      printf '{"status":"error","error":"Job not found","job_id":"%s"}\n' "$job_id"
     fi
     return 1
   }
 
   if [[ "$plain" == "true" ]]; then
-    printf '[monitoring] Job %s: %s\n' "$job_id" "$COMMAND"
+    printf '%s\n' "------ Monitoring ------"
+    printf 'Job %s: %s\n' "$job_id" "$COMMAND"
   else
     json_status_update "running" "$job_id" "Monitoring job: $COMMAND"
   fi
@@ -844,7 +871,12 @@ terminate_job() {
   local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE
 
   load_job_state "$job_id" || {
-    printf '{"status":"error","error": "Job not found", "job_id": "%s"}\n' "$job_id"
+    if [[ "$PLAIN_MODE" == "true" ]]; then
+      printf '%s\n' "------ Error ------" >&2
+      printf 'Job not found: %s\n' "$job_id" >&2
+    else
+      printf '{"status":"error","error":"Job not found","job_id":"%s"}\n' "$job_id"
+    fi
     return 1
   }
 
@@ -864,8 +896,7 @@ terminate_job() {
 terminate_all_jobs() {
   init_jobs_dir
   local terminated_count=0
-  local first=true
-  printf '{"terminated_jobs": ['
+  local jobs_json=""
 
   for job_file in "${JOBS_DIR}"/*.job; do
     [[ -f "$job_file" ]] || continue
@@ -881,21 +912,23 @@ terminate_all_jobs() {
       kill -0 "$PID" 2>/dev/null && kill -KILL "$PID" 2>/dev/null || true
       update_job_status "$JOB_ID" "terminated" "143" || true
 
-      [[ "$first" == "true" ]] || printf ','
-      first=false
-      printf '{"job_id": "%s", "pid": %s, "command": "%s"}' \
-        "$JOB_ID" "$PID" "$(json_escape "$COMMAND")" || true
+      if [[ -n "$jobs_json" ]]; then
+        jobs_json="${jobs_json},"
+      fi
+      jobs_json="${jobs_json}{\"job_id\":\"$(json_escape "$JOB_ID")\",\"pid\":${PID},\"command\":\"$(json_escape "$COMMAND")\"}"
       ((terminated_count++)) || true
     fi
   done
 
-  printf '], "count": %d, "timestamp": "%s"}\n' \
-    "$terminated_count" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '{"terminated_jobs":[%s],"count":%d,"timestamp":"%s"}\n' \
+    "$jobs_json" "$terminated_count" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 
-format_jobs_pretty() {
+format_jobs_plain() {
   local job_count=0
 
+  # Title
+  printf '%s\n' '------ Jobs List ------'
   # Header
   printf '%-20s %-8s %-12s %-50s %s\n' "JOB ID" "PID" "STATUS" "COMMAND" "START TIME"
   # Separator line (130 dashes)
@@ -931,12 +964,12 @@ list_jobs() {
   local plain="${1:-false}"
 
   if [[ "$plain" == "true" ]]; then
-    format_jobs_pretty
+    format_jobs_plain
     return
   fi
 
-  local first=true
-  printf '{"jobs": ['
+  local jobs_json=""
+  local job_count=0
 
   for job_file in "${JOBS_DIR}"/*.job; do
     [[ -f "$job_file" ]] || continue
@@ -950,16 +983,16 @@ list_jobs() {
       STATUS="completed"
     fi
 
-    [[ "$first" == "true" ]] || printf ','
-    first=false
+    if [[ -n "$jobs_json" ]]; then
+      jobs_json="${jobs_json},"
+    fi
 
-    printf '{"job_id": "%s", "pid": %s, "status": "%s", "command": "%s", "start_time": %s}' \
-      "$JOB_ID" "$PID" "$STATUS" "$(json_escape "$COMMAND")" "$START_TIME"
+    jobs_json="${jobs_json}{\"job_id\":\"$(json_escape "$JOB_ID")\",\"pid\":${PID},\"status\":\"${STATUS}\",\"command\":\"$(json_escape "$COMMAND")\",\"start_time\":${START_TIME}}"
+    ((job_count++))
   done
 
-  printf '], "count": %d, "timestamp": "%s"}\n' \
-    "$(find "$JOBS_DIR" -name '*.job' 2>/dev/null | wc -l | tr -d ' ')" \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '{"jobs":[%s],"count":%d,"timestamp":"%s"}\n' \
+    "$jobs_json" "$job_count" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 
 cleanup_jobs() {
@@ -1031,6 +1064,9 @@ OPTIONS:
   --cleanup               Remove completed job artifacts
   --stdin                 Read command from stdin (for shell metacharacters)
   --plain                 Output plain text instead of JSON
+  -w, --write             Write mode: pass command stdout to actuator stdout,
+                          output JSON/plain result to stderr. Use for commands
+                          with shell redirects (e.g., actuator -w --- echo 1 > file)
   -q, --quiet             Suppress command output from terminal and metadata
   -v, --version           Show version
   -h, --help              Show this help
@@ -1047,6 +1083,10 @@ EXAMPLES:
 
   # Stream real-time status
   actuator -s --- make build
+
+  # Write mode: command stdout passes through, JSON to stderr
+  actuator -w --- echo hello > /tmp/out   # /tmp/out gets "hello", JSON on stderr
+  actuator -w -c "ls -la > /tmp/listing"  # file write, JSON on stderr
 
   # Suppress command output, keep metadata only
   actuator -q "git diff --staged ./"
@@ -1105,7 +1145,7 @@ EOF
 
 main() {
   local command="" mode="sync" timeout="$DEFAULT_TIMEOUT"
-  local stream="false" plain="false" use_tty="false" quiet="false"
+  local stream="false" plain="false" use_tty="false" quiet="false" write_mode="false"
   local poll_id="" terminate_id="" terminate_signal="TERM" list_jobs_flag="false"
   local custom_job_id=""
 
@@ -1154,6 +1194,8 @@ main() {
         command=$(cat); shift ;;
       --plain)
         plain="true"; shift ;;
+      -w|--write)
+        write_mode="true"; shift ;;
       -q|--quiet)
         quiet="true"; shift ;;
       -v|--version)
@@ -1171,7 +1213,13 @@ main() {
       ---)
         shift; command="$*"; break ;;
       -*)
-        printf '{"status":"error","error": "Unknown option: %s"}\n' "$1" >&2; exit 1 ;;
+        if [[ "$plain" == "true" ]]; then
+          printf '%s\n' "------ Error ------" >&2
+          printf 'Unknown option: %s\n' "$1" >&2
+        else
+          printf '{"status":"error","error":"Unknown option: %s"}\n' "$1" >&2
+        fi
+        exit 1 ;;
       *)
         command="$*"; break ;;
     esac
@@ -1186,6 +1234,7 @@ main() {
   # Set global mode flags for json helper functions
   PLAIN_MODE="$plain"
   QUIET_MODE="$quiet"
+  WRITE_MODE="$write_mode"
 
   # Handle deferred actions
   if [[ "$list_jobs_flag" == "true" ]]; then
@@ -1210,17 +1259,22 @@ main() {
 
   # Validate command
   if [[ -z "$command" ]]; then
-    printf '{"status":"error","error": "No command specified. Use -h for help."}\n' >&2
+    if [[ "$plain" == "true" ]]; then
+      printf '%s\n' "------ Error ------" >&2
+      printf 'No command specified. Use -h for help.\n' >&2
+    else
+      printf '{"status":"error","error":"No command specified. Use -h for help."}\n' >&2
+    fi
     exit 1
   fi
 
   # Execute
   case "$mode" in
     sync)
-      execute_sync "$command" "$timeout" "$stream" "$plain" "$use_tty" "$quiet"
+      execute_sync "$command" "$timeout" "$stream" "$plain" "$use_tty" "$quiet" "$write_mode"
       ;;
     async)
-      execute_async "$command" "$timeout" "$plain" "$use_tty" "$quiet" "$custom_job_id"
+      execute_async "$command" "$timeout" "$plain" "$use_tty" "$quiet" "$custom_job_id" "$write_mode"
       ;;
   esac
 }

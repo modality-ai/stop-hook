@@ -13,6 +13,9 @@ type PreToolUseHookOutput = {
 
 // Global session ID - Snowflake-like ID (distributed system friendly)
 let gSessionId = `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
+let gLlm = "";
+let gActuatorId: string;
+
 // Simple logger wrapper
 const logger = {
   store: (logType: string, message: string) => {
@@ -156,10 +159,10 @@ const whichCli = (cli: string): string | null => {
 const client = new CopilotClient({
   cliPath: whichCli("copilot") || undefined,
 });
+const hasActuator = whichCli("actuator") != null;
 
 let session: CopilotSession | undefined;
 let sessionTimout: NodeJS.Timeout;
-
 const setupSessionEventListener = (
   session: any,
   abortController: AbortController
@@ -453,30 +456,73 @@ const initSession = async (
       backgroundCompactionThreshold: 0.65,
     },
     hooks: {
-      onPreToolUse: async (input: any): Promise<PreToolUseHookOutput> => {
-        // Automatically wrap bash commands with 'actuator -s'
-        if (input.toolName === "bash" || input.toolName === "shell") {
-          // Strip '2>/dev/null' first, then detect '>'
-          try {
-            const toolArgs = JSON.parse(input.toolArgs);
-            const originalCmd = toolArgs?.command || "";
-            appendFile(
-              "/tmp/copilot-loop-command.log",
-              `${new Date().toISOString()} [${gSessionId}] ${originalCmd}\n`
-            ).catch(() => {});
-            const strippedCmd = originalCmd.replace(/2>\/dev\/null/g, "");
-            if (-1 === strippedCmd.indexOf(">")) {
-              const jobId = input.timestamp;
-              const command = `actuator --plain -j ${jobId} -a --- ${originalCmd}; actuator --plain -s -p ${jobId}`;
-              return {
-                permissionDecision: "allow",
-                modifiedArgs: {
-                  ...toolArgs,
-                  command,
-                },
-              };
+      onPostToolUse: async (input: any) => {
+        switch (input.toolName) {
+          case "bash":
+          case "shell":
+            if (hasActuator && gActuatorId) {
+              try {
+                let alreadyStop = false;
+                const checkResult = () => {
+                  const toolResultJson = execSync(
+                    `actuator -p ${gActuatorId}`,
+                    {
+                      encoding: "utf-8",
+                    }
+                  );
+                  const toolResultData = JSON.parse(toolResultJson);
+                  if (toolResultData) {
+                    if (!alreadyStop) {
+                      alreadyStop = true;
+                      session?.abort?.().catch(() => {});
+                    }
+                    if (toolResultData.status !== "running") {
+                      gLlm = `Bash Tool Execution Result: ${toolResultData.stderr || toolResultData.stdout}`;
+                      return gLlm;
+                    }
+                  }
+                };
+                if (!checkResult()) {
+                  const intervalId = setInterval(() => {
+                    if (checkResult()) {
+                      clearInterval(intervalId);
+                    }
+                  }, 3000);
+                }
+              } catch (error) {
+                console.error("Failed to parse tool result for LLM:", error);
+              }
             }
-          } catch (error) {}
+            break;
+        }
+      },
+      onPreToolUse: async (input: any): Promise<PreToolUseHookOutput> => {
+        switch (input.toolName) {
+          case "bash":
+          case "shell":
+            try {
+              const toolArgs = JSON.parse(input.toolArgs);
+              const originalCmd = toolArgs?.command || "";
+              appendFile(
+                "/tmp/copilot-loop-command.log",
+                `${new Date().toISOString()} [${gSessionId}] ${originalCmd}\n`
+              ).catch(() => {});
+              if (hasActuator) {
+                const strippedCmd = originalCmd.replace(/2>\/dev\/null/g, "");
+                if (-1 === strippedCmd.indexOf(">")) {
+                  gActuatorId = input.timestamp;
+                  const command = `actuator --plain -j ${gActuatorId} -a --- ${originalCmd}; actuator -s -p ${gActuatorId}`;
+                  return {
+                    permissionDecision: "allow",
+                    modifiedArgs: {
+                      ...toolArgs,
+                      command,
+                    },
+                  };
+                }
+              }
+            } catch (error) {}
+            break;
         }
         return { permissionDecision: "allow" };
       },
@@ -502,6 +548,38 @@ const initSession = async (
   // Attach event listener immediately after session is created
   // Store the unsubscribe function to keep the listener alive
   setupSessionEventListener(session, abortController);
+};
+
+const aiThinking = async ({ prompt }: any, sendTimeoutMs: number) => {
+  let mainResponse = "";
+
+  const say = (prompt: string) => {
+    if (!session) {
+      logger.error("Session not initialized");
+      return "";
+    }
+    session
+      .sendAndWait({ prompt }, sendTimeoutMs)
+      .then(async (response) => {
+        mainResponse = response?.data?.content || "";
+      })
+      .catch((error) => {
+        mainResponse = error;
+      });
+  };
+  say(prompt);
+  return new Promise<string>((resolve, _reject) => {
+    const checkInterval = setInterval(() => {
+      if (mainResponse !== "") {
+        clearInterval(checkInterval);
+        resolve(mainResponse);
+      }
+      if (gLlm !== "") {
+        say(gLlm);
+        gLlm = "";
+      }
+    }, 500);
+  });
 };
 
 const aiCommand = async (prompt: any, systemPrompt: string) => {
@@ -545,15 +623,14 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
       );
     }
     const response = await Promise.race([
-      session.sendAndWait({ prompt }, sendTimeoutMs),
+      aiThinking({ prompt }, sendTimeoutMs),
       new Promise<never>((_, reject) => {
         abortController.signal.addEventListener("abort", () => {
           reject(new Error("Operation aborted due to server hang"));
         });
       }),
     ]);
-    const message = response?.data?.content || "";
-    return message;
+    return response;
   } catch (error) {
     if (abortController.signal.aborted) {
       logger.error(
@@ -626,11 +703,17 @@ const main = async () => {
   const isYamlFile = firstArg?.endsWith(".yaml") || firstArg?.endsWith(".yml");
 
   configFile = isYamlFile ? firstArg : parseCliArgs("--config");
-  const commandPrompt = !isYamlFile && !directPrompt && positionalArgs.length > 0
-    ? positionalArgs.join(" ")
-    : null;
+  const commandPrompt =
+    !isYamlFile && !directPrompt && positionalArgs.length > 0
+      ? positionalArgs.join(" ")
+      : null;
 
-  if (!configFile && !directPrompt && !commandPrompt && !parseCliArgs("--debug")) {
+  if (
+    !configFile &&
+    !directPrompt &&
+    !commandPrompt &&
+    !parseCliArgs("--debug")
+  ) {
     printHelp();
   }
 
