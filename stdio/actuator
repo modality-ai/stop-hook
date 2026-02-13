@@ -5,7 +5,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.4.0"
+readonly VERSION="1.5.0"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -64,7 +64,7 @@ json_output() {
   local stdout_data="$4" stderr_data="$5"
   local start_time="$6" end_time="$7"
   local job_id="${8:-}" pid="${9:-}" sequence="${10:-0}"
-  local cwd="${11:-}"
+  local cwd="${11:-}" write_mode="${12:-false}"
   local duration=0
 
   if [[ -n "$start_time" && -n "$end_time" ]]; then
@@ -104,6 +104,7 @@ json_output() {
 
   json_parts+=("\"command\":\"$(json_escape "$command")\"")
   [[ -n "$cwd" ]] && json_parts+=("\"cwd\":\"$(json_escape "$cwd")\"")
+  [[ "$write_mode" == "true" ]] && json_parts+=("\"write_mode\":true")
   json_parts+=("\"stdout\":\"${stdout_value}\"")
   [[ "$stdout_offloaded" == "true" ]] && json_parts+=("\"stdout_offloaded\":true")
 
@@ -128,7 +129,7 @@ plain_output() {
   local stdout_data="$4" stderr_data="$5"
   local start_time="$6" end_time="$7"
   local job_id="${8:-}" pid="${9:-}"
-  local _sequence="${10:-}" cwd="${11:-}"
+  local _sequence="${10:-}" cwd="${11:-}" write_mode="${12:-false}"
   local duration=0
 
   if [[ -n "$start_time" && -n "$end_time" ]]; then
@@ -140,6 +141,7 @@ plain_output() {
   [[ "$exit_code" -ne -1 ]] && printf 'Exit Code: %d\n' "$exit_code"
   printf 'Command: %s\n' "$command"
   [[ -n "$cwd" ]] && printf 'Working Directory: %s\n' "$cwd"
+  [[ "$write_mode" == "true" ]] && printf 'Write Mode: yes\n'
   printf 'Duration: %d seconds\n' "$duration"
 
   if [[ -n "$job_id" ]]; then
@@ -165,7 +167,7 @@ plain_output() {
 emit_result() {
   local write_mode="$1" plain="$2"
   shift 2
-  # Remaining: status exit_code command stdout_data stderr_data start_time end_time [job_id] [pid] [sequence]
+  # Remaining: status exit_code command stdout_data stderr_data start_time end_time [job_id] [pid] [sequence] [cwd] (write_mode appended below)
   local stdout_data="$4"
 
   # Write mode: pass command stdout through to actuator's stdout
@@ -174,11 +176,12 @@ emit_result() {
   fi
 
   # Output result (stderr in write mode, stdout normally)
+  # Append write_mode as final positional arg for json_output/plain_output
   if [[ "$write_mode" == "true" ]]; then
     if [[ "$plain" == "true" ]]; then
-      plain_output "$@" >&2
+      plain_output "$@" "$write_mode" >&2
     else
-      json_output "$@" >&2
+      json_output "$@" "$write_mode" >&2
     fi
   else
     if [[ "$plain" == "true" ]]; then
@@ -272,7 +275,7 @@ update_job_fields() {
 }
 
 save_job_state() {
-  local job_id="$1" pid="$2" command="$3" status="$4" start_time="$5" cwd="${6:-}"
+  local job_id="$1" pid="$2" command="$3" status="$4" start_time="$5" cwd="${6:-}" write_mode="${7:-false}"
   local job_file="${JOBS_DIR}/${job_id}.job"
   write_job_file "$job_file" \
     "JOB_ID='${job_id}'" \
@@ -281,6 +284,7 @@ save_job_state() {
     "STATUS='${status}'" \
     "START_TIME='${start_time}'" \
     "CWD='${cwd//\'/\'\\\'\'}'" \
+    "WRITE_MODE='${write_mode}'" \
     "STDOUT_FILE='${JOBS_DIR}/${job_id}.stdout'" \
     "STDERR_FILE='${JOBS_DIR}/${job_id}.stderr'"
 }
@@ -704,17 +708,44 @@ execute_async() {
   start_time=$(date +%s)
 
   # Save job state BEFORE launching process
-  save_job_state "$job_id" "0" "$command" "running" "$start_time" "$EXEC_CWD"
+  save_job_state "$job_id" "0" "$command" "running" "$start_time" "$EXEC_CWD" "$write_mode"
 
   # Create output files to ensure they exist
   touch "$stdout_file" "$stderr_file"
 
-  # Write mode: run foreground to capture stdout for pass-through, still track as job
+  # Write mode: background + wait to capture real PID, still blocks until done
   if [[ "$write_mode" == "true" ]]; then
     local exit_code=0
-    bash -c "$command" >"$stdout_file" 2>"$stderr_file" || exit_code=$?
+    bash -c "$command" >"$stdout_file" 2>"$stderr_file" &
+    local cmd_pid=$!
+
+    update_job_fields "${JOBS_DIR}/${job_id}.job" "PID='${cmd_pid}'"
+
+    # Set global state for signal handler
+    TRAP_CMD_PID="$cmd_pid"
+    TRAP_STDOUT_FILE="$stdout_file"
+    TRAP_STDERR_FILE="$stderr_file"
+    TRAP_COMMAND="$command"
+    TRAP_START_TIME="$start_time"
+
+    trap 'handle_signal INT' INT
+    trap 'handle_signal TERM' TERM
+
+    # Start timeout monitor if configured
+    TIMEOUT_MONITOR_PID=""
+    if [[ "$timeout" -gt 0 ]]; then
+      start_timeout_monitor "$cmd_pid" "$timeout"
+    fi
+
+    wait "$cmd_pid" 2>/dev/null || exit_code=$?
     local end_time
     end_time=$(date +%s)
+
+    # Kill timeout monitor if active
+    if [[ -n "$TIMEOUT_MONITOR_PID" ]]; then
+      kill "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
+      wait "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
+    fi
 
     local status="completed"
     if [[ "$timeout" -gt 0 && ( "$exit_code" -eq 137 || "$exit_code" -eq 143 ) ]]; then
@@ -729,7 +760,7 @@ execute_async() {
     stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
     stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
 
-    emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "$job_id" "$$" "$EXEC_SEQUENCE" "$EXEC_CWD"
+    emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "$job_id" "$cmd_pid" "$EXEC_SEQUENCE" "$EXEC_CWD"
     return
   fi
 
@@ -765,7 +796,7 @@ execute_async() {
 poll_job() {
   local job_id="$1"
   local plain="${2:-false}"
-  local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME CWD
+  local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME CWD WRITE_MODE
 
   load_job_state "$job_id" || {
     if [[ "$plain" == "true" ]]; then
@@ -797,17 +828,17 @@ poll_job() {
 
   if [[ "$plain" == "true" ]]; then
     plain_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
-      "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE" "${CWD:-}"
+      "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE" "${CWD:-}" "${WRITE_MODE:-false}"
   else
     json_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
-      "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE" "${CWD:-}"
+      "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE" "${CWD:-}" "${WRITE_MODE:-false}"
   fi
 }
 
 poll_job_stream() {
   local job_id="$1"
   local plain="${2:-false}"
-  local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME CWD
+  local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME CWD WRITE_MODE
   local poll_count=0
   local heartbeat_every=$(( ${STATUS_INTERVAL%.*} * 5 ))
   [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
@@ -914,10 +945,10 @@ poll_job_stream() {
       [[ -f "$STDERR_FILE" ]] && stderr_data=$(cat "$STDERR_FILE" 2>/dev/null || true)
       if [[ "$plain" == "true" ]]; then
         plain_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
-          "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE" "${CWD:-}"
+          "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE" "${CWD:-}" "${WRITE_MODE:-false}"
       else
         json_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
-          "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE" "${CWD:-}"
+          "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE" "${CWD:-}" "${WRITE_MODE:-false}"
       fi
       break
     fi
