@@ -17,6 +17,7 @@ EXEC_SEQUENCE=0
 PLAIN_MODE="false"
 QUIET_MODE="false"
 WRITE_MODE="false"
+EXEC_CWD=""
 
 # =============================================================================
 # Sequence Counter (execution order tracking)
@@ -63,20 +64,21 @@ json_output() {
   local stdout_data="$4" stderr_data="$5"
   local start_time="$6" end_time="$7"
   local job_id="${8:-}" pid="${9:-}" sequence="${10:-0}"
+  local cwd="${11:-}"
   local duration=0
 
   if [[ -n "$start_time" && -n "$end_time" ]]; then
     duration=$(( end_time - start_time ))
   fi
 
-  # Offload large stdout/stderr to files when over threshold
+  # Offload large stdout/stderr: reuse existing job files, create only for sync
   local stdout_value stderr_value
   local stdout_offloaded="false" stderr_offloaded="false"
 
   if [[ ${#stdout_data} -gt $OUTPUT_SIZE_THRESHOLD ]]; then
     init_jobs_dir
-    local stdout_file="${JOBS_DIR}/${sequence}_stdout.offload"
-    printf '%s' "$stdout_data" > "$stdout_file"
+    local stdout_file="${JOBS_DIR}/${job_id:-${sequence}}.stdout"
+    [[ ! -f "$stdout_file" ]] && printf '%s' "$stdout_data" > "$stdout_file"
     stdout_value="$(offload_message "stdout" "$stdout_file")"
     stdout_offloaded="true"
   else
@@ -85,8 +87,8 @@ json_output() {
 
   if [[ ${#stderr_data} -gt $OUTPUT_SIZE_THRESHOLD ]]; then
     init_jobs_dir
-    local stderr_file="${JOBS_DIR}/${sequence}_stderr.offload"
-    printf '%s' "$stderr_data" > "$stderr_file"
+    local stderr_file="${JOBS_DIR}/${job_id:-${sequence}}.stderr"
+    [[ ! -f "$stderr_file" ]] && printf '%s' "$stderr_data" > "$stderr_file"
     stderr_value="$(offload_message "stderr" "$stderr_file")"
     stderr_offloaded="true"
   else
@@ -101,6 +103,7 @@ json_output() {
   [[ "$exit_code" -ne -1 ]] && json_parts+=("\"exit_code\":${exit_code}")
 
   json_parts+=("\"command\":\"$(json_escape "$command")\"")
+  [[ -n "$cwd" ]] && json_parts+=("\"cwd\":\"$(json_escape "$cwd")\"")
   json_parts+=("\"stdout\":\"${stdout_value}\"")
   [[ "$stdout_offloaded" == "true" ]] && json_parts+=("\"stdout_offloaded\":true")
 
@@ -125,6 +128,7 @@ plain_output() {
   local stdout_data="$4" stderr_data="$5"
   local start_time="$6" end_time="$7"
   local job_id="${8:-}" pid="${9:-}"
+  local _sequence="${10:-}" cwd="${11:-}"
   local duration=0
 
   if [[ -n "$start_time" && -n "$end_time" ]]; then
@@ -134,6 +138,8 @@ plain_output() {
   printf '%s\n' '------ Command Execution Result ------'
   printf 'Status: %s\n' "$status"
   [[ "$exit_code" -ne -1 ]] && printf 'Exit Code: %d\n' "$exit_code"
+  printf 'Command: %s\n' "$command"
+  [[ -n "$cwd" ]] && printf 'Working Directory: %s\n' "$cwd"
   printf 'Duration: %d seconds\n' "$duration"
 
   if [[ -n "$job_id" ]]; then
@@ -266,7 +272,7 @@ update_job_fields() {
 }
 
 save_job_state() {
-  local job_id="$1" pid="$2" command="$3" status="$4" start_time="$5"
+  local job_id="$1" pid="$2" command="$3" status="$4" start_time="$5" cwd="${6:-}"
   local job_file="${JOBS_DIR}/${job_id}.job"
   write_job_file "$job_file" \
     "JOB_ID='${job_id}'" \
@@ -274,6 +280,7 @@ save_job_state() {
     "COMMAND='${command//\'/\'\\\'\'}'" \
     "STATUS='${status}'" \
     "START_TIME='${start_time}'" \
+    "CWD='${cwd//\'/\'\\\'\'}'" \
     "STDOUT_FILE='${JOBS_DIR}/${job_id}.stdout'" \
     "STDERR_FILE='${JOBS_DIR}/${job_id}.stderr'"
 }
@@ -346,7 +353,7 @@ handle_signal() {
 
   rm -f "$TRAP_STDOUT_FILE" "$TRAP_STDERR_FILE"
 
-  emit_result "$WRITE_MODE" "false" "interrupted" "$exit_code" "$TRAP_COMMAND" "$stdout_data" "$stderr_data" "$TRAP_START_TIME" "$end_time" "" "" "$EXEC_SEQUENCE"
+  emit_result "$WRITE_MODE" "false" "interrupted" "$exit_code" "$TRAP_COMMAND" "$stdout_data" "$stderr_data" "$TRAP_START_TIME" "$end_time" "" "" "$EXEC_SEQUENCE" "$EXEC_CWD"
   exit "$exit_code"
 }
 
@@ -514,7 +521,7 @@ execute_sync() {
       stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
       rm -f "$stdout_file" "$stderr_file"
 
-      emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "$cmd_pid" "$EXEC_SEQUENCE"
+      emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "$cmd_pid" "$EXEC_SEQUENCE" "$EXEC_CWD"
       return
     fi
 
@@ -552,7 +559,7 @@ execute_sync() {
     stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
     rm -f "$stdout_file" "$stderr_file"
 
-    emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE"
+    emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE" "$EXEC_CWD"
     return
   fi
 
@@ -668,7 +675,7 @@ execute_sync() {
 
   rm -f "$stdout_file" "$stderr_file"
 
-  emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "$cmd_pid" "$EXEC_SEQUENCE"
+  emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "$cmd_pid" "$EXEC_SEQUENCE" "$EXEC_CWD"
 }
 
 # =============================================================================
@@ -697,7 +704,7 @@ execute_async() {
   start_time=$(date +%s)
 
   # Save job state BEFORE launching process
-  save_job_state "$job_id" "0" "$command" "running" "$start_time"
+  save_job_state "$job_id" "0" "$command" "running" "$start_time" "$EXEC_CWD"
 
   # Create output files to ensure they exist
   touch "$stdout_file" "$stderr_file"
@@ -722,7 +729,7 @@ execute_async() {
     stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
     stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
 
-    emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "$job_id" "$$" "$EXEC_SEQUENCE"
+    emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "$job_id" "$$" "$EXEC_SEQUENCE" "$EXEC_CWD"
     return
   fi
 
@@ -748,7 +755,7 @@ execute_async() {
     start_timeout_monitor "$cmd_pid" "$timeout"
   fi
 
-  emit_result "$write_mode" "$plain" "running" "-1" "$command" "" "" "$start_time" "" "$job_id" "$cmd_pid" "$EXEC_SEQUENCE"
+  emit_result "$write_mode" "$plain" "running" "-1" "$command" "" "" "$start_time" "" "$job_id" "$cmd_pid" "$EXEC_SEQUENCE" "$EXEC_CWD"
 }
 
 # =============================================================================
@@ -758,7 +765,7 @@ execute_async() {
 poll_job() {
   local job_id="$1"
   local plain="${2:-false}"
-  local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME
+  local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME CWD
 
   load_job_state "$job_id" || {
     if [[ "$plain" == "true" ]]; then
@@ -790,17 +797,17 @@ poll_job() {
 
   if [[ "$plain" == "true" ]]; then
     plain_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
-      "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID"
+      "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE" "${CWD:-}"
   else
     json_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
-      "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE"
+      "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE" "${CWD:-}"
   fi
 }
 
 poll_job_stream() {
   local job_id="$1"
   local plain="${2:-false}"
-  local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME
+  local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME CWD
   local poll_count=0
   local heartbeat_every=$(( ${STATUS_INTERVAL%.*} * 5 ))
   [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
@@ -907,10 +914,10 @@ poll_job_stream() {
       [[ -f "$STDERR_FILE" ]] && stderr_data=$(cat "$STDERR_FILE" 2>/dev/null || true)
       if [[ "$plain" == "true" ]]; then
         plain_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
-          "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID"
+          "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE" "${CWD:-}"
       else
         json_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
-          "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE"
+          "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE" "${CWD:-}"
       fi
       break
     fi
@@ -1076,15 +1083,18 @@ cleanup_jobs() {
       ((cleaned++))
     fi
   done
-  # Clean up offloaded output files (created when stdout/stderr exceed size threshold)
-  local offloaded=0
-  for offload_file in "${JOBS_DIR}"/*.offload; do
-    [[ -f "$offload_file" ]] || continue
-    rm -f "$offload_file"
-    ((offloaded++))
+  # Clean up orphaned stdout/stderr files (sync offloads without matching .job)
+  local orphaned=0
+  for output_file in "${JOBS_DIR}"/*.stdout "${JOBS_DIR}"/*.stderr; do
+    [[ -f "$output_file" ]] || continue
+    local base="${output_file%.*}"
+    base="${base##*/}"
+    [[ -f "${JOBS_DIR}/${base}.job" ]] && continue
+    rm -f "$output_file"
+    ((orphaned++))
   done
   shopt -u nullglob  # Reset
-  printf '{"cleaned": %d, "offloaded_cleaned": %d, "timestamp": "%s"}\n' "$cleaned" "$offloaded" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '{"cleaned": %d, "orphaned_cleaned": %d, "timestamp": "%s"}\n' "$cleaned" "$orphaned" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 
 # =============================================================================
@@ -1206,6 +1216,7 @@ main() {
 
   # Get execution sequence number (global for all functions)
   EXEC_SEQUENCE=$(get_next_sequence)
+  EXEC_CWD=$(pwd)
 
   # Auto-detect piped stdin when no args
   if [[ $# -eq 0 ]]; then
