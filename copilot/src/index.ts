@@ -17,7 +17,9 @@ type PreToolUseHookOutput = {
 };
 
 // Global session ID - Snowflake-like ID (distributed system friendly)
-let gSessionId = `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
+const getSessionId = (): string =>
+  `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
+let gSessionId = getSessionId();
 
 // Simple logger wrapper
 const logger = {
@@ -542,7 +544,7 @@ const initSession = async (
                 if (-1 !== strippedCmd.indexOf(">")) {
                   writeMode = "-w";
                 }
-                const actuatorId = input.timestamp;
+                const actuatorId = input.timestamp + getSessionId();
                 const actuatorCmd = "actuator -a";
                 const command =
                   originalCmd.indexOf(actuatorCmd) === 0
@@ -560,7 +562,9 @@ const initSession = async (
             } catch (error) {}
             break;
           default:
-            console.log(`⚠️  No pre-tool hook defined for tool: ${input.toolName}`);
+            console.log(
+              `⚠️  No pre-tool hook defined for tool: ${input.toolName}`
+            );
             break;
         }
         return { permissionDecision: "allow" };
