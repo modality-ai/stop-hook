@@ -612,7 +612,6 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
   const healthCheckIntervalMs = 3000; // 3 seconds
   const pingTimeoutMs = 1000; // 1 second timeout for ping response
   const healthCheckHandle = setInterval(async () => {
-    if (abortController.signal.aborted || !session) return;
     try {
       await Promise.race([
         client.ping("O.K."),
