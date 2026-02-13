@@ -517,6 +517,7 @@ const initSession = async (
                 return {
                   modifiedResult: {
                     textResultForLlm: content,
+                    sessionLog: content,
                     resultType: "success" as const,
                   },
                 };
