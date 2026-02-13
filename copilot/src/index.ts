@@ -544,12 +544,11 @@ const initSession = async (
                 if (-1 !== strippedCmd.indexOf(">")) {
                   writeMode = "-w";
                 }
-                const actuatorId = input.timestamp + getSessionId();
                 const actuatorCmd = "actuator -a";
                 const command =
                   originalCmd.indexOf(actuatorCmd) === 0
                     ? originalCmd
-                    : `${actuatorCmd} ${writeMode} -j ${actuatorId} --- ${shellEscape(originalCmd)}; actuator -s -p ${actuatorId}`;
+                    : `${actuatorCmd} ${writeMode} --- ${shellEscape(originalCmd)}`;
                 console.log(`🛠️ Bash Job: ${command}`);
                 return {
                   permissionDecision: "allow",
