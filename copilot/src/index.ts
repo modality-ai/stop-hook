@@ -25,12 +25,12 @@ const logger = {
 
   log: (message?: any, ...args: any[]) => {
     logger.store("log", message);
-    console.log(`${gSessionId} ${message}`, ...args);
+    console.log(`${new Date().toISOString()} ${gSessionId} ${message}`, ...args);
   },
 
   error: (message?: any, ...args: any[]) => {
     logger.store("error", message);
-    console.error(`${gSessionId} ${message}`, ...args);
+    console.error(`${new Date().toISOString()} ${gSessionId} ${message}`, ...args);
   },
 };
 
