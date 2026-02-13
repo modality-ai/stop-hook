@@ -1085,14 +1085,14 @@ list_jobs_plain_fast() {
       if (system("kill -0 " pid " >/dev/null 2>&1") != 0) st = "completed"
     }
     cd = (length(cmd) > 48) ? substr(cmd, 1, 48) "..." : cmd
-    printf "%-25s %-8s %-12s %-50s %s\n", jid, pid, st, cd, stime
+    printf "%-25s %-8s %-12s %-55s %s\n", jid, pid, st, cd, stime
     n++
   }
   function sep(    i) { for (i = 0; i < 130; i++) printf "-"; printf "\n" }
   BEGIN {
     n = 0
     printf "------ Jobs List ------\n"
-    printf "%-25s %-8s %-12s %-50s %s\n", "JOB ID", "PID", "STATUS", "COMMAND", "START TIME"
+    printf "%-25s %-8s %-12s %-55s %s\n", "JOB ID", "PID", "STATUS", "COMMAND", "START TIME"
     sep()
   }
   FNR == 1 { flush(); jid=""; pid=""; cmd=""; st=""; stime="" }
