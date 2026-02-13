@@ -5,7 +5,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.3.1"
+readonly VERSION="1.4.0"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -1133,6 +1133,7 @@ OPTIONS:
                           output JSON/plain result to stderr. Use for commands
                           with shell redirects (e.g., actuator -w --- echo 1 > file)
   -q, --quiet             Suppress command output from terminal and metadata
+  --init                  Output shell function for eval (enables cd through actuator)
   -v, --version           Show version
   -h, --help              Show this help
 
@@ -1188,6 +1189,9 @@ EXAMPLES:
     npm run build
   HEREDOC
 
+  # Shell integration (add to ~/.zshrc or ~/.bashrc)
+  eval "$(actuator --init)"          # Enables: actuator cd ~/git
+
   # Job management
   actuator --list                    # JSON output
   actuator --list --plain            # Formatted table
@@ -1202,6 +1206,109 @@ OUTPUT:
   All output is JSON-structured for AI consumption.
   Use --plain for human-readable plain text output.
 EOF
+}
+
+# =============================================================================
+# Shell Init (eval "$(actuator --init)")
+# =============================================================================
+
+emit_shell_init() {
+  cat <<'SHELL_INIT'
+# Actuator shell wrapper — enables commands that affect the current shell
+# (cd, pushd, popd) to work through actuator.
+# Add to your shell profile: eval "$(actuator --init)"
+actuator() {
+  # Parse args to extract the command portion
+  # Supports: actuator cd /tmp        → separate args
+  #           actuator --- cd /tmp    → separator mode
+  #           actuator -c "cd /tmp"   → flag mode
+  #           actuator "cd /tmp"      → single string
+  local _cmd_args=() _cmd_str="" _first_word="" _has_flags=false
+  local _skip_next=false _collecting=false _via_flag=false
+
+  for _arg in "$@"; do
+    if [[ "$_skip_next" == "true" ]]; then
+      _skip_next=false
+      continue
+    fi
+    if [[ "$_collecting" == "true" ]]; then
+      _cmd_args+=("$_arg")
+      [[ -z "$_first_word" ]] && _first_word="${_arg%% *}"
+      continue
+    fi
+    case "$_arg" in
+      -c|--command)
+        _via_flag=true; _skip_next=true
+        local _next=false
+        for _a in "$@"; do
+          if [[ "$_next" == "true" ]]; then _cmd_str="$_a"; break; fi
+          [[ "$_a" == "$_arg" ]] && _next=true
+        done
+        _first_word="${_cmd_str%% *}"
+        ;;
+      ---) _collecting=true ;;
+      -t|--timeout|-j|--job-id|-p|--poll|-k|--terminate) _skip_next=true; _has_flags=true ;;
+      -a|--async|-s|--stream|-w|--write|-q|--quiet|--plain|-l|--list|--cleanup|--terminate-all|--stdin)
+        _has_flags=true ;;
+      -*) ;;
+      *)
+        _cmd_args+=("$_arg")
+        [[ -z "$_first_word" ]] && _first_word="${_arg%% *}"
+        _collecting=true
+        ;;
+    esac
+  done
+
+  # Handle cd/pushd/popd: apply directory change to current shell
+  case "$_first_word" in
+    cd|pushd|popd)
+      if [[ "$_has_flags" == "false" ]]; then
+        # No actuator flags: pure shell operation, don't call actuator
+        if [[ "$_via_flag" == "true" ]]; then
+          eval "$_cmd_str" || return $?
+        elif [[ ${#_cmd_args[@]} -eq 1 && "${_cmd_args[*]}" == *" "* ]]; then
+          eval "${_cmd_args[*]}" || return $?
+        else
+          builtin "${_cmd_args[@]}" || return $?
+        fi
+        return 0
+      fi
+
+      # Has actuator flags (-a, -s, etc.): pass through first, then cd locally
+      # MUST call actuator before cd, so the subprocess inherits the original cwd
+      command actuator "$@"
+      local _rc=$?
+
+      local _dir=""
+      if [[ "$_via_flag" == "true" || ( ${#_cmd_args[@]} -eq 1 && "${_cmd_args[*]}" == *" "* ) ]]; then
+        local _str="${_cmd_str:-${_cmd_args[*]}}"
+        _str="${_str#cd }"
+        _str="${_str#pushd }"
+        _dir="${_str%%&&*}"
+        _dir="${_dir%%;*}"
+        _dir="${_dir%%||*}"
+        _dir="${_dir%%|*}"
+        _dir="${_dir%% }"
+      else
+        local _rest="${_cmd_args[*]}"
+        _dir="${_rest#* }"
+        [[ "$_dir" == "$_rest" ]] && _dir=""
+      fi
+
+      # Best-effort cd in current shell after actuator returns
+      if [[ -n "$_dir" ]]; then
+        builtin cd "$_dir" 2>/dev/null || true
+      else
+        builtin cd 2>/dev/null || true
+      fi
+      return $_rc
+      ;;
+  esac
+
+  # Delegate to the real actuator binary
+  command actuator "$@"
+}
+SHELL_INIT
 }
 
 # =============================================================================
@@ -1266,6 +1373,8 @@ main() {
         quiet="true"; shift ;;
       -v|--version)
         printf '{"version": "%s"}\n' "$VERSION"; exit 0 ;;
+      --init)
+        emit_shell_init; exit 0 ;;
       -h|--help)
         usage; exit 0 ;;
       -l|--list)
@@ -1277,7 +1386,13 @@ main() {
         wait  # Wait for any remaining background jobs
         exit 0 ;;
       ---)
-        shift; command=$(printf '%q ' "$@"); break ;;
+        shift
+        if [[ $# -eq 1 ]]; then
+          command="$1"  # Single arg: preserve as-is (supports "cmd1 && cmd2")
+        else
+          command=$(printf '%q ' "$@")  # Multiple args: quote each separately
+        fi
+        break ;;
       -*)
         if [[ "$plain" == "true" ]]; then
           printf '%s\n' "------ Error ------" >&2
