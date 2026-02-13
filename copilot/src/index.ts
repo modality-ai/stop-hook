@@ -559,6 +559,9 @@ const initSession = async (
               }
             } catch (error) {}
             break;
+          default:
+            console.log(`⚠️  No pre-tool hook defined for tool: ${input.toolName}`);
+            break;
         }
         return { permissionDecision: "allow" };
       },
