@@ -986,75 +986,140 @@ terminate_all_jobs() {
     "$jobs_json" "$terminated_count" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 
-format_jobs_plain() {
-  local job_count=0
+# Fast job list: single awk pass over all job files (avoids N source + json_escape subprocesses)
+# Job file format: KEY='VALUE' lines where single quotes in VALUE are escaped as '\''
 
-  # Title
-  printf '%s\n' '------ Jobs List ------'
-  # Header
-  printf '%-20s %-8s %-12s %-50s %s\n' "JOB ID" "PID" "STATUS" "COMMAND" "START TIME"
-  # Separator line (130 dashes)
-  printf '%*s\n' 130 | tr ' ' '-'
+list_jobs_json_fast() {
+  local timestamp="$1" total="$2"
+  shift 2
+  # shellcheck disable=SC2016
+  awk -v ts="$timestamp" -v total="$total" -v sq="'" '
+  function val(line,    i, v) {
+    i = index(line, "=")
+    if (i == 0) return ""
+    v = substr(line, i + 1)
+    if (length(v) >= 2 && substr(v, 1, 1) == sq && substr(v, length(v), 1) == sq)
+      v = substr(v, 2, length(v) - 2)
+    gsub(sq "\\\\" sq sq, sq, v)
+    return v
+  }
+  function jesc(s) {
+    gsub(/\\/, "\\\\", s)
+    gsub(/"/, "\\\"", s)
+    gsub(/\t/, "\\t", s)
+    gsub(/\r/, "\\r", s)
+    return s
+  }
+  function flush(    sep) {
+    if (jid == "") return
+    if (st == "running" && pid ~ /^[0-9]+$/ && pid != "0") {
+      if (system("kill -0 " pid " >/dev/null 2>&1") != 0) st = "completed"
+    }
+    sep = (n > 0) ? "," : ""
+    printf "%s{\"job_id\":\"%s\",\"pid\":%s,\"status\":\"%s\",\"command\":\"%s\",\"start_time\":%s}",
+      sep, jesc(jid), (pid != "" ? pid : "0"), jesc(st), jesc(cmd), (stime != "" ? stime : "0")
+    n++
+  }
+  BEGIN { n = 0; printf "{\"jobs\":[" }
+  FNR == 1 { flush(); jid=""; pid=""; cmd=""; st=""; stime="" }
+  /^JOB_ID=/     { jid = val($0) }
+  /^PID=/        { pid = val($0) }
+  /^COMMAND=/    { cmd = val($0) }
+  /^STATUS=/     { st = val($0) }
+  /^START_TIME=/ { stime = val($0) }
+  END {
+    flush()
+    printf "],\"count\":%d,\"total\":%d,\"timestamp\":\"%s\"}\n", n, total+0, ts
+  }
+  ' "$@"
+}
 
-  # Rows
-  for job_file in "${JOBS_DIR}"/*.job; do
-    [[ -f "$job_file" ]] || continue
-
-    local JOB_ID="" PID="" COMMAND="" STATUS="" START_TIME="" EXIT_CODE="" END_TIME=""
-    # shellcheck disable=SC1090
-    source "$job_file"
-
-    # Refresh status for running jobs
-    if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2>/dev/null; then
-      STATUS="completed"
-    fi
-
-    # Truncate long commands
-    local cmd_display="${COMMAND:0:48}"
-    [[ ${#COMMAND} -gt 48 ]] && cmd_display="${cmd_display}..."
-    printf '%-20s %-8s %-12s %-50s %s\n' "$JOB_ID" "$PID" "$STATUS" "$cmd_display" "$START_TIME"
-    ((++job_count))
-  done
-
-  # Footer
-  [[ $job_count -gt 0 ]] && printf '%*s\n' 130 | tr ' ' '-'
-  printf 'Total: %d job(s) | Updated: %s\n' "$job_count" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+list_jobs_plain_fast() {
+  local timestamp="$1" total="$2"
+  shift 2
+  # shellcheck disable=SC2016
+  awk -v ts="$timestamp" -v total="$total" -v sq="'" '
+  function val(line,    i, v) {
+    i = index(line, "=")
+    if (i == 0) return ""
+    v = substr(line, i + 1)
+    if (length(v) >= 2 && substr(v, 1, 1) == sq && substr(v, length(v), 1) == sq)
+      v = substr(v, 2, length(v) - 2)
+    gsub(sq "\\\\" sq sq, sq, v)
+    return v
+  }
+  function flush(    cd) {
+    if (jid == "") return
+    if (st == "running" && pid ~ /^[0-9]+$/ && pid != "0") {
+      if (system("kill -0 " pid " >/dev/null 2>&1") != 0) st = "completed"
+    }
+    cd = (length(cmd) > 48) ? substr(cmd, 1, 48) "..." : cmd
+    printf "%-20s %-8s %-12s %-50s %s\n", jid, pid, st, cd, stime
+    n++
+  }
+  function sep(    i) { for (i = 0; i < 130; i++) printf "-"; printf "\n" }
+  BEGIN {
+    n = 0
+    printf "------ Jobs List ------\n"
+    printf "%-20s %-8s %-12s %-50s %s\n", "JOB ID", "PID", "STATUS", "COMMAND", "START TIME"
+    sep()
+  }
+  FNR == 1 { flush(); jid=""; pid=""; cmd=""; st=""; stime="" }
+  /^JOB_ID=/     { jid = val($0) }
+  /^PID=/        { pid = val($0) }
+  /^COMMAND=/    { cmd = val($0) }
+  /^STATUS=/     { st = val($0) }
+  /^START_TIME=/ { stime = val($0) }
+  END {
+    flush()
+    if (n > 0) sep()
+    shown = (total+0 > 0 && n < total+0) ? sprintf(" (showing %d of %d)", n, total+0) : ""
+    printf "Total: %d job(s)%s | Updated: %s\n", n, shown, ts
+  }
+  ' "$@"
 }
 
 list_jobs() {
   init_jobs_dir
-  local plain="${1:-false}"
+  local plain="${1:-false}" limit="${2:-0}"
 
-  if [[ "$plain" == "true" ]]; then
-    format_jobs_plain
+  # Collect job files
+  local job_files=()
+  for f in "${JOBS_DIR}"/*.job; do
+    [[ -f "$f" ]] && job_files+=("$f")
+  done
+
+  local total=${#job_files[@]}
+
+  if [[ $total -eq 0 ]]; then
+    local ts
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if [[ "$plain" == "true" ]]; then
+      printf '%s\n' '------ Jobs List ------'
+      printf 'Total: 0 job(s) | Updated: %s\n' "$ts"
+    else
+      printf '{"jobs":[],"count":0,"total":0,"timestamp":"%s"}\n' "$ts"
+    fi
     return
   fi
 
-  local jobs_json=""
-  local job_count=0
+  # Sort newest first by modification time (handles both auto-generated and custom job IDs)
+  IFS=$'\n' job_files=($(ls -1t "${job_files[@]}"))
+  unset IFS
 
-  for job_file in "${JOBS_DIR}"/*.job; do
-    [[ -f "$job_file" ]] || continue
+  # Apply limit
+  if [[ "$limit" -gt 0 && "$limit" -lt "$total" ]]; then
+    job_files=("${job_files[@]:0:$limit}")
+  fi
 
-    local JOB_ID="" PID="" COMMAND="" STATUS="" START_TIME="" EXIT_CODE="" END_TIME=""
-    # shellcheck disable=SC1090
-    source "$job_file"
+  local timestamp
+  timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-    # Refresh status for running jobs
-    if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2>/dev/null; then
-      STATUS="completed"
-    fi
-
-    if [[ -n "$jobs_json" ]]; then
-      jobs_json="${jobs_json},"
-    fi
-
-    jobs_json="${jobs_json}{\"job_id\":\"$(json_escape "$JOB_ID")\",\"pid\":${PID},\"status\":\"${STATUS}\",\"command\":\"$(json_escape "$COMMAND")\",\"start_time\":${START_TIME}}"
-    ((++job_count))
-  done
-
-  printf '{"jobs":[%s],"count":%d,"timestamp":"%s"}\n' \
-    "$jobs_json" "$job_count" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ "$plain" == "true" ]]; then
+    list_jobs_plain_fast "$timestamp" "$total" "${job_files[@]}"
+  else
+    list_jobs_json_fast "$timestamp" "$total" "${job_files[@]}"
+  fi
 }
 
 cleanup_jobs() {
@@ -1126,6 +1191,7 @@ OPTIONS:
   -k, --terminate <id>    Terminate async job
   --terminate-all         Terminate all running jobs
   -l, --list              List all tracked jobs (JSON output, use --plain for table format)
+  -n, --limit <N>         Limit job list to N most recent entries (use with -l)
   --cleanup               Remove completed job artifacts
   --stdin                 Read command from stdin (for shell metacharacters)
   --plain                 Output plain text instead of JSON
@@ -1195,6 +1261,8 @@ EXAMPLES:
   # Job management
   actuator --list                    # JSON output
   actuator --list --plain            # Formatted table
+  actuator -l -n 20                  # Show 20 most recent jobs
+  actuator -l -n 50 --plain          # Show 50 most recent in table format
   actuator --terminate-all
   actuator --cleanup
 
@@ -1319,7 +1387,7 @@ main() {
   local command="" mode="sync" timeout="$DEFAULT_TIMEOUT"
   local stream="false" plain="false" use_tty="false" quiet="false" write_mode="false"
   local poll_id="" terminate_id="" terminate_signal="TERM" list_jobs_flag="false"
-  local custom_job_id=""
+  local custom_job_id="" list_limit=""
 
   # Get execution sequence number (global for all functions)
   EXEC_SEQUENCE=$(get_next_sequence)
@@ -1379,6 +1447,8 @@ main() {
         usage; exit 0 ;;
       -l|--list)
         list_jobs_flag="true"; shift ;;
+      -n|--limit)
+        list_limit="$2"; shift 2 ;;
       --terminate-all)
         terminate_all_jobs; exit 0 ;;
       --cleanup)
@@ -1419,7 +1489,7 @@ main() {
 
   # Handle deferred actions
   if [[ "$list_jobs_flag" == "true" ]]; then
-    list_jobs "$plain"
+    list_jobs "$plain" "$list_limit"
     exit 0
   fi
 
