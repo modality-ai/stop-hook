@@ -91,3 +91,6 @@ Configuration field reference:
 - `promise`: Completion signal phrase for the agent
 - `persona`: Persona name to deploy at session start
 - `prompt`: Initial prompt for the agent loop
+
+## References
+- [GitHub Copilot SDK](https://github.com/github/copilot-sdk)
