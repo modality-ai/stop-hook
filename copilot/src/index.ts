@@ -28,12 +28,18 @@ const logger = {
 
   log: (message?: any, ...args: any[]) => {
     logger.store("log", message);
-    console.log(`${new Date().toISOString()} ${gSessionId} ${message}`, ...args);
+    console.log(
+      `${new Date().toISOString()} ${gSessionId} ${message}`,
+      ...args
+    );
   },
 
   error: (message?: any, ...args: any[]) => {
     logger.store("error", message);
-    console.error(`${new Date().toISOString()} ${gSessionId} ${message}`, ...args);
+    console.error(
+      `${new Date().toISOString()} ${gSessionId} ${message}`,
+      ...args
+    );
   },
 };
 
@@ -537,7 +543,11 @@ const initSession = async (
                   writeMode = "-w";
                 }
                 const actuatorId = input.timestamp;
-                const command = `actuator ${writeMode} -j ${actuatorId} -a --- ${shellEscape(originalCmd)}; actuator -s -p ${actuatorId}`;
+                const actuatorCmd = "actuator -a";
+                const command =
+                  originalCmd.indexOf(actuatorCmd) === 0
+                    ? originalCmd
+                    : `${actuatorCmd} ${writeMode} -j ${actuatorId} --- ${shellEscape(originalCmd)}; actuator -s -p ${actuatorId}`;
                 console.log(`🛠️ Bash Job: ${command}`);
                 return {
                   permissionDecision: "allow",
