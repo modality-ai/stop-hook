@@ -496,9 +496,6 @@ const initSession = async (
                       if (toolResultData.stdout) {
                         gLlm += `\nStdout:\n\`\`\`\n${toolResultData.stdout}\n\`\`\``;
                       }
-                      console.log(
-                        `\n🛠️  Actuator Tool Result for LLM:\n${gLlm}\n`
-                      );
                       return gLlm;
                     }
                   }
@@ -511,8 +508,11 @@ const initSession = async (
                         clearInterval(checkInterval);
                         resolve(result);
                       }
-                    }, 5000);
+                    }, 1000);
                   }
+                );
+                console.log(
+                  `\n🛠️  Actuator Tool Result for LLM:\n${content}\n`
                 );
                 return {
                   modifiedResult: {
