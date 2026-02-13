@@ -8,6 +8,9 @@ import { execSync } from "child_process";
 
 const LAST_SESSION_FILE = "/tmp/copilot-loop-last-session";
 
+/** Shell-escape a string using single quotes (POSIX-safe, handles all metacharacters) */
+const shellEscape = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
+
 type PreToolUseHookOutput = {
   permissionDecision: "allow" | "deny" | "ask";
   modifiedArgs?: Record<string, any>;
@@ -534,7 +537,7 @@ const initSession = async (
                   writeMode = "-w";
                 }
                 const actuatorId = input.timestamp;
-                const command = `actuator ${writeMode} -j ${actuatorId} -a --- ${originalCmd}; actuator -s -p ${actuatorId}`;
+                const command = `actuator ${writeMode} -j ${actuatorId} -a --- ${shellEscape(originalCmd)}; actuator -s -p ${actuatorId}`;
                 console.log(`🛠️ Bash Job: ${command}`);
                 return {
                   permissionDecision: "allow",
