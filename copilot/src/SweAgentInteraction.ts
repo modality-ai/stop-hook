@@ -98,7 +98,7 @@ class SweAgent {
     content: string,
     userPrompt: string | null
   ): Promise<void> {
-    if (content?.trim()) {
+    if ("string" === typeof content && content?.trim()) {
       const lines = content.split("\n").slice(-CONFIG.PROMISE_LINES);
       for (let i = lines.length - 1; i >= 0; i--) {
         const line = lines[i];
@@ -209,7 +209,7 @@ export class SweAgentInteraction extends SweAgent {
 
   private async promptConfirmation(): Promise<string> {
     const answer = await this.ask("Confirm? (Y/n/e)> ");
-    const r = answer.trim().toLowerCase();
+    const r = answer?.trim().toLowerCase();
     return ["y", "n", "e", ""].includes(r) ? r : this.promptConfirmation();
   }
 
@@ -223,7 +223,7 @@ export class SweAgentInteraction extends SweAgent {
       if (c === "e") {
         this.rl.write(cmd);
         const edited = await this.ask("Edit: ");
-        return edited.trim() || cmd;
+        return edited?.trim() || cmd;
       }
       return cmd;
     });
