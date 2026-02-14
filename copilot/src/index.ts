@@ -80,7 +80,7 @@ const getPositionalArgs = (): string[] => {
 };
 
 // Load and parse YAML prompt file
-const loadPromptFile = async (filePath: any) => {
+const loadPromptFile = async (filePath: string): Promise<Record<string, any>> => {
   if (typeof filePath !== "string") {
     logger.error("Prompt file path must be a string.");
     process.exit(1);
@@ -176,7 +176,7 @@ const hasActuator = whichCli("actuator") != null;
 let session: CopilotSession | undefined;
 let sessionTimout: NodeJS.Timeout;
 const setupSessionEventListener = (
-  session: any,
+  session: CopilotSession,
   abortController: AbortController
 ) => {
   // ============================================================================
@@ -337,7 +337,7 @@ const setupSessionEventListener = (
           // Tool execution finished
           if (event.data.success) {
             logger.log(`   ✓ Tool completed`);
-            if (event.data.result?.content) {
+            if (event.data.result && event.data.result.content) {
               const preview = event.data.result.content.slice(0, 150);
               logger.log(
                 `   Result: ${preview}${event.data.result.content.length > 150 ? "..." : ""}`
@@ -422,8 +422,8 @@ const setupSessionEventListener = (
 
         case "session.truncation":
         case "session.compaction_complete":
-          if (null != promptConfig.persona) {
-            session?.send({
+          if (null != promptConfig.persona && session) {
+            session.send({
               prompt: getPersonaPrompt(promptConfig.persona),
             });
           }
@@ -467,6 +467,9 @@ const initSession = async (
       // https://github.com/github/copilot-sdk/blob/main/nodejs/src/types.ts#L584
       backgroundCompactionThreshold: 0.65,
     },
+    onPermissionRequest: async () => {
+      return { kind: "approved" as const };
+    },
     hooks: {
       onPostToolUse: async (input: any) => {
         switch (input.toolName) {
@@ -500,7 +503,7 @@ const initSession = async (
                     }
                   }
                 };
-                const content = await new Promise<string>(
+                const content: string = await new Promise<string>(
                   (resolve, _reject) => {
                     const checkInterval = setInterval(() => {
                       const result = checkResult();
@@ -533,7 +536,7 @@ const initSession = async (
           case "bash":
           case "shell":
             try {
-              const toolArgs = JSON.parse(input.toolArgs);
+              const toolArgs = typeof input.toolArgs === "string" ? JSON.parse(input.toolArgs) : input.toolArgs;
               const originalCmd = toolArgs?.command || "";
               appendFile(
                 "/tmp/copilot-loop-command.log",
@@ -607,7 +610,7 @@ const aiThinking = async ({ prompt }: any, sendTimeoutMs: number) => {
     session
       .sendAndWait({ prompt }, sendTimeoutMs)
       .then(async (response) => {
-        mainResponse = response?.data?.content || "";
+        mainResponse = response?.data?.content ?? "";
       })
       .catch((error) => {
         mainResponse = error;
