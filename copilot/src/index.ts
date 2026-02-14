@@ -162,7 +162,7 @@ process.on("uncaughtException", unHandle);
 const whichCli = (cli: string): string | null => {
   try {
     const output = execSync(`which ${cli}`, { encoding: "utf-8" });
-    return output.trim();
+    return output?.trim();
   } catch (error) {
     return null;
   }
@@ -271,7 +271,7 @@ const setupSessionEventListener = (
           // Token usage and cost information
           if (event.data.currentTokens || event.data.tokenLimit) {
             logger.log(
-              `📊 Usage - Current: ${event.data.currentTokens}, Limit: ${event.data.tokenLimit}`
+              `📊 Usage - Current: ${event.data.currentTokens}, Limit: ${event.data.tokenLimit}, Messages: ${event.data.messagesLength}`
             );
           }
           break;
@@ -550,7 +550,7 @@ const initSession = async (
                   originalCmd.indexOf(actuatorCmd) === 0
                     ? originalCmd
                     : `${actuatorCmd} ${writeMode} --- ${shellEscape(originalCmd)}`;
-                console.log(`🛠️ Bash Job: ${command}`);
+                console.log(`🐚 Bash Job: ${command}`);
                 return {
                   permissionDecision: "allow",
                   modifiedArgs: {
@@ -806,7 +806,7 @@ const main = async () => {
   if (sessionOverride === true) {
     // --resume without session ID: read last session from tracking file
     if (existsSync(LAST_SESSION_FILE)) {
-      gSessionId = readFileSync(LAST_SESSION_FILE, "utf-8").trim();
+      gSessionId = readFileSync(LAST_SESSION_FILE, "utf-8")?.trim();
       logger.log(`🔄 Resuming last session: ${gSessionId}`);
     } else {
       logger.error("No previous session found to resume.");
