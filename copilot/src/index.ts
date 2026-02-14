@@ -515,7 +515,7 @@ const initSession = async (
                   }
                 );
                 console.log(
-                  `\n🛠️  Actuator Tool Result for LLM:\n${content}\n`
+                  `\n🐚  Actuator Tool Result for LLM:\n${content}\n`
                 );
                 return {
                   modifiedResult: {
