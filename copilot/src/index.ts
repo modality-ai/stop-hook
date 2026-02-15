@@ -80,7 +80,9 @@ const getPositionalArgs = (): string[] => {
 };
 
 // Load and parse YAML prompt file
-const loadPromptFile = async (filePath: string): Promise<Record<string, any>> => {
+const loadPromptFile = async (
+  filePath: string
+): Promise<Record<string, any>> => {
   if (typeof filePath !== "string") {
     logger.error("Prompt file path must be a string.");
     process.exit(1);
@@ -449,7 +451,12 @@ const initSession = async (
     delete options.model;
   }
   const defaultModel = options.reasoningEffort ? "gpt-5-mini" : "gpt-4.1";
-  const { model = defaultModel, reasoningEffort, mcpServers } = options;
+  const {
+    model = defaultModel,
+    reasoningEffort,
+    mcpServers,
+    systemPromptMode = "append",
+  } = options;
   logger.log(
     `🚀 Initializing session with model: ${model} ${reasoningEffort ? "reasoningEffort: " + reasoningEffort : "..."}`
   );
@@ -459,7 +466,7 @@ const initSession = async (
     mcpServers,
     streaming: true,
     systemMessage: {
-      mode: "append" as const, // [append | replace] - whether to append to or replace the default system SDK security guardrails
+      mode: systemPromptMode, // [append | replace] - whether to append to or replace the default system SDK security guardrails
       content: systemPrompt,
     },
     reasoningEffort, // [low|medium|high|xhigh] Ensure maximum reasoning effort for new sessions
@@ -536,7 +543,10 @@ const initSession = async (
           case "bash":
           case "shell":
             try {
-              const toolArgs = typeof input.toolArgs === "string" ? JSON.parse(input.toolArgs) : input.toolArgs;
+              const toolArgs =
+                typeof input.toolArgs === "string"
+                  ? JSON.parse(input.toolArgs)
+                  : input.toolArgs;
               const originalCmd = toolArgs?.command || "";
               appendFile(
                 "/tmp/copilot-loop-command.log",
