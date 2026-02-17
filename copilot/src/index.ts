@@ -7,6 +7,9 @@ import { appendFile } from "fs/promises";
 import { execSync } from "child_process";
 
 const LAST_SESSION_FILE = "/tmp/copilot-loop-last-session";
+let session: CopilotSession | undefined;
+let sessionTimout: NodeJS.Timeout;
+let healthCheckHandle: NodeJS.Timeout;
 
 /** Shell-escape a string using single quotes (POSIX-safe, handles all metacharacters) */
 const shellEscape = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
@@ -112,6 +115,7 @@ const setupSignalHandlers = (
     const activeSession = getSession();
     if (activeSession && !stopping) {
       await activeSession.abort(); // Cancel in-progress operation
+      clearInterval(healthCheckHandle);
       stopping = true;
     }
 
@@ -175,8 +179,6 @@ const client = new CopilotClient({
 });
 const hasActuator = whichCli("actuator") != null;
 
-let session: CopilotSession | undefined;
-let sessionTimout: NodeJS.Timeout;
 const setupSessionEventListener = (
   session: CopilotSession,
   abortController: AbortController
@@ -644,7 +646,7 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
   // Periodic server health check via ping
   const healthCheckIntervalMs = 3000; // 3 seconds
   const pingTimeoutMs = 1000; // 1 second timeout for ping response
-  const healthCheckHandle = setInterval(async () => {
+  healthCheckHandle = setInterval(async () => {
     try {
       await Promise.race([
         client.ping("O.K."),
