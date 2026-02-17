@@ -34,7 +34,7 @@ const logger = {
   log: (message?: any, ...args: any[]) => {
     logger.store("log", message);
     console.log(
-      `${new Date().toISOString()} ${gSessionId} ${message}`,
+      `\n${new Date().toISOString()} ${gSessionId} ${message}`,
       ...args
     );
   },
@@ -42,7 +42,7 @@ const logger = {
   error: (message?: any, ...args: any[]) => {
     logger.store("error", message);
     console.error(
-      `${new Date().toISOString()} ${gSessionId} ${message}`,
+      `\n${new Date().toISOString()} ${gSessionId} ${message}`,
       ...args
     );
   },
@@ -391,8 +391,13 @@ const setupSessionEventListener = (
 
         case "assistant.usage":
           // Usage info for this message
-          if (event.data.outputTokens) {
-            logger.log(`   [Tokens used: ${event.data.outputTokens}]`);
+          const { entitlementRequests, usedRequests, overage } =
+            event?.data?.quotaSnapshots?.premium_interactions || {};
+          if (event.data.quotaSnapshots.premium_interactions) {
+            logger.log(`   [Cost: ${event?.data?.cost}]`);
+            logger.log(
+              `   [Premium used: ${usedRequests}/${entitlementRequests} requests, overage: ${overage}]`
+            );
           }
           break;
 
@@ -467,8 +472,8 @@ const initSession = async (
   logger.log(
     `🚀 Initializing session with model: ${model} ${reasoningEffort ? "reasoningEffort: " + reasoningEffort : "..."}`
   );
-  logger.log(` systemPromptMode: ${systemPromptMode}`);
-  logger.log(`📌 Session ID: ${gSessionId}`);
+  logger.log(`   📌 systemPromptMode: ${systemPromptMode}`);
+  logger.log(`   📌 Session ID: ${gSessionId}`);
   const sessionOptoins = {
     model,
     mcpServers,
