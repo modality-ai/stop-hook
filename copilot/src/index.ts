@@ -444,6 +444,8 @@ const setupSessionEventListener = (
   });
 };
 
+const systemPromptModes = ["append", "replace"] as const;
+
 const initSession = async (
   systemPrompt: string,
   options: any = {},
@@ -457,18 +459,22 @@ const initSession = async (
     model = defaultModel,
     reasoningEffort,
     mcpServers,
-    systemPromptMode = "append",
+    systemPromptMode = systemPromptModes[0],
   } = options;
+  let finalSystemPromptMode = systemPromptModes.includes(systemPromptMode)
+    ? systemPromptMode
+    : systemPromptModes[0];
   logger.log(
     `🚀 Initializing session with model: ${model} ${reasoningEffort ? "reasoningEffort: " + reasoningEffort : "..."}`
   );
+  logger.log(` systemPromptMode: ${systemPromptMode}`);
   logger.log(`📌 Session ID: ${gSessionId}`);
   const sessionOptoins = {
     model,
     mcpServers,
     streaming: true,
     systemMessage: {
-      mode: systemPromptMode, // [append | replace] - whether to append to or replace the default system SDK security guardrails
+      mode: finalSystemPromptMode, // [append | replace] - whether to append to or replace the default system SDK security guardrails
       content: systemPrompt,
     },
     reasoningEffort, // [low|medium|high|xhigh] Ensure maximum reasoning effort for new sessions
