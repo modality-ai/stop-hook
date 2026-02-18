@@ -643,6 +643,9 @@ const initSession = async (
     if (null == cachedModelIds) {
       cachedModelIds = models.map((m: any) => m.id).filter(Boolean);
     }
+    if (parseCliArgs("--update-models")) {
+      process.exit(0);
+    }
   }
   if (!cachedModelIds.includes(model)) {
     logger.error(
