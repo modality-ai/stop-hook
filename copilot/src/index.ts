@@ -13,7 +13,7 @@ let healthCheckHandle: NodeJS.Timeout;
 let currentSession: CopilotSession;
 // Global session ID - Snowflake-like ID (distributed system friendly)
 let gSessionId = getSessionId();
-const loopId = getSessionId();
+let loopId = gSessionId;
 
 /** Shell-escape a string using single quotes (POSIX-safe, handles all metacharacters) */
 const shellEscape = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
@@ -22,7 +22,6 @@ type PreToolUseHookOutput = {
   permissionDecision: "allow" | "deny" | "ask";
   modifiedArgs?: Record<string, any>;
 };
-
 
 // Simple logger wrapper
 const logger = {
@@ -492,7 +491,7 @@ const initSession = async (
     `🚀 Initializing session with model: ${model} ${reasoningEffort ? "reasoningEffort: " + reasoningEffort : "..."}`
   );
   logger.log(`   📌 systemPromptMode: ${systemPromptMode}`);
-  logger.log(`   📌 Session ID: ${gSessionId}`);
+  logger.log(`   📌 Session ID: ${gSessionId} | Loop ID: ${loopId}`);
   const sessionOptoins = {
     model,
     mcpServers,
@@ -653,7 +652,7 @@ const initSession = async (
   }
 
   // Track session ID for --resume support
-  writeFileSync(LAST_SESSION_FILE, gSessionId);
+  writeFileSync(LAST_SESSION_FILE, `${gSessionId},${loopId}`);
 
   // Attach event listener immediately after session is created
   // Store the unsubscribe function to keep the listener alive
@@ -677,7 +676,10 @@ const aiThinking = async (
     session
       .sendAndWait({ prompt }, sendTimeoutMs)
       .then(async (response) => {
-        await session.sendAndWait({ prompt: `Update LOOP_MD for: ${mainResponse}` }, sendTimeoutMs);
+        await session.sendAndWait(
+          { prompt: `Update LOOP_MD for: ${mainResponse}` },
+          sendTimeoutMs
+        );
         mainResponse = response?.data?.content ?? "";
       })
       .catch((error) => {
@@ -695,7 +697,7 @@ const aiThinking = async (
   });
 };
 
-const aiCommand = async (prompt: any, systemPrompt: string) => {
+const aiCommand = async (prompt: any, systemPrompt: string, mode: string) => {
   const abortController = new AbortController();
   const session = await initSession(
     systemPrompt,
@@ -761,7 +763,9 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
     }
     return "";
   } finally {
-    gSessionId = getSessionId();
+    if (mode === "yolo") {
+      gSessionId = getSessionId();
+    }
     clearInterval(healthCheckHandle);
     session?.destroy?.().catch(() => {});
   }
@@ -886,10 +890,18 @@ const main = async () => {
   // Apply CLI overrides to promptConfig
   if (sessionOverride === true) {
     // --resume without session ID: read last session from tracking file
-    if (existsSync(LAST_SESSION_FILE)) {
-      gSessionId = readFileSync(LAST_SESSION_FILE, "utf-8")?.trim();
-      logger.log(`🔄 Resuming last session: ${gSessionId}`);
-    } else {
+    try {
+      if (existsSync(LAST_SESSION_FILE)) {
+        const data = readFileSync(LAST_SESSION_FILE, "utf-8")
+          ?.trim()
+          .split(",");
+        gSessionId = data?.[0] || gSessionId;
+        loopId = data?.[1] || gSessionId;
+        logger.log(`🔄 Resuming last session: ${gSessionId}`);
+      } else {
+        throw new Error("No session tracking file found");
+      }
+    } catch (error) {
       logger.error("No previous session found to resume.");
       process.exit(1);
     }
@@ -920,6 +932,7 @@ const main = async () => {
     aiCommand,
     completionPromise,
     maxIterations,
+    loopId,
   }).init(mode, initialPrompt);
   setupSignalHandlers(client, () => currentSession);
 };

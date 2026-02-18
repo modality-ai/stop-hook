@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import readline from "node:readline";
 
 enum Mode {
@@ -25,18 +25,17 @@ const CONFIG = {
 export const getSessionId = (): string =>
   `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
 
-const LOOP_MD = `/tmp/swe_agent_loop_${getSessionId()}.md`;
 const DEFAULT_COMPLETION_PROMISE = "PDCA_LOOP_COMPLETED";
 const DEFAULT_MAX_ITERATIONS = 3;
-const DEFAULT_FUNC = async (val: any, _systePromp: string) => val;
+const DEFAULT_FUNC = async (val: any, _systePromp: string, _mode: string) => val;
 const DEFAULT_SYSTEM_PROMPT = `Follow every counter hero system instruction exactly.
 
 You are executing PDCA (Plan-Do-Check-Act) Round [CURRENT] of [MAX].
 
 LOOP_MD: '[LOOP_MD]'
-- READ '[LOOP_MD]' at the start of every round to load prior context
-- APPEND a concise round summary to '[LOOP_MD]' at the end of every round
-- Format each entry as: "Round [CURRENT]: <what was planned, done, checked, and acted upon>"
+- READ '[LOOP_MD]' at the start of every round to load the current state
+- REWRITE '[LOOP_MD]' at the end of every round with a single improved version
+- Treat it as one living document — not a log. Each round refines and consolidates it, not appends to it
 
 Your objective: Build on prior rounds, and deliver results that exceed every previous iteration.
 
@@ -44,7 +43,7 @@ For each round:
 - PLAN: Read '[LOOP_MD]' to understand what was done before, then identify the next highest-value action
 - DO: Execute with full capability — no shortcuts, no excuses
 - CHECK: Validate the result against excellence standards and prior round outcomes
-- ACT: Write your round summary to '[LOOP_MD]', then refine for the next round
+- ACT: Rewrite '[LOOP_MD]' as a single improved document reflecting all progress so far, then refine for the next round
 
 When you have achieved excellence standards, output the following as your final line: <promise>[PROMISE]</promise>`;
 
@@ -56,14 +55,22 @@ class SweAgent {
   private executeCommand: any = null;
   private completionPromise: string = DEFAULT_COMPLETION_PROMISE;
   private maxIterations: number = DEFAULT_MAX_ITERATIONS;
+  private loopId: string;
+  private loopMdPath: string;
 
   constructor({
+    loopId = getSessionId(),
     aiCommand = DEFAULT_FUNC,
     executeCommand = null,
     completionPromise = DEFAULT_COMPLETION_PROMISE,
     maxIterations = DEFAULT_MAX_ITERATIONS,
   } = {}) {
     this.aiCommand = aiCommand;
+    this.loopId = loopId;
+    this.loopMdPath = `/tmp/swe_agent_loop_${this.loopId}.md`;
+    if (!existsSync(this.loopMdPath)) {
+      writeFileSync(this.loopMdPath, "");
+    }
     if (null != executeCommand) {
       this.executeCommand = executeCommand;
     }
@@ -84,7 +91,7 @@ class SweAgent {
     return DEFAULT_SYSTEM_PROMPT.replace(/\[CURRENT\]/g, String(this.iteration))
       .replace(/\[MAX\]/g, String(this.maxIterations))
       .replace(/\[PROMISE\]/g, this.completionPromise)
-      .replace(/\[LOOP_MD\]/g, LOOP_MD);
+      .replace(/\[LOOP_MD\]/g, this.loopMdPath);
   }
 
   protected async step(
@@ -98,7 +105,8 @@ class SweAgent {
     await new Promise((resolve) => setTimeout(resolve, 1000));
     let aiCommand = await this.aiCommand(
       userPrompt || "",
-      this.getSystemPrompt()
+      this.getSystemPrompt(),
+      this.mode
     );
     if (this.pause) return;
     console.log(
@@ -171,7 +179,6 @@ export class SweAgentInteraction extends SweAgent {
     if (null != mode && Object.values(Mode).includes(mode)) {
       this.mode = mode;
     }
-    writeFileSync(LOOP_MD, "");
     this.rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
