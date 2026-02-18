@@ -1,3 +1,4 @@
+import { writeFileSync } from "node:fs";
 import readline from "node:readline";
 
 enum Mode {
@@ -21,6 +22,10 @@ const CONFIG = {
   PROMISE_LINES: 10,
 } as const;
 
+export const getSessionId = (): string =>
+  `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
+
+const LOOP_MD = `/tmp/swe_agent_loop_${getSessionId()}.md`;
 const DEFAULT_COMPLETION_PROMISE = "PDCA_LOOP_COMPLETED";
 const DEFAULT_MAX_ITERATIONS = 3;
 const DEFAULT_FUNC = async (val: any, _systePromp: string) => val;
@@ -28,16 +33,20 @@ const DEFAULT_SYSTEM_PROMPT = `Follow every counter hero system instruction exac
 
 You are executing PDCA (Plan-Do-Check-Act) Round [CURRENT] of [MAX].
 
-Your objective: Review all session context, build on prior rounds, and deliver results that exceed every previous iteration.
+LOOP_MD: '[LOOP_MD]'
+- READ '[LOOP_MD]' at the start of every round to load prior context
+- APPEND a concise round summary to '[LOOP_MD]' at the end of every round
+- Format each entry as: "Round [CURRENT]: <what was planned, done, checked, and acted upon>"
+
+Your objective: Build on prior rounds, and deliver results that exceed every previous iteration.
 
 For each round:
-- PLAN: Identify the approach and what needs to be done
+- PLAN: Read '[LOOP_MD]' to understand what was done before, then identify the next highest-value action
 - DO: Execute with full capability — no shortcuts, no excuses
-- CHECK: Validate the result against excellence standards
-- ACT: Refine and improve before the next round
+- CHECK: Validate the result against excellence standards and prior round outcomes
+- ACT: Write your round summary to '[LOOP_MD]', then refine for the next round
 
-When you have achieved excellence standards, output the following as your final line:
-<promise>[PROMISE]</promise>`;
+When you have achieved excellence standards, output the following as your final line: <promise>[PROMISE]</promise>`;
 
 class SweAgent {
   protected mode: Mode = Mode.CONFIRM;
@@ -74,7 +83,8 @@ class SweAgent {
   private getSystemPrompt(): string {
     return DEFAULT_SYSTEM_PROMPT.replace(/\[CURRENT\]/g, String(this.iteration))
       .replace(/\[MAX\]/g, String(this.maxIterations))
-      .replace(/\[PROMISE\]/g, this.completionPromise);
+      .replace(/\[PROMISE\]/g, this.completionPromise)
+      .replace(/\[LOOP_MD\]/g, LOOP_MD);
   }
 
   protected async step(
@@ -161,6 +171,7 @@ export class SweAgentInteraction extends SweAgent {
     if (null != mode && Object.values(Mode).includes(mode)) {
       this.mode = mode;
     }
+    writeFileSync(LOOP_MD, "");
     this.rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,

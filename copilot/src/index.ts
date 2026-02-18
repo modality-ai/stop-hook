@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { SweAgentInteraction } from "./SweAgentInteraction";
+import { SweAgentInteraction, getSessionId } from "./SweAgentInteraction";
 import { CopilotClient, type CopilotSession } from "@github/copilot-sdk";
 import { appendFileSync, readFileSync, writeFileSync, existsSync } from "fs";
 import { appendFile } from "fs/promises";
@@ -8,9 +8,12 @@ import { execSync } from "child_process";
 
 const LAST_SESSION_FILE = "/tmp/copilot-loop-last-session";
 const MODELS_CACHE_FILE = "/tmp/copilot-loop-models.json";
-let session: CopilotSession | undefined;
 let sessionTimout: NodeJS.Timeout;
 let healthCheckHandle: NodeJS.Timeout;
+let currentSession: CopilotSession;
+// Global session ID - Snowflake-like ID (distributed system friendly)
+let gSessionId = getSessionId();
+const loopId = getSessionId();
 
 /** Shell-escape a string using single quotes (POSIX-safe, handles all metacharacters) */
 const shellEscape = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
@@ -20,15 +23,11 @@ type PreToolUseHookOutput = {
   modifiedArgs?: Record<string, any>;
 };
 
-// Global session ID - Snowflake-like ID (distributed system friendly)
-const getSessionId = (): string =>
-  `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
-let gSessionId = getSessionId();
 
 // Simple logger wrapper
 const logger = {
   store: (logType: string, message: string) => {
-    const filePath = `/tmp/copilot-loop-${gSessionId}-${logType}.txt`;
+    const filePath = `/tmp/copilot-loop-${loopId}-${logType}.txt`;
     appendFileSync(filePath, `${message}\n`);
   },
 
@@ -132,9 +131,9 @@ const setupSignalHandlers = (
     const activeSession = getSession();
     if (activeSession && !stopping) {
       await activeSession.abort(); // Cancel in-progress operation
-      clearInterval(healthCheckHandle);
       stopping = true;
     }
+    clearInterval(healthCheckHandle);
 
     try {
       const timeout = new Promise<never>((_, reject) =>
@@ -463,7 +462,7 @@ const setupSessionEventListener = (
           break;
       }
     } catch (error) {
-      console.error("Event handler error:", error);
+      logger.error("Event handler error:", error);
     }
   });
 };
@@ -473,8 +472,9 @@ const systemPromptModes = ["append", "replace"] as const;
 const initSession = async (
   systemPrompt: string,
   options: any = {},
-  abortController: AbortController
-) => {
+  abortController: AbortController,
+  session?: CopilotSession
+): Promise<CopilotSession> => {
   if (null == options.model) {
     delete options.model;
   }
@@ -553,9 +553,7 @@ const initSession = async (
                     }, 1000);
                   }
                 );
-                console.log(
-                  `\n🐚  Actuator Tool Result for LLM:\n${content}\n`
-                );
+                logger.log(`🐚  Actuator Tool Result for LLM:\n${content}\n`);
                 return {
                   modifiedResult: {
                     textResultForLlm: content,
@@ -564,7 +562,7 @@ const initSession = async (
                   },
                 };
               } catch (error) {
-                console.error("Failed to parse tool result for LLM:", error);
+                logger.error("Failed to parse tool result for LLM:", error);
               }
             }
             break;
@@ -595,7 +593,7 @@ const initSession = async (
                   originalCmd.indexOf(actuatorCmd) === 0
                     ? originalCmd
                     : `${actuatorCmd} ${writeMode} --- ${shellEscape(originalCmd)}`;
-                console.log(`🐚 Bash Job: ${command}`);
+                logger.log(`🐚 Bash Job: ${command}`);
                 return {
                   permissionDecision: "allow",
                   modifiedArgs: {
@@ -607,7 +605,7 @@ const initSession = async (
             } catch (error) {}
             break;
           default:
-            console.log(
+            logger.log(
               `⚠️  No pre-tool hook defined for tool: ${input.toolName}`
             );
             break;
@@ -637,7 +635,7 @@ const initSession = async (
   if (null == cachedModelIds || parseCliArgs("--update-models")) {
     const models = await client.listModels();
     saveModelsCache(models);
-    console.log(
+    logger.log(
       `✅ Models cache updated: ${MODELS_CACHE_FILE} (${models.length} models)`
     );
     if (null == cachedModelIds) {
@@ -660,11 +658,17 @@ const initSession = async (
   // Attach event listener immediately after session is created
   // Store the unsubscribe function to keep the listener alive
   setupSessionEventListener(session, abortController);
+  return session;
 };
 
-const aiThinking = async ({ prompt }: any, sendTimeoutMs: number) => {
+const aiThinking = async (
+  { prompt }: any,
+  sendTimeoutMs: number,
+  session: CopilotSession
+) => {
   let mainResponse = "";
 
+  await session.sendAndWait({ prompt: "Read LOOP_MD file" }, sendTimeoutMs);
   const say = (prompt: string) => {
     if (!session) {
       logger.error("Session not initialized");
@@ -673,6 +677,7 @@ const aiThinking = async ({ prompt }: any, sendTimeoutMs: number) => {
     session
       .sendAndWait({ prompt }, sendTimeoutMs)
       .then(async (response) => {
+        await session.sendAndWait({ prompt: `Update LOOP_MD for: ${mainResponse}` }, sendTimeoutMs);
         mainResponse = response?.data?.content ?? "";
       })
       .catch((error) => {
@@ -692,7 +697,12 @@ const aiThinking = async ({ prompt }: any, sendTimeoutMs: number) => {
 
 const aiCommand = async (prompt: any, systemPrompt: string) => {
   const abortController = new AbortController();
-  await initSession(systemPrompt, promptConfig, abortController);
+  const session = await initSession(
+    systemPrompt,
+    promptConfig,
+    abortController
+  );
+  currentSession = session;
 
   // Periodic server health check via ping
   const healthCheckIntervalMs = 3000; // 3 seconds
@@ -730,7 +740,7 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
       );
     }
     const response = await Promise.race([
-      aiThinking({ prompt }, sendTimeoutMs),
+      aiThinking({ prompt }, sendTimeoutMs, session),
       new Promise<never>((_, reject) => {
         abortController.signal.addEventListener("abort", () => {
           reject(new Error("Operation aborted due to server hang"));
@@ -751,6 +761,7 @@ const aiCommand = async (prompt: any, systemPrompt: string) => {
     }
     return "";
   } finally {
+    gSessionId = getSessionId();
     clearInterval(healthCheckHandle);
     session?.destroy?.().catch(() => {});
   }
@@ -910,7 +921,7 @@ const main = async () => {
     completionPromise,
     maxIterations,
   }).init(mode, initialPrompt);
-  setupSignalHandlers(client, () => session);
+  setupSignalHandlers(client, () => currentSession);
 };
 
 main();
