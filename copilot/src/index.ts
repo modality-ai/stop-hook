@@ -7,6 +7,7 @@ import { appendFile } from "fs/promises";
 import { execSync } from "child_process";
 
 const LAST_SESSION_FILE = "/tmp/copilot-loop-last-session";
+const MODELS_CACHE_FILE = "/tmp/copilot-loop-models.json";
 let session: CopilotSession | undefined;
 let sessionTimout: NodeJS.Timeout;
 let healthCheckHandle: NodeJS.Timeout;
@@ -48,6 +49,22 @@ const logger = {
   },
 };
 
+const loadCachedModelIds = (): string[] | null => {
+  if (!existsSync(MODELS_CACHE_FILE)) return null;
+  try {
+    const data = JSON.parse(readFileSync(MODELS_CACHE_FILE, "utf-8"));
+    return Array.isArray(data)
+      ? data.map((m: any) => m.id).filter(Boolean)
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+const saveModelsCache = (models: any[]) => {
+  writeFileSync(MODELS_CACHE_FILE, JSON.stringify(models, null, 2));
+};
+
 // Parse CLI arguments for flags (-p, -a with value, --debug as boolean)
 const parseCliArgs = (flag: string) => {
   const index = process.argv.indexOf(flag);
@@ -62,7 +79,7 @@ const parseCliArgs = (flag: string) => {
   }
 
   // For boolean flags (like --debug, --resume, -r)
-  const booleanFlags = ["--debug", "--resume", "-r"];
+  const booleanFlags = ["--debug", "--resume", "-r", "--update-models"];
   return booleanFlags.includes(flag) ? true : null;
 };
 
@@ -394,7 +411,9 @@ const setupSessionEventListener = (
           const { entitlementRequests, usedRequests, overage } =
             event?.data?.quotaSnapshots?.premium_interactions || {};
           if (event.data.quotaSnapshots.premium_interactions) {
-            logger.log(`   [Cost: ${event?.data?.cost}]`);
+            logger.log(
+              `   [Cost: ${event?.data?.cost} / ${event?.data?.model}]`
+            );
             logger.log(
               `   [Premium used: ${usedRequests}/${entitlementRequests} requests, overage: ${overage}]`
             );
@@ -614,6 +633,24 @@ const initSession = async (
     });
   }
 
+  let cachedModelIds = loadCachedModelIds();
+  if (null == cachedModelIds || parseCliArgs("--update-models")) {
+    const models = await client.listModels();
+    saveModelsCache(models);
+    console.log(
+      `✅ Models cache updated: ${MODELS_CACHE_FILE} (${models.length} models)`
+    );
+    if (null == cachedModelIds) {
+      cachedModelIds = models.map((m: any) => m.id).filter(Boolean);
+    }
+  }
+  if (!cachedModelIds.includes(model)) {
+    logger.error(
+      `❌ Model "${model}" is not available. Run --update-models to refresh.\n   Available: ${cachedModelIds.join(", ")}`
+    );
+    process.exit(1);
+  }
+
   // Track session ID for --resume support
   writeFileSync(LAST_SESSION_FILE, gSessionId);
 
@@ -739,6 +776,7 @@ Options:
                           persistence
   --debug                 Use confirm mode for permission prompts instead of
                           automatic approval
+  --update-models         Update the local models cache file
   -h, --help              display help for command
 
 Arguments:
@@ -804,7 +842,8 @@ const main = async () => {
     !directPrompt &&
     !commandPrompt &&
     !sessionOverride &&
-    !parseCliArgs("--debug")
+    !parseCliArgs("--debug") &&
+    !parseCliArgs("--update-models")
   ) {
     printHelp();
   }
@@ -816,7 +855,9 @@ const main = async () => {
     Object.assign(promptConfig, await loadPromptFile(configFile));
     initialPrompt = promptConfig.prompt || initialPrompt;
   }
-  if (directPrompt) {
+  if (parseCliArgs("--update-models")) {
+    initialPrompt = "--update-models";
+  } else if (directPrompt) {
     initialPrompt = directPrompt;
   } else if (commandPrompt) {
     initialPrompt = commandPrompt;
