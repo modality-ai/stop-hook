@@ -505,7 +505,12 @@ const initSession = async (
       // https://github.com/github/copilot-sdk/blob/main/nodejs/src/types.ts#L584
       backgroundCompactionThreshold: 0.65,
     },
-    onPermissionRequest: async () => {
+    onPermissionRequest: async (request: any) => {
+      const denyTools: string[] = promptConfig["denyTools"] ?? [];
+      if (denyTools.includes(request?.kind)) {
+        logger.log(`🚫 Permission denied for tool: ${request?.kind}`);
+        return { kind: "denied-by-rules" as const };
+      }
       return { kind: "approved" as const };
     },
     hooks: {
@@ -522,7 +527,7 @@ const initSession = async (
             if (hasActuator && actuatorId) {
               try {
                 const checkResult = () => {
-                  let gLlm = "";
+                  let gLlm = [];
                   const actuatorCmd = `actuator -p ${actuatorId}`;
                   const toolResultJson = execSync(actuatorCmd, {
                     encoding: "utf-8",
@@ -530,14 +535,14 @@ const initSession = async (
                   const toolResultData = JSON.parse(toolResultJson);
                   if (toolResultData) {
                     if (toolResultData.status !== "running") {
-                      gLlm = `[Tool Result] ${input.toolArgs.description}\nExit Code: ${toolResultData.exit_code}`;
-                      if (toolResultData.stderr) {
-                        gLlm += `\nStderr:\n\`\`\`\n${toolResultData.stderr}\n\`\`\``;
-                      }
                       if (toolResultData.stdout) {
-                        gLlm += `\nStdout:\n\`\`\`\n${toolResultData.stdout}\n\`\`\``;
+                        gLlm.push(toolResultData.stdout);
                       }
-                      return gLlm;
+                      if (toolResultData.stderr) {
+                        gLlm.push(toolResultData.stderr);
+                      }
+                      gLlm.push(`<exited with exit code ${toolResultData.exit_code}>`);
+                      return gLlm.join("\n");
                     }
                   }
                 };
@@ -552,12 +557,12 @@ const initSession = async (
                     }, 1000);
                   }
                 );
-                logger.log(`🐚  Actuator Tool Result for LLM:\n${content}\n`);
+                logger.log(`🐚 Actuator Tool Result for LLM:\n${content}\n`);
+
                 return {
                   modifiedResult: {
+                    ...input?.toolResult,
                     textResultForLlm: content,
-                    sessionLog: content,
-                    resultType: "success" as const,
                   },
                 };
               } catch (error) {
@@ -568,6 +573,11 @@ const initSession = async (
         }
       },
       onPreToolUse: async (input: any): Promise<PreToolUseHookOutput> => {
+        const denyTools: string[] = promptConfig["denyTools"] ?? [];
+        if (denyTools.includes(input.toolName)) {
+          logger.log(`🚫 Pre-tool denied: ${input.toolName}`);
+          return { permissionDecision: "deny" };
+        }
         switch (input.toolName) {
           case "bash":
           case "shell":
@@ -582,16 +592,20 @@ const initSession = async (
                 `${new Date().toISOString()} [${gSessionId}] [${input.timestamp}] ${originalCmd}\n`
               ).catch(() => {});
               if (hasActuator) {
-                const strippedCmd = originalCmd.replace(/2>\/dev\/null/g, "");
+                const strippedCmd = originalCmd
+                  .replace(/2>\/dev\/null/g, "")
+                  .replace(/2>&1/g, "");
                 let writeMode = "";
                 if (-1 !== strippedCmd.indexOf(">")) {
                   writeMode = "-w";
                 }
+                const actuatorId = getSessionId();
                 const actuatorCmd = "actuator -a";
+                const actuatorInitCmd = `${actuatorCmd} -j ${actuatorId} ${writeMode}`;
                 const command =
                   originalCmd.indexOf(actuatorCmd) === 0
                     ? originalCmd
-                    : `${actuatorCmd} ${writeMode} --- ${shellEscape(originalCmd)}`;
+                    : `${actuatorInitCmd} --- ${shellEscape(originalCmd)}; actuator -s -p ${actuatorId}`;
                 logger.log(`🐚 Bash Job: ${command}`);
                 return {
                   permissionDecision: "allow",
@@ -667,7 +681,7 @@ const aiThinking = async (
 ) => {
   let mainResponse = "";
 
-  await session.sendAndWait({ prompt: "Read LOOP_MD file" }, sendTimeoutMs);
+  await session.sendAndWait({ prompt: "Read LOOP_MD file." }, sendTimeoutMs);
   const say = (prompt: string) => {
     if (!session) {
       logger.error("Session not initialized");
@@ -849,7 +863,15 @@ const main = async () => {
   const firstArg = positionalArgs[0];
   const isYamlFile = firstArg?.endsWith(".yaml") || firstArg?.endsWith(".yml");
 
-  configFile = isYamlFile ? firstArg : parseCliArgs("--config");
+  // When '---' boundary is used, the yaml config is before '---' in argv
+  const ddIndex = process.argv.indexOf("---");
+  const preArgs = ddIndex !== -1 ? process.argv.slice(2, ddIndex) : [];
+  const yamlFromPreArgs = preArgs.find(
+    (a) => a.endsWith(".yaml") || a.endsWith(".yml")
+  );
+  configFile = isYamlFile
+    ? firstArg
+    : yamlFromPreArgs || parseCliArgs("--config");
   const commandPrompt =
     !isYamlFile && !directPrompt && positionalArgs.length > 0
       ? positionalArgs.join(" ")

@@ -69,7 +69,7 @@ class SweAgent {
     this.loopId = loopId;
     this.loopMdPath = `/tmp/swe_agent_loop_${this.loopId}.md`;
     if (!existsSync(this.loopMdPath)) {
-      writeFileSync(this.loopMdPath, "");
+      writeFileSync(this.loopMdPath, "<!-- Initial state: no prior rounds -->\n");
     }
     if (null != executeCommand) {
       this.executeCommand = executeCommand;
