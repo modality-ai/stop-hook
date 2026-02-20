@@ -26,6 +26,7 @@ const trimLastChar = (s: string | number): string => ("" + s).slice(0, -2);
 
 type PreToolUseHookOutput = {
   permissionDecision: "allow" | "deny" | "ask";
+  permissionDecisionReason?: string;
   modifiedArgs?: Record<string, any>;
 };
 
@@ -634,9 +635,17 @@ const initSession = async (
       onPreToolUse: async (input: any): Promise<PreToolUseHookOutput> => {
         const { toolName, timestamp, command } = input || {};
         const denyTools: string[] = promptConfig["denyTools"] ?? [];
-        if (denyTools.includes(toolName) || 10 > command.indexOf("actuator")) {
+        if (denyTools.includes(toolName)) {
           logger.log(`🚫 Pre-tool denied: ${toolName}`);
           return { permissionDecision: "deny" };
+        }
+        const commandHaveActuator = command.indexOf("actuator");
+        if (-1 !== commandHaveActuator && 10 > commandHaveActuator) {
+          logger.log(`🚫 Pre-tool denied: actuator`);
+          return {
+            permissionDecision: "deny",
+            permissionDecisionReason: "actuator not allowed in command",
+          };
         }
         switch (toolName) {
           case "bash":
