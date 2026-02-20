@@ -659,7 +659,7 @@ const initSession = async (
                 const actuatorCmd = "actuator -a";
                 const actuatorInitCmd = `${actuatorCmd} -j ${actuatorId} ${writeMode}`;
                 const command = `${actuatorInitCmd} --- ${shellEscape(originalCmd)}`;
-                logger.log(`🐚 Bash Job: ${command}`);
+                logger.log(`🐚 Start to Execute Bash: ${command}`);
 
                 setTimeout(async () => {
                   const proc = Bun.spawn(["actuator", "-s", "-p", actuatorId], {
@@ -680,7 +680,7 @@ const initSession = async (
                       if (line.trim()) logger.log(`🐚 ${line}`); // prints each JSON event as it arrives
                     }
                   }
-                }, 1000);
+                }, 3000);
 
                 return {
                   permissionDecision: "allow",
