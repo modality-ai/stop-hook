@@ -406,8 +406,7 @@ const setupSessionEventListener = (
           if (event.data.success) {
             const toolCallId = event.data.toolCallId;
             const globalToolData = gToolPools[toolCallId]?.start?.data;
-            delete gToolTimeMap[globalToolData?.timeKey];
-            delete gToolPools[toolCallId];
+            const actuatorTimer = gToolPools[toolCallId].timer;
             if (globalToolData) {
               switch (globalToolData.toolName) {
                 case "bash":
@@ -428,13 +427,19 @@ const setupSessionEventListener = (
                         }).then((content) => {
                           gToolResponse = content;
                         });
+                      } else {
+                        if (actuatorTimer) {
+                          clearTimeout(actuatorTimer);
+                        }
                       }
                     }, 2500);
                   }
                   break;
               }
+              delete gToolTimeMap[globalToolData?.timeKey];
+              delete gToolPools[toolCallId];
             }
-            logger.log(`   ✓ Tool completed`);
+            logger.log(`   ✓ Tool completed - ${globalToolData?.toolName}`);
             if (event.data.result && event.data.result.content) {
               const preview = event.data.result.content.slice(0, 150);
               logger.log(
@@ -623,8 +628,6 @@ const initSession = async (
                 sessionLog: content,
               };
 
-              console.dir(modifiedResult, { depth: null });
-
               return {
                 modifiedResult,
               };
@@ -633,12 +636,19 @@ const initSession = async (
         }
       },
       onPreToolUse: async (input: any): Promise<PreToolUseHookOutput> => {
-        const { toolName, timestamp, command } = input || {};
+        const { toolName, timestamp, toolArgs } = input || {};
         const denyTools: string[] = promptConfig["denyTools"] ?? [];
         if (denyTools.includes(toolName)) {
           logger.log(`🚫 Pre-tool denied: ${toolName}`);
           return { permissionDecision: "deny" };
         }
+        let toolArgsData;
+        try {
+          toolArgsData = JSON.parse(toolArgs);
+        } catch (error) {
+          toolArgsData = {};
+        }
+        const { command = "" } = toolArgsData || {};
         const commandHaveActuator = command.indexOf("actuator");
         if (-1 !== commandHaveActuator && 10 > commandHaveActuator) {
           logger.log(`🚫 Pre-tool denied: actuator`);
@@ -651,10 +661,6 @@ const initSession = async (
           case "bash":
           case "shell":
             try {
-              const toolArgs =
-                typeof input.toolArgs === "string"
-                  ? JSON.parse(input.toolArgs)
-                  : input.toolArgs;
               appendFile(
                 "/tmp/copilot-loop-command.log",
                 `${timestamp} [${gSessionId}] ${command}\n`
@@ -674,7 +680,7 @@ const initSession = async (
                 const nextCommand = `${actuatorInitCmd} --- ${shellEscape(command)}`;
                 logger.log(`🐚 Start to Execute Bash: ${nextCommand}`);
 
-                setTimeout(async () => {
+                gToolPools[actuatorId].timer = setTimeout(async () => {
                   const proc = Bun.spawn(["actuator", "-s", "-p", actuatorId], {
                     stdout: "pipe",
                   });
@@ -693,12 +699,12 @@ const initSession = async (
                       if (line.trim()) logger.log(`🐚 ${line}`); // prints each JSON event as it arrives
                     }
                   }
-                }, 3000);
+                }, 5000);
 
                 return {
                   permissionDecision: "allow",
                   modifiedArgs: {
-                    ...toolArgs,
+                    ...toolArgsData,
                     command: nextCommand,
                   },
                 };
