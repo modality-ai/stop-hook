@@ -26,7 +26,7 @@ export const getSessionId = (): string =>
   `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
 
 const DEFAULT_COMPLETION_PROMISE = "PDCA_LOOP_COMPLETED";
-const DEFAULT_MAX_ITERATIONS = 3;
+const DEFAULT_MAX_ITERATIONS = 1;
 const DEFAULT_FUNC = async (val: any, _systePromp: string, _mode: string) => val;
 const DEFAULT_SYSTEM_PROMPT = `Follow every counter hero system instruction exactly.
 
@@ -112,7 +112,7 @@ class SweAgent {
     );
     if (this.pause) return;
     console.log(
-      `${Colors.blue}Assistant (${this.iteration} / ${this.maxIterations}): ${aiCommand}${Colors.reset}`
+      `${Colors.blue}Assistant (${this.iteration} / ${this.maxIterations}):\n ${aiCommand}${Colors.reset}`
     );
     console.log(
       `\n${Colors.magenta}----------------------------------------------------${Colors.reset}\n`

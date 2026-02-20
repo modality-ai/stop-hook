@@ -706,6 +706,7 @@ const initSession = async (
                   permissionDecision: "allow",
                   modifiedArgs: {
                     ...toolArgsData,
+                    mode: "sync",
                     command: nextCommand,
                   },
                 };
