@@ -8,6 +8,9 @@ import { execSync } from "child_process";
 
 const LAST_SESSION_FILE = "/tmp/copilot-loop-last-session";
 const MODELS_CACHE_FILE = "/tmp/copilot-loop-models.json";
+const gToolPools = Object.create(null);
+const gToolTimeMap = Object.create(null);
+let gToolResponse = "";
 let sessionTimout: NodeJS.Timeout;
 let healthCheckHandle: NodeJS.Timeout;
 let currentSession: CopilotSession;
@@ -17,6 +20,9 @@ let loopId = gSessionId;
 
 /** Shell-escape a string using single quotes (POSIX-safe, handles all metacharacters) */
 const shellEscape = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
+
+/** Remove the last character from a string */
+const trimLastChar = (s: string | number): string => ("" + s).slice(0, -2);
 
 type PreToolUseHookOutput = {
   permissionDecision: "allow" | "deny" | "ask";
@@ -45,6 +51,41 @@ const logger = {
       ...args
     );
   },
+};
+
+const checkBashResult = (actuatorId: string) => {
+  const result = [];
+  const actuatorCmd = `actuator -p ${actuatorId}`;
+  const toolResultJson = execSync(actuatorCmd, {
+    encoding: "utf-8",
+  });
+  try {
+    const toolResultData = JSON.parse(toolResultJson);
+    if (toolResultData) {
+      if (toolResultData.status !== "running") {
+        if (toolResultData.stdout) {
+          result.push(toolResultData.stdout);
+        }
+        if (toolResultData.stderr) {
+          result.push(toolResultData.stderr);
+        }
+        result.push(`<exited with exit code ${toolResultData.exit_code}>`);
+        return result.join("\n");
+      }
+    }
+  } catch (e) {}
+};
+
+const insertGlobalToolData = (event: any) => {
+  const { data, timestamp } = event || {};
+  const { toolCallId, toolName } = data || {};
+  const timestampMs = trimLastChar(Math.floor(new Date(timestamp).getTime()));
+  const timeKey = `${timestampMs}-${toolName}`;
+  gToolTimeMap[timeKey] = toolCallId;
+  gToolPools[event.data.toolCallId] = {
+    start: event,
+    timeKey,
+  };
 };
 
 const loadCachedModelIds = (): string[] | null => {
@@ -335,6 +376,7 @@ const setupSessionEventListener = (
         // ─────────────────────────────────────────────────────────────
 
         case "tool.execution_start":
+          insertGlobalToolData(event);
           // Tool execution starting (file edits, reads, bash commands, etc.)
           logger.log(`🔧 Executing tool: ${event.data.toolName}`);
           if (event.data.arguments) {
@@ -355,6 +397,35 @@ const setupSessionEventListener = (
         case "tool.execution_complete":
           // Tool execution finished
           if (event.data.success) {
+            const toolCallId = event.data.toolCallId;
+            const globalToolData = gToolPools[toolCallId]?.start?.data;
+            delete gToolTimeMap[globalToolData?.timeKey];
+            delete gToolPools[toolCallId];
+            if (globalToolData) {
+              switch (globalToolData.toolName) {
+                case "bash":
+                case "shell":
+                  if (hasActuator) {
+                    setTimeout(() => {
+                      if (!checkBashResult(toolCallId)) {
+                        currentSession.abort();
+                        new Promise<string>((resolve, _reject) => {
+                          const checkInterval = setInterval(() => {
+                            const result = checkBashResult(toolCallId);
+                            if (result) {
+                              clearInterval(checkInterval);
+                              resolve(result);
+                            }
+                          }, 1000);
+                        }).then((content) => {
+                          gToolResponse = content;
+                        });
+                      }
+                    }, 2500);
+                  }
+                  break;
+              }
+            }
             logger.log(`   ✓ Tool completed`);
             if (event.data.result && event.data.result.content) {
               const preview = event.data.result.content.slice(0, 150);
@@ -525,60 +596,37 @@ const initSession = async (
               actuatorId = metaInfo?.job.id;
             } catch (error) {}
             if (hasActuator && actuatorId) {
-              try {
-                const checkResult = () => {
-                  let gLlm = [];
-                  const actuatorCmd = `actuator -p ${actuatorId}`;
-                  const toolResultJson = execSync(actuatorCmd, {
-                    encoding: "utf-8",
-                  });
-                  const toolResultData = JSON.parse(toolResultJson);
-                  if (toolResultData) {
-                    if (toolResultData.status !== "running") {
-                      if (toolResultData.stdout) {
-                        gLlm.push(toolResultData.stdout);
-                      }
-                      if (toolResultData.stderr) {
-                        gLlm.push(toolResultData.stderr);
-                      }
-                      gLlm.push(`<exited with exit code ${toolResultData.exit_code}>`);
-                      return gLlm.join("\n");
+              const content: string = await new Promise<string>(
+                (resolve, _reject) => {
+                  const checkInterval = setInterval(() => {
+                    const result = checkBashResult(actuatorId);
+                    if (result) {
+                      clearInterval(checkInterval);
+                      resolve(result);
                     }
-                  }
-                };
-                const content: string = await new Promise<string>(
-                  (resolve, _reject) => {
-                    const checkInterval = setInterval(() => {
-                      const result = checkResult();
-                      if (result) {
-                        clearInterval(checkInterval);
-                        resolve(result);
-                      }
-                    }, 1000);
-                  }
-                );
-                logger.log(`🐚 Actuator Tool Result for LLM:\n${content}\n`);
+                  }, 1000);
+                }
+              );
+              logger.log(`🐚 Actuator Tool Result for LLM:\n${content}\n`);
 
-                return {
-                  modifiedResult: {
-                    ...input?.toolResult,
-                    textResultForLlm: content,
-                  },
-                };
-              } catch (error) {
-                logger.error("Failed to parse tool result for LLM:", error);
-              }
+              return {
+                modifiedResult: {
+                  ...input?.toolResult,
+                  textResultForLlm: content,
+                },
+              };
             }
             break;
         }
       },
       onPreToolUse: async (input: any): Promise<PreToolUseHookOutput> => {
+        const { toolName, timestamp } = input || {};
         const denyTools: string[] = promptConfig["denyTools"] ?? [];
-        if (denyTools.includes(input.toolName)) {
-          logger.log(`🚫 Pre-tool denied: ${input.toolName}`);
+        if (denyTools.includes(toolName)) {
+          logger.log(`🚫 Pre-tool denied: ${toolName}`);
           return { permissionDecision: "deny" };
         }
-        switch (input.toolName) {
+        switch (toolName) {
           case "bash":
           case "shell":
             try {
@@ -589,7 +637,7 @@ const initSession = async (
               const originalCmd = toolArgs?.command || "";
               appendFile(
                 "/tmp/copilot-loop-command.log",
-                `${new Date().toISOString()} [${gSessionId}] [${input.timestamp}] ${originalCmd}\n`
+                `${timestamp} [${gSessionId}] ${originalCmd}\n`
               ).catch(() => {});
               if (hasActuator) {
                 const strippedCmd = originalCmd
@@ -599,14 +647,37 @@ const initSession = async (
                 if (-1 !== strippedCmd.indexOf(">")) {
                   writeMode = "-w";
                 }
-                const actuatorId = getSessionId();
+                const actuatorId =
+                  gToolTimeMap[`${trimLastChar(timestamp)}-${toolName}`];
                 const actuatorCmd = "actuator -a";
                 const actuatorInitCmd = `${actuatorCmd} -j ${actuatorId} ${writeMode}`;
                 const command =
                   originalCmd.indexOf(actuatorCmd) === 0
                     ? originalCmd
-                    : `${actuatorInitCmd} --- ${shellEscape(originalCmd)}; actuator -s -p ${actuatorId}`;
+                    : `${actuatorInitCmd} --- ${shellEscape(originalCmd)}`;
                 logger.log(`🐚 Bash Job: ${command}`);
+
+                setTimeout(async () => {
+                  const proc = Bun.spawn(["actuator", "-s", "-p", actuatorId], {
+                    stdout: "pipe",
+                  });
+                  const reader = proc.stdout.getReader();
+                  const decoder = new TextDecoder();
+                  let buffer = "";
+                  while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split("\n");
+                    buffer = lines.pop() ?? "";
+
+                    for (const line of lines) {
+                      if (line.trim()) logger.log(`🐚 ${line}`); // prints each JSON event as it arrives
+                    }
+                  }
+                }, 1000);
+
                 return {
                   permissionDecision: "allow",
                   modifiedArgs: {
@@ -706,6 +777,10 @@ const aiThinking = async (
       if (mainResponse !== "") {
         clearInterval(checkInterval);
         resolve(mainResponse);
+      }
+      if (gToolResponse !== "") {
+        say(gToolResponse);
+        gToolResponse = "";
       }
     }, 500);
   });

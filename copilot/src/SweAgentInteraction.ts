@@ -33,6 +33,7 @@ const DEFAULT_SYSTEM_PROMPT = `Follow every counter hero system instruction exac
 You are executing PDCA (Plan-Do-Check-Act) Round [CURRENT] of [MAX].
 
 LOOP_MD: '[LOOP_MD]'
+- File is ready to use editing and rewriting, You don't need create it.
 - READ '[LOOP_MD]' at the start of every round to load the current state
 - REWRITE '[LOOP_MD]' at the end of every round with a single improved version
 - Treat it as one living document — not a log. Each round refines and consolidates it, not appends to it

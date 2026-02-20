@@ -5,12 +5,13 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.5.2"
+readonly VERSION="1.6.0"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
 readonly STATUS_INTERVAL="${ACTUATOR_STATUS_INTERVAL:-2}"
 readonly OUTPUT_SIZE_THRESHOLD=23000
+readonly DEFAULT_JOB_ID_WIDTH="${ACTUATOR_JOB_ID_WIDTH:-30}"
 
 # Global execution sequence (set in main before any command execution)
 EXEC_SEQUENCE=0
@@ -97,7 +98,7 @@ json_output() {
 
   # Build JSON object as single line (JSONL format)
   local json_parts=()
-  json_parts+=("\"version\":${sequence}")
+  json_parts+=("\"actuatorJobVersion\":${sequence}")
   json_parts+=("\"status\":\"$(json_escape "$status")\"")
 
   [[ "$exit_code" -ne -1 ]] && json_parts+=("\"exit_code\":${exit_code}")
@@ -987,6 +988,7 @@ terminate_job() {
 }
 
 terminate_all_jobs() {
+  local plain="${1:-false}" id_width="${2:-$DEFAULT_JOB_ID_WIDTH}"
   init_jobs_dir
   local terminated_count=0
   local jobs_json=""
@@ -1005,16 +1007,24 @@ terminate_all_jobs() {
       kill -0 "$PID" 2>/dev/null && kill -KILL "$PID" 2>/dev/null || true
       update_job_status "$JOB_ID" "terminated" "143" || true
 
-      if [[ -n "$jobs_json" ]]; then
-        jobs_json="${jobs_json},"
+      if [[ "$plain" == "true" ]]; then
+        printf 'Terminated: %-*s PID=%-8s %s\n' "$id_width" "$JOB_ID" "$PID" "$COMMAND"
+      else
+        if [[ -n "$jobs_json" ]]; then
+          jobs_json="${jobs_json},"
+        fi
+        jobs_json="${jobs_json}{\"job_id\":\"$(json_escape "$JOB_ID")\",\"pid\":${PID},\"command\":\"$(json_escape "$COMMAND")\"}"
       fi
-      jobs_json="${jobs_json}{\"job_id\":\"$(json_escape "$JOB_ID")\",\"pid\":${PID},\"command\":\"$(json_escape "$COMMAND")\"}"
       ((terminated_count++)) || true
     fi
   done
 
-  printf '{"terminated_jobs":[%s],"count":%d,"timestamp":"%s"}\n' \
-    "$jobs_json" "$terminated_count" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ "$plain" == "true" ]]; then
+    printf 'Total: %d terminated | %s\n' "$terminated_count" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  else
+    printf '{"terminated_jobs":[%s],"count":%d,"timestamp":"%s"}\n' \
+      "$jobs_json" "$terminated_count" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  fi
 }
 
 # Fast job list: single awk pass over all job files (avoids N source + json_escape subprocesses)
@@ -1066,10 +1076,10 @@ list_jobs_json_fast() {
 }
 
 list_jobs_plain_fast() {
-  local timestamp="$1" total="$2"
-  shift 2
+  local timestamp="$1" total="$2" id_width="${3:-$DEFAULT_JOB_ID_WIDTH}"
+  shift 3
   # shellcheck disable=SC2016
-  awk -v ts="$timestamp" -v total="$total" -v sq="'" '
+  awk -v ts="$timestamp" -v total="$total" -v sq="'" -v id_w="$id_width" '
   function val(line,    i, v) {
     i = index(line, "=")
     if (i == 0) return ""
@@ -1085,14 +1095,14 @@ list_jobs_plain_fast() {
       if (system("kill -0 " pid " >/dev/null 2>&1") != 0) st = "completed"
     }
     cd = (length(cmd) > 48) ? substr(cmd, 1, 48) "..." : cmd
-    printf "%-25s %-8s %-12s %-55s %s\n", jid, pid, st, cd, stime
+    printf "%-*s %-8s %-12s %-55s %s\n", id_w, jid, pid, st, cd, stime
     n++
   }
-  function sep(    i) { for (i = 0; i < 130; i++) printf "-"; printf "\n" }
+  function sep(    i) { for (i = 0; i < id_w + 100; i++) printf "-"; printf "\n" }
   BEGIN {
     n = 0
     printf "------ Jobs List ------\n"
-    printf "%-25s %-8s %-12s %-55s %s\n", "JOB ID", "PID", "STATUS", "COMMAND", "START TIME"
+    printf "%-*s %-8s %-12s %-55s %s\n", id_w, "JOB ID", "PID", "STATUS", "COMMAND", "START TIME"
     sep()
   }
   FNR == 1 { flush(); jid=""; pid=""; cmd=""; st=""; stime="" }
@@ -1112,7 +1122,7 @@ list_jobs_plain_fast() {
 
 list_jobs() {
   init_jobs_dir
-  local plain="${1:-false}" limit="${2:-0}"
+  local plain="${1:-false}" limit="${2:-0}" id_width="${3:-$DEFAULT_JOB_ID_WIDTH}"
 
   # Collect job files
   local job_files=()
@@ -1134,8 +1144,8 @@ list_jobs() {
     return
   fi
 
-  # Sort newest first by modification time (handles both auto-generated and custom job IDs)
-  IFS=$'\n' job_files=($(ls -1t "${job_files[@]}"))
+  # Sort oldest first by modification time (newest last)
+  IFS=$'\n' job_files=($(ls -1tr "${job_files[@]}"))
   unset IFS
 
   # Apply limit
@@ -1147,7 +1157,7 @@ list_jobs() {
   timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
   if [[ "$plain" == "true" ]]; then
-    list_jobs_plain_fast "$timestamp" "$total" "${job_files[@]}"
+    list_jobs_plain_fast "$timestamp" "$total" "$id_width" "${job_files[@]}"
   else
     list_jobs_json_fast "$timestamp" "$total" "${job_files[@]}"
   fi
@@ -1223,6 +1233,7 @@ OPTIONS:
   --terminate-all         Terminate all running jobs
   -l, --list              List all tracked jobs (JSON output, use --plain for table format)
   -n, --limit <N>         Limit job list to N most recent entries (use with -l)
+  -L, --id-width <N>      Job ID column width in plain list output (default: 30)
   --cleanup               Remove completed job artifacts
   --stdin                 Read command from stdin (for shell metacharacters)
   --plain                 Output plain text instead of JSON
@@ -1417,8 +1428,8 @@ SHELL_INIT
 main() {
   local command="" mode="sync" timeout="$DEFAULT_TIMEOUT"
   local stream="false" plain="false" use_tty="false" quiet="false" write_mode="false"
-  local poll_id="" terminate_id="" terminate_signal="TERM" list_jobs_flag="false"
-  local custom_job_id="" list_limit=""
+  local poll_id="" terminate_id="" terminate_signal="TERM" list_jobs_flag="false" terminate_all_flag="false"
+  local custom_job_id="" list_limit="" job_id_width="$DEFAULT_JOB_ID_WIDTH"
 
   # Get execution sequence number (global for all functions)
   EXEC_SEQUENCE=$(get_next_sequence)
@@ -1480,8 +1491,10 @@ main() {
         list_jobs_flag="true"; shift ;;
       -n|--limit)
         list_limit="$2"; shift 2 ;;
+      -L|--id-width)
+        job_id_width="$2"; shift 2 ;;
       --terminate-all)
-        terminate_all_jobs; exit 0 ;;
+        terminate_all_flag="true"; shift ;;
       --cleanup)
         cleanup_jobs || true  # Ignore any errors from cleanup
         wait  # Wait for any remaining background jobs
@@ -1519,8 +1532,13 @@ main() {
   WRITE_MODE="$write_mode"
 
   # Handle deferred actions
+  if [[ "$terminate_all_flag" == "true" ]]; then
+    terminate_all_jobs "$plain" "$job_id_width"
+    exit 0
+  fi
+
   if [[ "$list_jobs_flag" == "true" ]]; then
-    list_jobs "$plain" "$list_limit"
+    list_jobs "$plain" "$list_limit" "$job_id_width"
     exit 0
   fi
 
