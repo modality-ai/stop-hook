@@ -654,7 +654,8 @@ const initSession = async (
           logger.log(`🚫 Pre-tool denied: actuator`);
           return {
             permissionDecision: "deny",
-            permissionDecisionReason: "Actuator is not permitted for AI agent use. Switch to the bash tool directly (without actuator) and explain why you were attempting to use actuator instead of bash.",
+            permissionDecisionReason:
+              "Actuator is not permitted for AI agent use. Switch to the bash tool directly (without actuator) and explain why you were attempting to use actuator instead of bash.",
           };
         }
         switch (toolName) {
@@ -784,11 +785,14 @@ const aiThinking = async (
     session
       .sendAndWait({ prompt }, sendTimeoutMs)
       .then(async (response) => {
-        await session.sendAndWait(
-          { prompt: `Update LOOP_MD for: ${mainResponse}` },
-          sendTimeoutMs
-        );
-        mainResponse = response?.data?.content ?? "";
+        const content = response?.data?.content ?? "";
+        if (content) {
+          await session.sendAndWait(
+            { prompt: `Update LOOP_MD for: ${content}` },
+            sendTimeoutMs
+          );
+          mainResponse = content;
+        }
       })
       .catch((error) => {
         mainResponse = error;
