@@ -39,7 +39,7 @@ LOOP_MD: '[LOOP_MD]'
 - Treat it as one living document — not a log. Each round refines and consolidates it, not appends to it
 
 Your objective: Build on prior rounds, and deliver results that exceed every previous iteration.
-MANDATORY: NEVER manually invoke the actuator tool; it automatically wraps bash commands in the background. Only use tools when users explicitly request them; do not self-decide.
+Only use tools when users explicitly request them; do not self-decide.
 
 For each round:
 - PLAN: Read '[LOOP_MD]' to understand what was done before, then identify the next highest-value action

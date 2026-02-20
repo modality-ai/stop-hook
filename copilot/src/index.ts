@@ -616,20 +616,25 @@ const initSession = async (
               );
               logger.log(`🐚 Actuator Tool Result for LLM:\n${content}\n`);
 
+              const modifiedResult = {
+                ...input?.toolResult,
+                textResultForLlm: content,
+                sessionLog: content,
+              };
+
+              console.dir(modifiedResult, { depth: null });
+
               return {
-                modifiedResult: {
-                  ...input?.toolResult,
-                  textResultForLlm: content,
-                },
+                modifiedResult,
               };
             }
             break;
         }
       },
       onPreToolUse: async (input: any): Promise<PreToolUseHookOutput> => {
-        const { toolName, timestamp } = input || {};
+        const { toolName, timestamp, command } = input || {};
         const denyTools: string[] = promptConfig["denyTools"] ?? [];
-        if (denyTools.includes(toolName)) {
+        if (denyTools.includes(toolName) || 10 > command.indexOf("actuator")) {
           logger.log(`🚫 Pre-tool denied: ${toolName}`);
           return { permissionDecision: "deny" };
         }
@@ -641,13 +646,12 @@ const initSession = async (
                 typeof input.toolArgs === "string"
                   ? JSON.parse(input.toolArgs)
                   : input.toolArgs;
-              const originalCmd = toolArgs?.command || "";
               appendFile(
                 "/tmp/copilot-loop-command.log",
-                `${timestamp} [${gSessionId}] ${originalCmd}\n`
+                `${timestamp} [${gSessionId}] ${command}\n`
               ).catch(() => {});
               if (hasActuator) {
-                const strippedCmd = originalCmd
+                const strippedCmd = command
                   .replace(/2>\/dev\/null/g, "")
                   .replace(/2>&1/g, "");
                 let writeMode = "";
@@ -658,8 +662,8 @@ const initSession = async (
                   gToolTimeMap[`${trimLastChar(timestamp)}-${toolName}`];
                 const actuatorCmd = "actuator -a";
                 const actuatorInitCmd = `${actuatorCmd} -j ${actuatorId} ${writeMode}`;
-                const command = `${actuatorInitCmd} --- ${shellEscape(originalCmd)}`;
-                logger.log(`🐚 Start to Execute Bash: ${command}`);
+                const nextCommand = `${actuatorInitCmd} --- ${shellEscape(command)}`;
+                logger.log(`🐚 Start to Execute Bash: ${nextCommand}`);
 
                 setTimeout(async () => {
                   const proc = Bun.spawn(["actuator", "-s", "-p", actuatorId], {
@@ -686,7 +690,7 @@ const initSession = async (
                   permissionDecision: "allow",
                   modifiedArgs: {
                     ...toolArgs,
-                    command,
+                    command: nextCommand,
                   },
                 };
               }
