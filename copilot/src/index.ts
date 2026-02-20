@@ -654,7 +654,7 @@ const initSession = async (
           logger.log(`🚫 Pre-tool denied: actuator`);
           return {
             permissionDecision: "deny",
-            permissionDecisionReason: "actuator not allowed in command",
+            permissionDecisionReason: "Actuator is not permitted for AI agent use. Switch to the bash tool directly (without actuator) and explain why you were attempting to use actuator instead of bash.",
           };
         }
         switch (toolName) {
