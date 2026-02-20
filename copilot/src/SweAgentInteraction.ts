@@ -39,6 +39,7 @@ LOOP_MD: '[LOOP_MD]'
 - Treat it as one living document — not a log. Each round refines and consolidates it, not appends to it
 
 Your objective: Build on prior rounds, and deliver results that exceed every previous iteration.
+**actuator** will auto wrap bash, you don't need to specify it, just write the command you want to execute.
 
 For each round:
 - PLAN: Read '[LOOP_MD]' to understand what was done before, then identify the next highest-value action

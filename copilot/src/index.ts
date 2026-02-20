@@ -61,6 +61,12 @@ const checkBashResult = (actuatorId: string) => {
   });
   try {
     const toolResultData = JSON.parse(toolResultJson);
+    if (toolResultData.error) {
+      logger.error(
+        `🐚 Actuator Tool Error:\n${toolResultData.error}\nCommand: ${actuatorCmd}`
+      );
+      return false;
+    }
     if (toolResultData) {
       if (toolResultData.status !== "running") {
         if (toolResultData.stdout) {
@@ -407,7 +413,8 @@ const setupSessionEventListener = (
                 case "shell":
                   if (hasActuator) {
                     setTimeout(() => {
-                      if (!checkBashResult(toolCallId)) {
+                      const testBash = checkBashResult(toolCallId);
+                      if (!testBash && false !== testBash) {
                         currentSession.abort();
                         new Promise<string>((resolve, _reject) => {
                           const checkInterval = setInterval(() => {
@@ -651,10 +658,7 @@ const initSession = async (
                   gToolTimeMap[`${trimLastChar(timestamp)}-${toolName}`];
                 const actuatorCmd = "actuator -a";
                 const actuatorInitCmd = `${actuatorCmd} -j ${actuatorId} ${writeMode}`;
-                const command =
-                  originalCmd.indexOf(actuatorCmd) === 0
-                    ? originalCmd
-                    : `${actuatorInitCmd} --- ${shellEscape(originalCmd)}`;
+                const command = `${actuatorInitCmd} --- ${shellEscape(originalCmd)}`;
                 logger.log(`🐚 Bash Job: ${command}`);
 
                 setTimeout(async () => {

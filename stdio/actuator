@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Universal CLI Execution Tool - ACTUATOR
-# Version: 1.0.0 (MVP - Phase 1)
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.6.0"
+readonly VERSION="1.6.1"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -304,7 +303,15 @@ update_job_status() {
 load_job_state() {
   local job_id="$1"
   local job_file="${JOBS_DIR}/${job_id}.job"
-  [[ -f "$job_file" ]] || { echo "Job not found: ${job_id}" >&2; return 1; }
+  if [[ ! -f "$job_file" ]]; then
+    if [[ "${PLAIN_MODE:-false}" == "true" ]]; then
+      printf '%s\n' "------ Error ------" >&2
+      printf 'Job not found: %s\n' "$job_id" >&2
+    else
+      printf '{"status":"error","error":"Job not found","job_id":"%s"}\n' "$job_id"
+    fi
+    return 1
+  fi
   # shellcheck disable=SC1090
   source "$job_file"
 }
@@ -799,15 +806,7 @@ poll_job() {
   local plain="${2:-false}"
   local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME CWD WRITE_MODE
 
-  load_job_state "$job_id" || {
-    if [[ "$plain" == "true" ]]; then
-      printf '%s\n' "------ Error ------" >&2
-      printf 'Job not found: %s\n' "$job_id" >&2
-    else
-      printf '{"status":"error","error":"Job not found","job_id":"%s"}\n' "$job_id"
-    fi
-    return 1
-  }
+  load_job_state "$job_id" || return 1
 
   # Check if process is still running
   if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2>/dev/null; then
@@ -844,15 +843,7 @@ poll_job_stream() {
   local heartbeat_every=$(( ${STATUS_INTERVAL%.*} * 5 ))
   [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
 
-  load_job_state "$job_id" || {
-    if [[ "$plain" == "true" ]]; then
-      printf '%s\n' "------ Error ------" >&2
-      printf 'Job not found: %s\n' "$job_id" >&2
-    else
-      printf '{"status":"error","error":"Job not found","job_id":"%s"}\n' "$job_id"
-    fi
-    return 1
-  }
+  load_job_state "$job_id" || return 1
 
   if [[ "$plain" == "true" ]]; then
     printf '%s\n' "------ Monitoring ------"
@@ -862,7 +853,6 @@ poll_job_stream() {
   fi
 
   local stdout_lines=0 stderr_lines=0
-  local initial_status="$STATUS"
 
   # Polling loop with heartbeat events
   while true; do
@@ -964,15 +954,7 @@ terminate_job() {
   local signal="${2:-TERM}"
   local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE
 
-  load_job_state "$job_id" || {
-    if [[ "$PLAIN_MODE" == "true" ]]; then
-      printf '%s\n' "------ Error ------" >&2
-      printf 'Job not found: %s\n' "$job_id" >&2
-    else
-      printf '{"status":"error","error":"Job not found","job_id":"%s"}\n' "$job_id"
-    fi
-    return 1
-  }
+  load_job_state "$job_id" || return 1
 
   if kill -0 "$PID" 2>/dev/null; then
     kill -"$signal" "$PID" 2>/dev/null
@@ -1422,6 +1404,18 @@ SHELL_INIT
 }
 
 # =============================================================================
+# Argument Validation
+# =============================================================================
+
+require_arg() {
+  local opt="$1" caller_argc="$2"
+  if [[ "$caller_argc" -lt 2 ]]; then
+    printf '{"status":"error","error":"Option %s requires an argument"}\n' "$opt" >&2
+    exit 1
+  fi
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -1457,19 +1451,19 @@ main() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -c|--command)
-        command="$2"; shift 2 ;;
+        require_arg "$1" "$#"; command="$2"; shift 2 ;;
       -a|--async)
         mode="async"; shift ;;
       -j|--job-id)
-        custom_job_id="$2"; shift 2 ;;
+        require_arg "$1" "$#"; custom_job_id="$2"; shift 2 ;;
       -s|--stream)
         stream="true"; shift ;;
       -t|--timeout)
-        timeout="$2"; shift 2 ;;
+        require_arg "$1" "$#"; timeout="$2"; shift 2 ;;
       -p|--poll)
-        poll_id="$2"; shift 2 ;;
+        require_arg "$1" "$#"; poll_id="$2"; shift 2 ;;
       -k|--terminate)
-        terminate_id="$2"
+        require_arg "$1" "$#"; terminate_id="$2"
         shift 2
         [[ $# -gt 0 && "$1" != -* ]] && { terminate_signal="$1"; shift; }
         ;;
@@ -1490,9 +1484,9 @@ main() {
       -l|--list)
         list_jobs_flag="true"; shift ;;
       -n|--limit)
-        list_limit="$2"; shift 2 ;;
+        require_arg "$1" "$#"; list_limit="$2"; shift 2 ;;
       -L|--id-width)
-        job_id_width="$2"; shift 2 ;;
+        require_arg "$1" "$#"; job_id_width="$2"; shift 2 ;;
       --terminate-all)
         terminate_all_flag="true"; shift ;;
       --cleanup)
