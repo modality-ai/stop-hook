@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.6.1"
+readonly VERSION="1.7.0"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -17,6 +17,7 @@ EXEC_SEQUENCE=0
 PLAIN_MODE="false"
 QUIET_MODE="false"
 WRITE_MODE="false"
+RAW_MODE="false"
 EXEC_CWD=""
 
 # =============================================================================
@@ -169,6 +170,18 @@ emit_result() {
   shift 2
   # Remaining: status exit_code command stdout_data stderr_data start_time end_time [job_id] [pid] [sequence] [cwd] (write_mode appended below)
   local stdout_data="$4"
+
+  # Pipe mode: ONLY command stdout, no metadata output anywhere
+  # Metadata is still saved to job file (accessible via actuator -p <id>)
+  # Propagates command exit code as actuator exit code
+  if [[ "$RAW_MODE" == "true" ]]; then
+    if [[ -n "$stdout_data" ]]; then
+      printf '%s\n' "$stdout_data"
+    fi
+    local cmd_exit_code="$2"
+    [[ "$cmd_exit_code" -ge 0 ]] 2>/dev/null && return "$cmd_exit_code"
+    return 0
+  fi
 
   # Write mode: pass command stdout through to actuator's stdout
   if [[ "$write_mode" == "true" && -n "$stdout_data" ]]; then
@@ -722,7 +735,8 @@ execute_async() {
   touch "$stdout_file" "$stderr_file"
 
   # Write mode: background + wait to capture real PID, still blocks until done
-  if [[ "$write_mode" == "true" ]]; then
+  # Raw mode skips this path — uses fire-and-forget below (raw suppresses output in emit_result)
+  if [[ "$write_mode" == "true" && "$RAW_MODE" != "true" ]]; then
     local exit_code=0
     bash -c "$command" >"$stdout_file" 2>"$stderr_file" &
     local cmd_pid=$!
@@ -1222,6 +1236,10 @@ OPTIONS:
   -w, --write             Write mode: pass command stdout to actuator stdout,
                           output JSON/plain result to stderr. Use for commands
                           with shell redirects (e.g., actuator -w --- echo 1 > file)
+  --raw                   Raw mode: like --write but suppresses ALL metadata output.
+                          Only command stdout goes to actuator stdout. No JSON/plain
+                          on stdout or stderr. Metadata saved to job file only
+                          (accessible via actuator -p <job_id>)
   -q, --quiet             Suppress command output from terminal and metadata
   --init                  Output shell function for eval (enables cd through actuator)
   -v, --version           Show version
@@ -1243,6 +1261,10 @@ EXAMPLES:
   # Write mode: command stdout passes through, JSON to stderr
   actuator -w --- echo hello > /tmp/out   # /tmp/out gets "hello", JSON on stderr
   actuator -w -c "ls -la > /tmp/listing"  # file write, JSON on stderr
+
+  # Raw mode: clean stdout only, no metadata (ideal for SDK/tool integration)
+  actuator --raw -j myid --- echo hello    # stdout: "hello", no JSON anywhere
+  actuator -p myid                         # access metadata via job file
 
   # Suppress command output, keep metadata only
   actuator -q "git diff --staged ./"
@@ -1340,7 +1362,7 @@ actuator() {
         ;;
       ---) _collecting=true ;;
       -t|--timeout|-j|--job-id|-p|--poll|-k|--terminate) _skip_next=true; _has_flags=true ;;
-      -a|--async|-s|--stream|-w|--write|-q|--quiet|--plain|-l|--list|--cleanup|--terminate-all|--stdin)
+      -a|--async|-s|--stream|-w|--write|--raw|-q|--quiet|--plain|-l|--list|--cleanup|--terminate-all|--stdin)
         _has_flags=true ;;
       -*) ;;
       *)
@@ -1421,7 +1443,7 @@ require_arg() {
 
 main() {
   local command="" mode="sync" timeout="$DEFAULT_TIMEOUT"
-  local stream="false" plain="false" use_tty="false" quiet="false" write_mode="false"
+  local stream="false" plain="false" use_tty="false" quiet="false" write_mode="false" raw_mode="false"
   local poll_id="" terminate_id="" terminate_signal="TERM" list_jobs_flag="false" terminate_all_flag="false"
   local custom_job_id="" list_limit="" job_id_width="$DEFAULT_JOB_ID_WIDTH"
 
@@ -1473,6 +1495,8 @@ main() {
         plain="true"; shift ;;
       -w|--write)
         write_mode="true"; shift ;;
+      --raw)
+        raw_mode="true"; write_mode="true"; shift ;;
       -q|--quiet)
         quiet="true"; shift ;;
       -v|--version)
@@ -1524,6 +1548,7 @@ main() {
   PLAIN_MODE="$plain"
   QUIET_MODE="$quiet"
   WRITE_MODE="$write_mode"
+  RAW_MODE="$raw_mode"
 
   # Handle deferred actions
   if [[ "$terminate_all_flag" == "true" ]]; then
