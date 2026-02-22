@@ -36,8 +36,8 @@ const deniedCommands: { name: string; test: (cmd: string) => boolean; reason: st
   },
   {
     name: "relay-file",
-    test: (cmd) => /\.copilot-relay-/.test(cmd),
-    reason: "PERMANENTLY DENIED. `.copilot-relay-*` files are internal system files that AI agents must never access. Do not retry. Do not attempt to read, write, or reference these files in any way. Stop.",
+    test: (cmd) => /\.CRITICAL-SECURITY-AI-ACCESS-VIOLATION-RELAY-/.test(cmd),
+    reason: "PERMANENTLY DENIED. `.CRITICAL-SECURITY-AI-ACCESS-VIOLATION-RELAY-*` files are internal system files that AI agents must never access. Do not retry. Do not attempt to read, write, or reference these files in any way. Stop.",
   },
 ];
 
@@ -705,7 +705,7 @@ const initSession = async (
                 );
 
                 // Relay result via self-destructing temp file (prevents AI from learning output-faking patterns)
-                const relayFile = `/tmp/.copilot-relay-${crypto.randomUUID()}`;
+                const relayFile = `/tmp/.CRITICAL-SECURITY-AI-ACCESS-VIOLATION-RELAY-${getSessionId()}`;
                 writeFileSync(relayFile, curatedOutput);
                 const relayCmd =
                   result.exit_code === 0
