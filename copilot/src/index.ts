@@ -1,6 +1,10 @@
 #!/usr/bin/env bun
 
-import { SweAgentInteraction, getSessionId } from "./SweAgentInteraction";
+import {
+  SweAgentInteraction,
+  getSessionId,
+  type AIOptions,
+} from "./SweAgentInteraction";
 import { CopilotClient, type CopilotSession } from "@github/copilot-sdk";
 import { appendFileSync, readFileSync, writeFileSync, existsSync } from "fs";
 import { appendFile } from "fs/promises";
@@ -10,7 +14,6 @@ const LAST_SESSION_FILE = "/tmp/copilot-loop-last-session";
 const MODELS_CACHE_FILE = "/tmp/copilot-loop-models.json";
 const gToolPools = Object.create(null);
 const gToolTimeMap = Object.create(null);
-let gToolResponse = "";
 let sessionTimout: NodeJS.Timeout;
 let healthCheckHandle: NodeJS.Timeout;
 let currentSession: CopilotSession;
@@ -164,8 +167,8 @@ const loadPromptFile = async (
   }
 };
 
-const getPersonaPrompt = (personaName: string) => {
-  const personaPropmpt = `Deploy ${personaName} persona to activate and maintain persistence throughout the entire workflow.`;
+const getPersonaPrompt = (personaName: string, currentIteration?: number) => {
+  const personaPropmpt = `Deploy ${personaName} persona to activate and maintain persistence throughout the entire workflow.${currentIteration && 1 > currentIteration ? " and Read LOOP_MD for context." : ""}`;
   return personaPropmpt;
 };
 
@@ -765,7 +768,6 @@ const aiThinking = async (
 ) => {
   let mainResponse = "";
 
-  await session.sendAndWait({ prompt: "Read LOOP_MD file." }, sendTimeoutMs);
   const say = (prompt: string) => {
     if (!session) {
       logger.error("Session not initialized");
@@ -776,10 +778,6 @@ const aiThinking = async (
       .then(async (response) => {
         const content = response?.data?.content ?? "";
         if (content) {
-          await session.sendAndWait(
-            { prompt: `Update LOOP_MD for: ${content}` },
-            sendTimeoutMs
-          );
           mainResponse = content;
         }
       })
@@ -789,20 +787,21 @@ const aiThinking = async (
   };
   say(prompt);
   return new Promise<string>((resolve, _reject) => {
-    const checkInterval = setInterval(() => {
+    const checkInterval = setInterval(async () => {
       if (mainResponse !== "") {
         clearInterval(checkInterval);
+        await session.sendAndWait(
+          { prompt: `Update LOOP_MD for: ${mainResponse}` },
+          sendTimeoutMs
+        );
         resolve(mainResponse);
-      }
-      if (gToolResponse !== "") {
-        say(gToolResponse);
-        gToolResponse = "";
       }
     }, 500);
   });
 };
 
-const aiCommand = async (prompt: any, systemPrompt: string, mode: string) => {
+const aiCommand = async (prompt: any, aiOption: AIOptions) => {
+  const { systemPrompt, mode, currentIteration }: AIOptions = aiOption;
   const abortController = new AbortController();
   const session = await initSession(
     systemPrompt,
@@ -836,16 +835,23 @@ const aiCommand = async (prompt: any, systemPrompt: string, mode: string) => {
       return "";
     }
 
-    // Race between sendAndWait and abort signal
     const sendTimeoutMs = promptConfig.timeout * 1000;
     if (null != promptConfig.persona) {
       await session.sendAndWait(
         {
-          prompt: getPersonaPrompt(promptConfig.persona),
+          prompt: getPersonaPrompt(promptConfig.persona, currentIteration),
         },
         sendTimeoutMs
       );
+    } else {
+      if (1 > currentIteration) {
+        await session.sendAndWait(
+          { prompt: "Read LOOP_MD file." },
+          sendTimeoutMs
+        );
+      }
     }
+    // Race between aiThinking and abort signal
     const response = await Promise.race([
       aiThinking({ prompt }, sendTimeoutMs, session),
       new Promise<never>((_, reject) => {

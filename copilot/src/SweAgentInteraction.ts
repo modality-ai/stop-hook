@@ -22,12 +22,18 @@ const CONFIG = {
   PROMISE_LINES: 10,
 } as const;
 
+export interface AIOptions {
+  systemPrompt: string;
+  mode: Mode;
+  currentIteration: number;
+}
+
 export const getSessionId = (): string =>
   `${((Date.now() << 10) | ((Math.random() * 1024) | 0)) >>> 0}`;
 
 const DEFAULT_COMPLETION_PROMISE = "PDCA_LOOP_COMPLETED";
 const DEFAULT_MAX_ITERATIONS = 1;
-const DEFAULT_FUNC = async (val: any, _systePromp: string, _mode: string) => val;
+const DEFAULT_FUNC = async (val: any, _options: AIOptions) => val;
 const DEFAULT_SYSTEM_PROMPT = `Follow every counter hero system instruction exactly.
 
 You are executing PDCA (Plan-Do-Check-Act) Round [CURRENT] of [MAX].
@@ -71,7 +77,10 @@ class SweAgent {
     this.loopId = loopId;
     this.loopMdPath = `/tmp/swe_agent_loop_${this.loopId}.md`;
     if (!existsSync(this.loopMdPath)) {
-      writeFileSync(this.loopMdPath, "<!-- Initial state: no prior rounds -->\n");
+      writeFileSync(
+        this.loopMdPath,
+        "<!-- Initial state: no prior rounds -->\n"
+      );
     }
     if (null != executeCommand) {
       this.executeCommand = executeCommand;
@@ -105,11 +114,11 @@ class SweAgent {
       `${Colors.magenta}You (${this.iteration} / ${this.maxIterations}): ${userPrompt}${Colors.reset}`
     );
     await new Promise((resolve) => setTimeout(resolve, 1000));
-    let aiCommand = await this.aiCommand(
-      userPrompt || "",
-      this.getSystemPrompt(),
-      this.mode
-    );
+    let aiCommand = await this.aiCommand(userPrompt || "", {
+      systemPrompt: this.getSystemPrompt(),
+      mode: this.mode,
+      currentIteration: this.iteration,
+    });
     if (this.pause) return;
     console.log(
       `${Colors.blue}Assistant (${this.iteration} / ${this.maxIterations}):\n ${aiCommand}${Colors.reset}`
