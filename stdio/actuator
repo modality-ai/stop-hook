@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.7.1"
+readonly VERSION="1.7.2"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -1093,7 +1093,7 @@ list_jobs_plain_fast() {
     cd = (length(cmd) > 48) ? substr(cmd, 1, 48) "..." : cmd
     ts_fmt = "-"
     if (stime != "" && stime+0 > 0) {
-      cmd = "date -r " stime " +\"%a %H:%M:%S\""
+      cmd = "date -r " stime " +\"%a %H:%M:%S\" 2>/dev/null || date -d @" stime " +\"%a %H:%M:%S\""
       cmd | getline ts_fmt
       close(cmd)
     }
