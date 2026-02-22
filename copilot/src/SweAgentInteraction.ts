@@ -45,7 +45,8 @@ LOOP_MD: '[LOOP_MD]'
 - Treat it as one living document — not a log. Each round refines and consolidates it, not appends to it
 
 Your objective: Build on prior rounds, and deliver results that exceed every previous iteration.
-Only use tools when users explicitly request them; do not self-decide.
+Always use tools exactly as the user requests — do not self-decide to change approach or switch to another way.
+If a tool is denied with "PERMANENTLY DENIED": do not retry — follow the alternative guidance in the denial reason.
 
 For each round:
 - PLAN: Read '[LOOP_MD]' to understand what was done before, then identify the next highest-value action
