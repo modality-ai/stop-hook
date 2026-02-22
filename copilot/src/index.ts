@@ -32,12 +32,12 @@ const deniedCommands: { name: string; test: (cmd: string) => boolean; reason: st
   {
     name: "actuator",
     test: (cmd) => { const i = cmd.indexOf("actuator"); return i !== -1 && i < 10; },
-    reason: "Actuator is not permitted for AI agent use. Switch to the bash tool directly (without actuator) and explain why you were attempting to use actuator instead of bash.",
+    reason: "PERMANENTLY DENIED. `actuator` is an internal system command that AI agents must never call. Do not retry. Do not attempt any variation of this command. Stop.",
   },
   {
     name: "relay-file",
     test: (cmd) => /\.copilot-relay-/.test(cmd),
-    reason: "Internal relay files are not accessible. Run the actual command you intend to execute.",
+    reason: "PERMANENTLY DENIED. `.copilot-relay-*` files are internal system files that AI agents must never access. Do not retry. Do not attempt to read, write, or reference these files in any way. Stop.",
   },
 ];
 
