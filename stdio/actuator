@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.7.0"
+readonly VERSION="1.7.1"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -1091,7 +1091,13 @@ list_jobs_plain_fast() {
       if (system("kill -0 " pid " >/dev/null 2>&1") != 0) st = "completed"
     }
     cd = (length(cmd) > 48) ? substr(cmd, 1, 48) "..." : cmd
-    printf "%-*s %-8s %-12s %-55s %s\n", id_w, jid, pid, st, cd, stime
+    ts_fmt = "-"
+    if (stime != "" && stime+0 > 0) {
+      cmd = "date -r " stime " +\"%a %H:%M:%S\""
+      cmd | getline ts_fmt
+      close(cmd)
+    }
+    printf "%-*s %-8s %-12s %-55s %s\n", id_w, jid, pid, st, cd, ts_fmt
     n++
   }
   function sep(    i) { for (i = 0; i < id_w + 100; i++) printf "-"; printf "\n" }

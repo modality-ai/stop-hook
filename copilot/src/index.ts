@@ -27,6 +27,23 @@ const shellEscape = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
 /** Remove the last character from a string */
 const trimLastChar = (s: string | number): string => ("" + s).slice(0, -2);
 
+/** Denied command patterns — blocks AI from using internal tool patterns or bypassing execution */
+const deniedCommands: { name: string; test: (cmd: string) => boolean; reason: string }[] = [
+  {
+    name: "actuator",
+    test: (cmd) => { const i = cmd.indexOf("actuator"); return i !== -1 && i < 10; },
+    reason: "Actuator is not permitted for AI agent use. Switch to the bash tool directly (without actuator) and explain why you were attempting to use actuator instead of bash.",
+  },
+  {
+    name: "relay-file",
+    test: (cmd) => /\.copilot-relay-/.test(cmd),
+    reason: "Internal relay files are not accessible. Run the actual command you intend to execute.",
+  },
+];
+
+const getDeniedCommand = (command: string) =>
+  deniedCommands.find((rule) => rule.test(command)) ?? null;
+
 type PreToolUseHookOutput = {
   permissionDecision: "allow" | "deny" | "ask";
   permissionDecisionReason?: string;
@@ -590,13 +607,12 @@ const initSession = async (
           toolArgsData = {};
         }
         const { command = "" } = toolArgsData || {};
-        const commandHaveActuator = command.indexOf("actuator");
-        if (-1 !== commandHaveActuator && 10 > commandHaveActuator) {
-          logger.log(`🚫 Pre-tool denied: actuator`);
+        const denied = getDeniedCommand(command);
+        if (denied) {
+          logger.log(`🚫 Pre-tool denied: ${denied.name}`);
           return {
             permissionDecision: "deny",
-            permissionDecisionReason:
-              "Actuator is not permitted for AI agent use. Switch to the bash tool directly (without actuator) and explain why you were attempting to use actuator instead of bash.",
+            permissionDecisionReason: denied.reason,
           };
         }
         switch (toolName) {
@@ -688,17 +704,19 @@ const initSession = async (
                   `🐚 Actuator Result (${curatedOutput.length} chars, exit=${result.exit_code}): ${curatedOutput.slice(0, 200)}`
                 );
 
-                // Return a command that echoes the curated result with correct exit code
-                const echoCmd =
+                // Relay result via self-destructing temp file (prevents AI from learning output-faking patterns)
+                const relayFile = `/tmp/.copilot-relay-${crypto.randomUUID()}`;
+                writeFileSync(relayFile, curatedOutput);
+                const relayCmd =
                   result.exit_code === 0
-                    ? `printf '%s' ${shellEscape(curatedOutput)}`
-                    : `printf '%s' ${shellEscape(curatedOutput)} >&2; exit ${result.exit_code}`;
+                    ? `cat ${relayFile}; rm -f ${relayFile}`
+                    : `cat ${relayFile} >&2; rm -f ${relayFile}; exit ${result.exit_code}`;
 
                 return {
                   permissionDecision: "allow",
                   modifiedArgs: {
                     ...toolArgsData,
-                    command: echoCmd,
+                    command: relayCmd,
                   },
                 };
               }
