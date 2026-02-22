@@ -185,7 +185,7 @@ const loadPromptFile = async (
 };
 
 const getPersonaPrompt = (personaName: string, currentIteration?: number) => {
-  const personaPropmpt = `Deploy ${personaName} persona to activate and maintain persistence throughout the entire workflow.${currentIteration && 1 > currentIteration ? " and Read LOOP_MD for context." : ""}`;
+  const personaPropmpt = `Deploy ${personaName} persona to activate and maintain persistence throughout the entire workflow.${currentIteration && 1 > currentIteration ? " and use the View tool to read the LOOP_MD file for context." : ""}`;
   return personaPropmpt;
 };
 
@@ -809,7 +809,7 @@ const aiThinking = async (
       if (mainResponse !== "") {
         clearInterval(checkInterval);
         await session.sendAndWait(
-          { prompt: `Update LOOP_MD for: ${mainResponse}` },
+          { prompt: `Use edit tool to update LOOP_MD for: ${mainResponse}` },
           sendTimeoutMs
         );
         resolve(mainResponse);
@@ -864,7 +864,7 @@ const aiCommand = async (prompt: any, aiOption: AIOptions) => {
     } else {
       if (1 > currentIteration) {
         await session.sendAndWait(
-          { prompt: "Read LOOP_MD file." },
+          { prompt: "Use the View tool to read the LOOP_MD file for context." },
           sendTimeoutMs
         );
       }
