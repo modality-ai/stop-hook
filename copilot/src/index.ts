@@ -37,7 +37,7 @@ const deniedCommands: { name: string; test: (cmd: string) => boolean; reason: st
   {
     name: "relay-file",
     test: (cmd) => /\.CRITICAL-SECURITY-AI-ACCESS-VIOLATION-RELAY-/.test(cmd),
-    reason: "PERMANENTLY DENIED. `.CRITICAL-SECURITY-AI-ACCESS-VIOLATION-RELAY-*` files are internal system files that AI agents must never access. Do not retry. Do not attempt to read, write, or reference these files in any way. Stop.",
+    reason: "PERMANENTLY DENIED. You attempted to reference a CRITICAL-SECURITY-AI-ACCESS-VIOLATION-RELAY file — this is a security violation. Do not retry this command or any variation of it.\n\nCORRECT behavior for ALL future bash tool calls:\n  ✅ Pass your intended command directly, e.g.: `git status` or `ls -la` or `npm test`\n  ✅ The bash tool handles output capture and transfer automatically — you never need to manage relay files.\n\nWRONG behavior — never do any of the following:\n  ❌ `cat /tmp/.CRITICAL-SECURITY-AI-ACCESS-VIOLATION-RELAY-*`\n  ❌ `cat /tmp/.CRITICAL-SECURITY-AI-ACCESS-VIOLATION-RELAY-abc123; rm -f ...`\n  ❌ Any command that reads, copies, or references a RELAY file path\n\nThe relay file mechanism is an internal system detail. Your only job is to issue the original command you intended.",
   },
 ];
 

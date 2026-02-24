@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.7.2"
+readonly VERSION="1.8.0"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -1124,13 +1124,22 @@ list_jobs_plain_fast() {
 
 list_jobs() {
   init_jobs_dir
-  local plain="${1:-false}" limit="${2:-0}" id_width="${3:-$DEFAULT_JOB_ID_WIDTH}"
+  local plain="${1:-false}" limit="${2:-0}" id_width="${3:-$DEFAULT_JOB_ID_WIDTH}" filter="${4:-}"
 
   # Collect job files
   local job_files=()
   for f in "${JOBS_DIR}"/*.job; do
     [[ -f "$f" ]] && job_files+=("$f")
   done
+
+  # Apply keyword filter on COMMAND field
+  if [[ -n "$filter" && ${#job_files[@]} -gt 0 ]]; then
+    local filtered=()
+    for f in "${job_files[@]}"; do
+      grep -qi "^COMMAND=.*${filter}" "$f" 2>/dev/null && filtered+=("$f")
+    done
+    job_files=("${filtered[@]}")
+  fi
 
   local total=${#job_files[@]}
 
@@ -1234,6 +1243,7 @@ OPTIONS:
   -k, --terminate <id>    Terminate async job
   --terminate-all         Terminate all running jobs
   -l, --list              List all tracked jobs (JSON output, use --plain for table format)
+  --filter <keyword>      Filter job list by command keyword (use with -l, case-insensitive)
   -n, --limit <N>         Limit job list to N most recent entries (use with -l)
   -L, --id-width <N>      Job ID column width in plain list output (default: 30)
   --cleanup               Remove completed job artifacts
@@ -1315,6 +1325,8 @@ EXAMPLES:
   actuator --list --plain            # Formatted table
   actuator -l -n 20                  # Show 20 most recent jobs
   actuator -l -n 50 --plain          # Show 50 most recent in table format
+  actuator -l --filter npm           # Show only jobs matching "npm"
+  actuator -l --filter npm --plain   # Same in table format
   actuator --terminate-all
   actuator --cleanup
 
@@ -1367,7 +1379,7 @@ actuator() {
         _first_word="${_cmd_str%% *}"
         ;;
       ---) _collecting=true ;;
-      -t|--timeout|-j|--job-id|-p|--poll|-k|--terminate) _skip_next=true; _has_flags=true ;;
+      -t|--timeout|-j|--job-id|-p|--poll|-k|--terminate|--filter) _skip_next=true; _has_flags=true ;;
       -a|--async|-s|--stream|-w|--write|--raw|-q|--quiet|--plain|-l|--list|--cleanup|--terminate-all|--stdin)
         _has_flags=true ;;
       -*) ;;
@@ -1451,7 +1463,7 @@ main() {
   local command="" mode="sync" timeout="$DEFAULT_TIMEOUT"
   local stream="false" plain="false" use_tty="false" quiet="false" write_mode="false" raw_mode="false"
   local poll_id="" terminate_id="" terminate_signal="TERM" list_jobs_flag="false" terminate_all_flag="false"
-  local custom_job_id="" list_limit="" job_id_width="$DEFAULT_JOB_ID_WIDTH"
+  local custom_job_id="" list_limit="" job_id_width="$DEFAULT_JOB_ID_WIDTH" list_filter=""
 
   # Get execution sequence number (global for all functions)
   EXEC_SEQUENCE=$(get_next_sequence)
@@ -1513,6 +1525,8 @@ main() {
         usage; exit 0 ;;
       -l|--list)
         list_jobs_flag="true"; shift ;;
+      --filter)
+        require_arg "$1" "$#"; list_filter="$2"; shift 2 ;;
       -n|--limit)
         require_arg "$1" "$#"; list_limit="$2"; shift 2 ;;
       -L|--id-width)
@@ -1563,7 +1577,7 @@ main() {
   fi
 
   if [[ "$list_jobs_flag" == "true" ]]; then
-    list_jobs "$plain" "$list_limit" "$job_id_width"
+    list_jobs "$plain" "$list_limit" "$job_id_width" "$list_filter"
     exit 0
   fi
 
