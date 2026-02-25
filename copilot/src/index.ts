@@ -20,6 +20,7 @@ let currentSession: CopilotSession;
 // Global session ID - Snowflake-like ID (distributed system friendly)
 let gSessionId = getSessionId();
 let loopId = gSessionId;
+let gAbortController: AbortController | null = null;
 
 /** Shell-escape a string using single quotes (POSIX-safe, handles all metacharacters) */
 const shellEscape = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
@@ -36,8 +37,8 @@ const deniedCommands: { name: string; test: (cmd: string) => boolean; reason: st
   },
   {
     name: "relay-file",
-    test: (cmd) => /\.CRITICAL-SECURITY-AI-ACCESS-VIOLATION-RELAY-/.test(cmd),
-    reason: "PERMANENTLY DENIED. You attempted to reference a CRITICAL-SECURITY-AI-ACCESS-VIOLATION-RELAY file — this is a security violation. Do not retry this command or any variation of it.\n\nCORRECT behavior for ALL future bash tool calls:\n  ✅ Pass your intended command directly, e.g.: `git status` or `ls -la` or `npm test`\n  ✅ The bash tool handles output capture and transfer automatically — you never need to manage relay files.\n\nWRONG behavior — never do any of the following:\n  ❌ `cat /tmp/.CRITICAL-SECURITY-AI-ACCESS-VIOLATION-RELAY-*`\n  ❌ `cat /tmp/.CRITICAL-SECURITY-AI-ACCESS-VIOLATION-RELAY-abc123; rm -f ...`\n  ❌ Any command that reads, copies, or references a RELAY file path\n\nThe relay file mechanism is an internal system detail. Your only job is to issue the original command you intended.",
+    test: (cmd) => /\.AI-SHOULD-DENY-USE-THIS-RELAY-/.test(cmd),
+    reason: "PERMANENTLY DENIED. You attempted to reference a AI-SHOULD-DENY-USE-THIS-RELAY file — this is a security violation. Do not retry this command or any variation of it.\n\nCORRECT behavior for ALL future bash tool calls:\n  ✅ Pass your intended command directly, e.g.: `git status` or `ls -la` or `npm test`\n  ✅ The bash tool handles output capture and transfer automatically — you never need to manage relay files.\n\nWRONG behavior — never do any of the following:\n  ❌ `cat /tmp/.AI-SHOULD-DENY-USE-THIS-RELAY-*`\n  ❌ `cat /tmp/.AI-SHOULD-DENY-USE-THIS-RELAY-abc123; rm -f ...`\n  ❌ Any command that reads, copies, or references a RELAY file path\n\nThe relay file mechanism is an internal system detail. Your only job is to issue the original command you intended.",
   },
 ];
 
@@ -55,6 +56,8 @@ const logger = {
   store: (logType: string, message: string) => {
     const filePath = `/tmp/copilot-loop-${loopId}-${logType}.txt`;
     appendFileSync(filePath, `${message}\n`);
+    clearTimeout(sessionTimout);
+    sessionTimout = setTimeout(() => gAbortController?.abort(), 10 * 60 * 1000); // 10 minutes
   },
 
   log: (message?: any, ...args: any[]) => {
@@ -263,8 +266,7 @@ const client = new CopilotClient({
 const hasActuator = whichCli("actuator") != null;
 
 const setupSessionEventListener = (
-  session: CopilotSession,
-  abortController: AbortController
+  session: CopilotSession
 ) => {
   // ============================================================================
   // Session Event Listener - Comprehensive Event Tracking
@@ -326,8 +328,6 @@ const setupSessionEventListener = (
 
   // Keep reference to unsubscribe function to prevent listener from being garbage collected
   return session.on((event: any) => {
-    clearTimeout(sessionTimout);
-    sessionTimout = setTimeout(() => abortController.abort(), 10 * 60 * 1000); // 10 minutes
     try {
       switch (event.type) {
         // ─────────────────────────────────────────────────────────────
@@ -550,7 +550,6 @@ const systemPromptModes = ["append", "replace"] as const;
 const initSession = async (
   systemPrompt: string,
   options: any = {},
-  abortController: AbortController,
   session?: CopilotSession
 ): Promise<CopilotSession> => {
   if (null == options.model) {
@@ -705,12 +704,13 @@ const initSession = async (
                 );
 
                 // Relay result via self-destructing temp file (prevents AI from learning output-faking patterns)
-                const relayFile = `/tmp/.CRITICAL-SECURITY-AI-ACCESS-VIOLATION-RELAY-${getSessionId()}`;
+                const relayFile = `/tmp/.AI-SHOULD-DENY-USE-THIS-RELAY-${getSessionId()}`;
                 writeFileSync(relayFile, curatedOutput);
+                const agentHint = `echo 'AI-AGENT: This is an internal relay command. Do not reference, copy, or retry this path. Always use your original intended command directly.' > /dev/null`;
                 const relayCmd =
                   result.exit_code === 0
-                    ? `cat ${relayFile}; rm -f ${relayFile}`
-                    : `cat ${relayFile} >&2; rm -f ${relayFile}; exit ${result.exit_code}`;
+                    ? `${agentHint}; cat ${relayFile}; rm -f ${relayFile}`
+                    : `${agentHint}; cat ${relayFile} >&2; rm -f ${relayFile}; exit ${result.exit_code}`;
 
                 return {
                   permissionDecision: "allow",
@@ -775,7 +775,7 @@ const initSession = async (
 
   // Attach event listener immediately after session is created
   // Store the unsubscribe function to keep the listener alive
-  setupSessionEventListener(session, abortController);
+  setupSessionEventListener(session);
   return session;
 };
 
@@ -821,10 +821,10 @@ const aiThinking = async (
 const aiCommand = async (prompt: any, aiOption: AIOptions) => {
   const { systemPrompt, mode, currentIteration }: AIOptions = aiOption;
   const abortController = new AbortController();
+  gAbortController = abortController;
   const session = await initSession(
     systemPrompt,
     promptConfig,
-    abortController
   );
   currentSession = session;
 
