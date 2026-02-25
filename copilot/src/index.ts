@@ -25,6 +25,43 @@ let gAbortController: AbortController | null = null;
 /** Shell-escape a string using single quotes (POSIX-safe, handles all metacharacters) */
 const shellEscape = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
 
+/** Print a colorful unified diff between oldStr and newStr for a given file path */
+const printColorDiff = (filePath: string, oldStr: string, newStr: string): void => {
+  const RESET = "\x1b[0m";
+  const RED = "\x1b[31m";
+  const GREEN = "\x1b[32m";
+  const CYAN = "\x1b[36m";
+  const DIM = "\x1b[2m";
+  const BOLD = "\x1b[1m";
+  const id = Date.now();
+  const tmpOld = `/tmp/.diff-old-${id}`;
+  const tmpNew = `/tmp/.diff-new-${id}`;
+  try {
+    writeFileSync(tmpOld, oldStr ?? "");
+    writeFileSync(tmpNew, newStr ?? "");
+    let rawDiff = "";
+    try {
+      execSync(`diff -u --label "a/${filePath}" --label "b/${filePath}" ${shellEscape(tmpOld)} ${shellEscape(tmpNew)}`, { encoding: "utf-8" });
+    } catch (e: any) {
+      rawDiff = e.stdout ?? "";
+    }
+    if (!rawDiff) return;
+    const colored = rawDiff
+      .split("\n")
+      .map((line) => {
+        if (line.startsWith("---") || line.startsWith("+++")) return `${BOLD}${CYAN}${line}${RESET}`;
+        if (line.startsWith("@@")) return `${CYAN}${line}${RESET}`;
+        if (line.startsWith("-")) return `${RED}${line}${RESET}`;
+        if (line.startsWith("+")) return `${GREEN}${line}${RESET}`;
+        return `${DIM}${line}${RESET}`;
+      })
+      .join("\n");
+    process.stdout.write(`\n${colored}\n`);
+  } finally {
+    try { execSync(`rm -f ${shellEscape(tmpOld)} ${shellEscape(tmpNew)}`); } catch {}
+  }
+};
+
 /** Remove the last character from a string */
 const trimLastChar = (s: string | number): string => ("" + s).slice(0, -2);
 
@@ -49,6 +86,7 @@ type PreToolUseHookOutput = {
   permissionDecision: "allow" | "deny" | "ask";
   permissionDecisionReason?: string;
   modifiedArgs?: Record<string, any>;
+  additionalContext?: string;
 };
 
 // Simple logger wrapper
@@ -441,6 +479,16 @@ const setupSessionEventListener = (
                 `   Result: ${preview}${event.data.result.content.length > 150 ? "..." : ""}`
               );
             }
+            if (globalToolData?.toolName === "edit") {
+              try {
+                const args = typeof globalToolData.arguments === "string"
+                  ? JSON.parse(globalToolData.arguments)
+                  : globalToolData.arguments;
+                if (args?.path) {
+                  printColorDiff(args.path, args.old_str ?? "", args.new_str ?? "");
+                }
+              } catch {}
+            }
           } else {
             logger.log(`   ✗ Tool failed: ${event.data.error?.message}`);
           }
@@ -481,6 +529,10 @@ const setupSessionEventListener = (
         case "assistant.message_delta":
           // Streaming response content (write without newline)
           process.stdout.write(event.data.deltaContent);
+          break;
+
+        case "assistant.streaming_delta":
+          // Streaming progress metrics only (totalResponseSizeBytes) - no content
           break;
 
         case "assistant.usage":
@@ -535,6 +587,61 @@ const setupSessionEventListener = (
           break;
         case "pending_messages.modified":
           break;
+
+        // ─────────────────────────────────────────────────────────────
+        // NEW SDK EVENT TYPES
+        // ─────────────────────────────────────────────────────────────
+
+        case "session.title_changed":
+          logger.log(`📝 Session title: ${event.data.title}`);
+          break;
+
+        case "session.warning":
+          logger.log(`⚠️  Session warning: ${event.data.message}`);
+          break;
+
+        case "session.mode_changed":
+          logger.log(`🔀 Mode changed: ${event.data.previousMode} → ${event.data.newMode}`);
+          break;
+
+        case "session.plan_changed":
+          logger.log(`📋 Plan ${event.data.operation}`);
+          break;
+
+        case "session.workspace_file_changed":
+          logger.log(`📁 Workspace file ${event.data.operation}: ${event.data.path}`);
+          break;
+
+        case "session.shutdown":
+          logger.log(`🛑 Session shutdown (${event.data.shutdownType})`);
+          break;
+
+        case "session.context_changed":
+          logger.log(`📂 Context changed: ${event.data.cwd}`);
+          break;
+
+        case "session.task_complete":
+          if (event.data.summary) logger.log(`✅ Task complete: ${event.data.summary}`);
+          break;
+
+        case "tool.user_requested":
+          logger.log(`👤 User requested tool: ${event.data.toolName}`);
+          break;
+
+        case "skill.invoked":
+          logger.log(`🎯 Skill invoked: ${event.data.name}`);
+          break;
+
+        case "system.message":
+          logger.store("log", `🔧 System message: ${event.data.content}`);
+          break;
+
+        case "session.resume":
+        case "session.handoff":
+        case "session.snapshot_rewind":
+        case "session.compaction_start":
+          break;
+
         default:
           process.stdout.write(`❓ Unhandled event type: ${event.type}\n`);
           break;
@@ -706,14 +813,14 @@ const initSession = async (
                 // Relay result via self-destructing temp file (prevents AI from learning output-faking patterns)
                 const relayFile = `/tmp/.AI-SHOULD-DENY-USE-THIS-RELAY-${getSessionId()}`;
                 writeFileSync(relayFile, curatedOutput);
-                const agentHint = `echo 'AI-AGENT: This is an internal relay command. Do not reference, copy, or retry this path. Always use your original intended command directly.' > /dev/null`;
                 const relayCmd =
                   result.exit_code === 0
-                    ? `${agentHint}; cat ${relayFile}; rm -f ${relayFile}`
-                    : `${agentHint}; cat ${relayFile} >&2; rm -f ${relayFile}; exit ${result.exit_code}`;
+                    ? `cat ${relayFile}; rm -f ${relayFile}`
+                    : `cat ${relayFile} >&2; rm -f ${relayFile}; exit ${result.exit_code}`;
 
                 return {
                   permissionDecision: "allow",
+                  additionalContext: "AI-AGENT: This is an internal relay command. Do not reference, copy, or retry this path. Always use your original intended command directly.",
                   modifiedArgs: {
                     ...toolArgsData,
                     command: relayCmd,
