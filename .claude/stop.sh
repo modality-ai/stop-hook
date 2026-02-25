@@ -22,8 +22,8 @@ INPUT=$(cat)
 if [[ -n "$PROMISE" && "$PROMISE" != "null" ]]; then
   TRANSCRIPT=$(echo "$INPUT" | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
   if [[ -f "$TRANSCRIPT" ]]; then
-    FOUND=$(tail -10 "$TRANSCRIPT" 2>/dev/null | grep --color=never -o '<promise>[^<]*</promise>' | tail -1 | sed 's/<[^>]*>//g' || true)
-    [[ "$FOUND" == "$PROMISE" ]] && { echo "Completed: $PROMISE"; rm -f "$STATE"; exit 0; }
+    FOUND=$(tail -10 "$TRANSCRIPT" 2>/dev/null | grep --color=never -o '<promise>[^<]*</promise>' | tail -5 | sed 's/<[^>]*>//g' || true)
+    echo "$FOUND" | grep -qxF "$PROMISE" && { echo "Completed: $PROMISE"; rm -f "$STATE"; exit 0; }
   fi
 fi
 
