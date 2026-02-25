@@ -26,7 +26,11 @@ let gAbortController: AbortController | null = null;
 const shellEscape = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
 
 /** Print a colorful unified diff between oldStr and newStr for a given file path */
-const printColorDiff = (filePath: string, oldStr: string, newStr: string): void => {
+const printColorDiff = (
+  filePath: string,
+  oldStr: string,
+  newStr: string
+): void => {
   const RESET = "\x1b[0m";
   const RED = "\x1b[31m";
   const GREEN = "\x1b[32m";
@@ -41,7 +45,10 @@ const printColorDiff = (filePath: string, oldStr: string, newStr: string): void 
     writeFileSync(tmpNew, newStr ?? "");
     let rawDiff = "";
     try {
-      execSync(`diff -u --label "a/${filePath}" --label "b/${filePath}" ${shellEscape(tmpOld)} ${shellEscape(tmpNew)}`, { encoding: "utf-8" });
+      execSync(
+        `diff -u --label "a/${filePath}" --label "b/${filePath}" ${shellEscape(tmpOld)} ${shellEscape(tmpNew)}`,
+        { encoding: "utf-8" }
+      );
     } catch (e: any) {
       rawDiff = e.stdout ?? "";
     }
@@ -49,7 +56,8 @@ const printColorDiff = (filePath: string, oldStr: string, newStr: string): void 
     const colored = rawDiff
       .split("\n")
       .map((line) => {
-        if (line.startsWith("---") || line.startsWith("+++")) return `${BOLD}${CYAN}${line}${RESET}`;
+        if (line.startsWith("---") || line.startsWith("+++"))
+          return `${BOLD}${CYAN}${line}${RESET}`;
         if (line.startsWith("@@")) return `${CYAN}${line}${RESET}`;
         if (line.startsWith("-")) return `${RED}${line}${RESET}`;
         if (line.startsWith("+")) return `${GREEN}${line}${RESET}`;
@@ -58,7 +66,9 @@ const printColorDiff = (filePath: string, oldStr: string, newStr: string): void 
       .join("\n");
     process.stdout.write(`\n${colored}\n`);
   } finally {
-    try { execSync(`rm -f ${shellEscape(tmpOld)} ${shellEscape(tmpNew)}`); } catch {}
+    try {
+      execSync(`rm -f ${shellEscape(tmpOld)} ${shellEscape(tmpNew)}`);
+    } catch {}
   }
 };
 
@@ -66,16 +76,25 @@ const printColorDiff = (filePath: string, oldStr: string, newStr: string): void 
 const trimLastChar = (s: string | number): string => ("" + s).slice(0, -2);
 
 /** Denied command patterns — blocks AI from using internal tool patterns or bypassing execution */
-const deniedCommands: { name: string; test: (cmd: string) => boolean; reason: string }[] = [
+const deniedCommands: {
+  name: string;
+  test: (cmd: string) => boolean;
+  reason: string;
+}[] = [
   {
     name: "actuator",
-    test: (cmd) => { const i = cmd.indexOf("actuator"); return i !== -1 && i < 10; },
-    reason: "PERMANENTLY DENIED. `actuator` is an internal system command that AI agents must never call. Do not retry. Do not attempt any variation of this command. Stop.",
+    test: (cmd) => {
+      const i = cmd.indexOf("actuator");
+      return i !== -1 && i < 10;
+    },
+    reason:
+      "PERMANENTLY DENIED. `actuator` is an internal system command that AI agents must never call. Do not retry. Do not attempt any variation of this command. Stop.",
   },
   {
     name: "relay-file",
     test: (cmd) => /\.AI-SHOULD-DENY-USE-THIS-RELAY-/.test(cmd),
-    reason: "PERMANENTLY DENIED. You attempted to reference a AI-SHOULD-DENY-USE-THIS-RELAY file — this is a security violation. Do not retry this command or any variation of it.\n\nCORRECT behavior for ALL future bash tool calls:\n  ✅ Pass your intended command directly, e.g.: `git status` or `ls -la` or `npm test`\n  ✅ The bash tool handles output capture and transfer automatically — you never need to manage relay files.\n\nWRONG behavior — never do any of the following:\n  ❌ `cat /tmp/.AI-SHOULD-DENY-USE-THIS-RELAY-*`\n  ❌ `cat /tmp/.AI-SHOULD-DENY-USE-THIS-RELAY-abc123; rm -f ...`\n  ❌ Any command that reads, copies, or references a RELAY file path\n\nThe relay file mechanism is an internal system detail. Your only job is to issue the original command you intended.",
+    reason:
+      "PERMANENTLY DENIED. You attempted to reference a AI-SHOULD-DENY-USE-THIS-RELAY file — this is a security violation. Do not retry this command or any variation of it.\n\nCORRECT behavior for ALL future bash tool calls:\n  ✅ Pass your intended command directly, e.g.: `git status` or `ls -la` or `npm test`\n  ✅ The bash tool handles output capture and transfer automatically — you never need to manage relay files.\n\nWRONG behavior — never do any of the following:\n  ❌ `cat /tmp/.AI-SHOULD-DENY-USE-THIS-RELAY-*`\n  ❌ `cat /tmp/.AI-SHOULD-DENY-USE-THIS-RELAY-abc123; rm -f ...`\n  ❌ Any command that reads, copies, or references a RELAY file path\n\nThe relay file mechanism is an internal system detail. Your only job is to issue the original command you intended.",
   },
 ];
 
@@ -303,9 +322,7 @@ const client = new CopilotClient({
 });
 const hasActuator = whichCli("actuator") != null;
 
-const setupSessionEventListener = (
-  session: CopilotSession
-) => {
+const setupSessionEventListener = (session: CopilotSession) => {
   // ============================================================================
   // Session Event Listener - Comprehensive Event Tracking
   // ============================================================================
@@ -447,6 +464,17 @@ const setupSessionEventListener = (
           if (event.data.arguments) {
             logger.log(`   Arguments: ${JSON.stringify(event.data.arguments)}`);
           }
+          if (event.data.toolName === "edit") {
+            try {
+              const args =
+                typeof event.data.arguments === "string"
+                  ? JSON.parse(event.data.arguments)
+                  : event.data.arguments;
+              if (args?.path) {
+                printColorDiff(args.path, args.old_str ?? "", args.new_str ?? "");
+              }
+            } catch {}
+          }
           break;
 
         case "tool.execution_progress":
@@ -478,16 +506,6 @@ const setupSessionEventListener = (
               logger.log(
                 `   Result: ${preview}${event.data.result.content.length > 150 ? "..." : ""}`
               );
-            }
-            if (globalToolData?.toolName === "edit") {
-              try {
-                const args = typeof globalToolData.arguments === "string"
-                  ? JSON.parse(globalToolData.arguments)
-                  : globalToolData.arguments;
-                if (args?.path) {
-                  printColorDiff(args.path, args.old_str ?? "", args.new_str ?? "");
-                }
-              } catch {}
             }
           } else {
             logger.log(`   ✗ Tool failed: ${event.data.error?.message}`);
@@ -601,7 +619,9 @@ const setupSessionEventListener = (
           break;
 
         case "session.mode_changed":
-          logger.log(`🔀 Mode changed: ${event.data.previousMode} → ${event.data.newMode}`);
+          logger.log(
+            `🔀 Mode changed: ${event.data.previousMode} → ${event.data.newMode}`
+          );
           break;
 
         case "session.plan_changed":
@@ -609,7 +629,9 @@ const setupSessionEventListener = (
           break;
 
         case "session.workspace_file_changed":
-          logger.log(`📁 Workspace file ${event.data.operation}: ${event.data.path}`);
+          logger.log(
+            `📁 Workspace file ${event.data.operation}: ${event.data.path}`
+          );
           break;
 
         case "session.shutdown":
@@ -621,7 +643,8 @@ const setupSessionEventListener = (
           break;
 
         case "session.task_complete":
-          if (event.data.summary) logger.log(`✅ Task complete: ${event.data.summary}`);
+          if (event.data.summary)
+            logger.log(`✅ Task complete: ${event.data.summary}`);
           break;
 
         case "tool.user_requested":
@@ -719,6 +742,7 @@ const initSession = async (
           return {
             permissionDecision: "deny",
             permissionDecisionReason: denied.reason,
+            additionalContext: denied.reason,
           };
         }
         switch (toolName) {
@@ -812,15 +836,16 @@ const initSession = async (
 
                 // Relay result via self-destructing temp file (prevents AI from learning output-faking patterns)
                 const relayFile = `/tmp/.AI-SHOULD-DENY-USE-THIS-RELAY-${getSessionId()}`;
+                const agentHint = "AI-AGENT: This is an internal relay command. Do not reference, copy, or retry this path. Always use your original intended command directly.";
                 writeFileSync(relayFile, curatedOutput);
                 const relayCmd =
                   result.exit_code === 0
-                    ? `cat ${relayFile}; rm -f ${relayFile}`
-                    : `cat ${relayFile} >&2; rm -f ${relayFile}; exit ${result.exit_code}`;
+                    ? `echo ${shellEscape(agentHint)} > /dev/null; cat ${relayFile}; rm -f ${relayFile}`
+                    : `echo ${shellEscape(agentHint)} > /dev/null; cat ${relayFile} >&2; rm -f ${relayFile}; exit ${result.exit_code}`;
 
                 return {
                   permissionDecision: "allow",
-                  additionalContext: "AI-AGENT: This is an internal relay command. Do not reference, copy, or retry this path. Always use your original intended command directly.",
+                  additionalContext: agentHint,
                   modifiedArgs: {
                     ...toolArgsData,
                     command: relayCmd,
@@ -929,10 +954,7 @@ const aiCommand = async (prompt: any, aiOption: AIOptions) => {
   const { systemPrompt, mode, currentIteration }: AIOptions = aiOption;
   const abortController = new AbortController();
   gAbortController = abortController;
-  const session = await initSession(
-    systemPrompt,
-    promptConfig,
-  );
+  const session = await initSession(systemPrompt, promptConfig);
   currentSession = session;
 
   // Periodic server health check via ping
