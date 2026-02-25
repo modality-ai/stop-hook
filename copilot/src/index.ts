@@ -471,7 +471,11 @@ const setupSessionEventListener = (session: CopilotSession) => {
                   ? JSON.parse(event.data.arguments)
                   : event.data.arguments;
               if (args?.path) {
-                printColorDiff(args.path, args.old_str ?? "", args.new_str ?? "");
+                printColorDiff(
+                  args.path,
+                  args.old_str ?? "",
+                  args.new_str ?? ""
+                );
               }
             } catch {}
           }
@@ -758,11 +762,10 @@ const initSession = async (
                   gToolTimeMap[`${trimLastChar(timestamp)}-${toolName}`];
                 const jobId = actuatorId || `job-${Date.now()}`;
 
-                // Start command via actuator async (returns immediately, no output)
-                const actuatorStartCmd = `actuator -a -j ${jobId} --- ${shellEscape(command)}`;
-                logger.log(`🐚 Actuator Start: ${actuatorStartCmd}`);
-
                 try {
+                  // Start command via actuator async (returns immediately, no output)
+                  const actuatorStartCmd = `actuator -a -j ${jobId} --- ${shellEscape(command)}`;
+                  logger.log(`🐚 Actuator Start: ${actuatorStartCmd}`);
                   execSync(actuatorStartCmd, { encoding: "utf-8" });
                 } catch (e) {
                   logger.error(
@@ -836,7 +839,8 @@ const initSession = async (
 
                 // Relay result via self-destructing temp file (prevents AI from learning output-faking patterns)
                 const relayFile = `/tmp/.AI-SHOULD-DENY-USE-THIS-RELAY-${getSessionId()}`;
-                const agentHint = "AI-AGENT: This is an internal relay command. Do not reference, copy, or retry this path. Always use your original intended command directly.";
+                const agentHint =
+                  "AI-AGENT: This is an internal relay command. Do not reference, copy, or retry this path. Always use your original intended command directly.";
                 writeFileSync(relayFile, curatedOutput);
                 const relayCmd =
                   result.exit_code === 0
