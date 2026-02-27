@@ -6,14 +6,18 @@ import {
   type AIOptions,
 } from "./SweAgentInteraction";
 import { CopilotClient, type CopilotSession } from "@github/copilot-sdk";
-import { appendFileSync, readFileSync, writeFileSync, existsSync } from "fs";
+import { appendFileSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { appendFile } from "fs/promises";
 import { execSync } from "child_process";
 
-const LAST_SESSION_FILE = "/tmp/copilot-loop-last-session";
-const MODELS_CACHE_FILE = "/tmp/copilot-loop-models.json";
+const COPILOT_LOOP_DIR = "/tmp/copilot-loop";
+mkdirSync(COPILOT_LOOP_DIR, { recursive: true });
+
+const LAST_SESSION_FILE = `${COPILOT_LOOP_DIR}/last-session`;
+const MODELS_CACHE_FILE = `${COPILOT_LOOP_DIR}/models.json`;
 const gToolPools = Object.create(null);
 const gToolTimeMap = Object.create(null);
+// Map keyed by jobId: pre-hook sets actuator results, post-hook looks up by jobId to avoid race conditions
 let sessionTimout: NodeJS.Timeout;
 let healthCheckHandle: NodeJS.Timeout;
 let currentSession: CopilotSession;
@@ -38,8 +42,8 @@ const printColorDiff = (
   const DIM = "\x1b[2m";
   const BOLD = "\x1b[1m";
   const id = Date.now();
-  const tmpOld = `/tmp/.diff-old-${id}`;
-  const tmpNew = `/tmp/.diff-new-${id}`;
+  const tmpOld = `${COPILOT_LOOP_DIR}/.diff-old-${id}`;
+  const tmpNew = `${COPILOT_LOOP_DIR}/.diff-new-${id}`;
   try {
     writeFileSync(tmpOld, oldStr ?? "");
     writeFileSync(tmpNew, newStr ?? "");
@@ -90,12 +94,6 @@ const deniedCommands: {
     reason:
       "PERMANENTLY DENIED. `actuator` is an internal system command that AI agents must never call. Do not retry. Do not attempt any variation of this command. Stop.",
   },
-  {
-    name: "relay-file",
-    test: (cmd) => /\.AI-SHOULD-DENY-USE-THIS-RELAY-/.test(cmd),
-    reason:
-      "PERMANENTLY DENIED. You attempted to reference a AI-SHOULD-DENY-USE-THIS-RELAY file — this is a security violation. Do not retry this command or any variation of it.\n\nCORRECT behavior for ALL future bash tool calls:\n  ✅ Pass your intended command directly, e.g.: `git status` or `ls -la` or `npm test`\n  ✅ The bash tool handles output capture and transfer automatically — you never need to manage relay files.\n\nWRONG behavior — never do any of the following:\n  ❌ `cat /tmp/.AI-SHOULD-DENY-USE-THIS-RELAY-*`\n  ❌ `cat /tmp/.AI-SHOULD-DENY-USE-THIS-RELAY-abc123; rm -f ...`\n  ❌ Any command that reads, copies, or references a RELAY file path\n\nThe relay file mechanism is an internal system detail. Your only job is to issue the original command you intended.",
-  },
 ];
 
 const getDeniedCommand = (command: string) =>
@@ -111,7 +109,7 @@ type PreToolUseHookOutput = {
 // Simple logger wrapper
 const logger = {
   store: (logType: string, message: string) => {
-    const filePath = `/tmp/copilot-loop-${loopId}-${logType}.txt`;
+    const filePath = `${COPILOT_LOOP_DIR}/${loopId}-${logType}.txt`;
     appendFileSync(filePath, `${message}\n`);
     clearTimeout(sessionTimout);
     sessionTimout = setTimeout(() => gAbortController?.abort(), 10 * 60 * 1000); // 10 minutes
@@ -464,7 +462,10 @@ const setupSessionEventListener = (session: CopilotSession) => {
           if (event.data.arguments) {
             logger.log(`   Arguments: ${JSON.stringify(event.data.arguments)}`);
           }
-          if (event.data.toolName === "edit") {
+          if (
+            event.data.toolName === "edit" ||
+            event.data.toolName === "create"
+          ) {
             try {
               const args =
                 typeof event.data.arguments === "string"
@@ -473,8 +474,10 @@ const setupSessionEventListener = (session: CopilotSession) => {
               if (args?.path) {
                 printColorDiff(
                   args.path,
-                  args.old_str ?? "",
-                  args.new_str ?? ""
+                  event.data.toolName === "edit" ? (args.old_str ?? "") : "",
+                  event.data.toolName === "edit"
+                    ? (args.new_str ?? "")
+                    : (args.content ?? "")
                 );
               }
             } catch {}
@@ -754,7 +757,7 @@ const initSession = async (
           case "shell":
             try {
               appendFile(
-                "/tmp/copilot-loop-command.log",
+                `${COPILOT_LOOP_DIR}/command.log`,
                 `${timestamp} [${gSessionId}] ${command}\n`
               ).catch(() => {});
               if (hasActuator) {
@@ -762,9 +765,12 @@ const initSession = async (
                   gToolTimeMap[`${trimLastChar(timestamp)}-${toolName}`];
                 const jobId = actuatorId || `job-${Date.now()}`;
 
+                const escCommand = command.startsWith(": ")
+                  ? command.slice(2, command.lastIndexOf("; cat "))
+                  : shellEscape(command);
                 try {
                   // Start command via actuator async (returns immediately, no output)
-                  const actuatorStartCmd = `actuator -a -j ${jobId} --- ${shellEscape(command)}`;
+                  const actuatorStartCmd = `actuator -a -j ${jobId} --- ${escCommand}`;
                   logger.log(`🐚 Actuator Start: ${actuatorStartCmd}`);
                   execSync(actuatorStartCmd, { encoding: "utf-8" });
                 } catch (e) {
@@ -797,62 +803,33 @@ const initSession = async (
                 }
 
                 // Poll until command completes
-                const result: {
-                  stdout: string;
-                  stderr: string;
-                  exit_code: number;
-                } = await new Promise((resolve) => {
+                const result: string = await new Promise((resolve) => {
                   const interval = setInterval(() => {
                     const pollResult = checkBashResult(jobId);
                     if (pollResult) {
                       clearInterval(interval);
-                      // checkBashResult returns formatted string, but we need structured data
                       try {
-                        const raw = execSync(`actuator -p ${jobId}`, {
-                          encoding: "utf-8",
-                        });
-                        const data = JSON.parse(raw);
-                        resolve({
-                          stdout: data.stdout || "",
-                          stderr: data.stderr || "",
-                          exit_code: data.exit_code ?? 0,
-                        });
-                      } catch {
-                        resolve({
-                          stdout: String(pollResult),
-                          stderr: "",
-                          exit_code: 0,
-                        });
+                        resolve(pollResult);
+                      } catch (error) {
+                        resolve(String(error));
                       }
                     }
                   }, 1000);
                 });
+                const relayFile = `${COPILOT_LOOP_DIR}/.relay-${getSessionId()}`;
+                writeFileSync(relayFile, result);
+                logger.log(`🐚 Actuator Result  ${result}`);
 
-                // Build curated output for LLM
-                const parts: string[] = [];
-                if (result.stdout) parts.push(result.stdout);
-                if (result.stderr) parts.push(result.stderr);
-                const curatedOutput = parts.join("\n");
-                logger.log(
-                  `🐚 Actuator Result (${curatedOutput.length} chars, exit=${result.exit_code}): ${curatedOutput.slice(0, 200)}`
-                );
-
-                // Relay result via self-destructing temp file (prevents AI from learning output-faking patterns)
-                const relayFile = `/tmp/.AI-SHOULD-DENY-USE-THIS-RELAY-${getSessionId()}`;
-                const agentHint =
-                  "AI-AGENT: This is an internal relay command. Do not reference, copy, or retry this path. Always use your original intended command directly.";
-                writeFileSync(relayFile, curatedOutput);
-                const relayCmd =
-                  result.exit_code === 0
-                    ? `echo ${shellEscape(agentHint)} > /dev/null; cat ${relayFile}; rm -f ${relayFile}`
-                    : `echo ${shellEscape(agentHint)} > /dev/null; cat ${relayFile} >&2; rm -f ${relayFile}; exit ${result.exit_code}`;
-
+                // Run no-op — post-hook replaces this dummy output with actual result
+                // Use a random nonce so AI cannot learn or replicate the pattern
                 return {
                   permissionDecision: "allow",
-                  additionalContext: agentHint,
                   modifiedArgs: {
                     ...toolArgsData,
-                    command: relayCmd,
+                    mode: "sync",
+                    detach: false,
+                    timeout: false,
+                    command: `: ${escCommand}; cat ${relayFile}; rm -f ${relayFile}`,
                   },
                 };
               }
