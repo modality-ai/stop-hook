@@ -6,7 +6,13 @@ import {
   type AIOptions,
 } from "./SweAgentInteraction";
 import { CopilotClient, type CopilotSession } from "@github/copilot-sdk";
-import { appendFileSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import {
+  appendFileSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+} from "fs";
 import { appendFile } from "fs/promises";
 import { execSync } from "child_process";
 
@@ -132,8 +138,15 @@ const logger = {
   },
 };
 
-const checkBashResult = (actuatorId: string) => {
-  const result = [];
+interface BashResult {
+  stdout?: string;
+  stderr?: string;
+  exit_code?: number;
+}
+
+const checkBashResult = (
+  actuatorId: string
+): BashResult | false | undefined => {
   const actuatorCmd = `actuator -p ${actuatorId}`;
   const toolResultJson = execSync(actuatorCmd, {
     encoding: "utf-8",
@@ -146,17 +159,8 @@ const checkBashResult = (actuatorId: string) => {
       );
       return false;
     }
-    if (toolResultData) {
-      if (toolResultData.status !== "running") {
-        if (toolResultData.stdout) {
-          result.push(toolResultData.stdout);
-        }
-        if (toolResultData.stderr) {
-          result.push(toolResultData.stderr);
-        }
-        result.push(`<exited with exit code ${toolResultData.exit_code}>`);
-        return result.join("\n");
-      }
+    if (toolResultData && toolResultData.status !== "running") {
+      return toolResultData;
     }
   } catch (e) {}
 };
@@ -803,7 +807,7 @@ const initSession = async (
                 }
 
                 // Poll until command completes
-                const result: string = await new Promise((resolve) => {
+                const result: BashResult = await new Promise((resolve) => {
                   const interval = setInterval(() => {
                     const pollResult = checkBashResult(jobId);
                     if (pollResult) {
@@ -811,17 +815,36 @@ const initSession = async (
                       try {
                         resolve(pollResult);
                       } catch (error) {
-                        resolve(String(error));
+                        resolve({ stderr: String(error) });
                       }
                     }
                   }, 1000);
                 });
                 const relayFile = `${COPILOT_LOOP_DIR}/.relay-${getSessionId()}`;
-                writeFileSync(relayFile, result);
-                logger.log(`🐚 Actuator Result  ${result}`);
+                const commandArr = [];
+                if (result.stdout) {
+                  const stdoutFile = `${relayFile}.stdout`;
+                  writeFileSync(stdoutFile, result.stdout);
+                  commandArr.push(`cat ${stdoutFile}; rm -f ${stdoutFile}`);
+                }
+                if (result.stderr) {
+                  const stderrFile = `${relayFile}.stderr`;
+                  writeFileSync(stderrFile, result.stderr);
+                  commandArr.push(
+                    result.stdout
+                      ? `dd >&2 2>/dev/null < ${stderrFile}; rm -f ${stderrFile}`
+                      : `cat ${stderrFile} >&2; rm -f ${stderrFile}`
+                  );
+                }
+                logger.log(
+                  `🐚 Actuator Result: ${JSON.stringify(result, null, 2)}`
+                );
 
                 // Run no-op — post-hook replaces this dummy output with actual result
                 // Use a random nonce so AI cannot learn or replicate the pattern
+                const modifiedCommand = `: ${escCommand}; ${commandArr.join(";")}; (exit ${result.exit_code ?? 1})`;
+                logger.log(`🐚 Modified Command: ${modifiedCommand}`);
+
                 return {
                   permissionDecision: "allow",
                   modifiedArgs: {
@@ -829,7 +852,7 @@ const initSession = async (
                     mode: "sync",
                     detach: false,
                     timeout: false,
-                    command: `: ${escCommand}; cat ${relayFile}; rm -f ${relayFile}`,
+                    command: modifiedCommand,
                   },
                 };
               }

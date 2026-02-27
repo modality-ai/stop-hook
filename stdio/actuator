@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.8.0"
+readonly VERSION="1.8.1"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -824,16 +824,18 @@ poll_job() {
 
   # Check if process is still running
   if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2>/dev/null; then
-    wait "$PID" 2>/dev/null
-    local actual_exit=$?
-    if [[ "$actual_exit" -eq 0 ]]; then
-      STATUS="completed"
-    else
+    # PID is from a different shell invocation; wait() is unreliable for non-child PIDs
+    # (returns 127 which with set -e would kill this script before emitting output).
+    # Instead, give the background job a moment to write its final status, then re-read.
+    sleep 0.1 2>/dev/null || true
+    load_job_state "$job_id" > /dev/null 2>&1 || true
+    if [[ "$STATUS" == "running" ]]; then
+      # Race: background job hasn't updated status yet; mark failed as fallback
       STATUS="failed"
+      EXIT_CODE="1"
+      END_TIME=$(date +%s)
+      update_job_status "$job_id" "$STATUS" "$EXIT_CODE"
     fi
-    update_job_status "$job_id" "$STATUS" "$actual_exit"
-    EXIT_CODE="$actual_exit"
-    END_TIME=$(date +%s)
   fi
 
   local stdout_data="" stderr_data=""
@@ -875,16 +877,18 @@ poll_job_stream() {
 
     # Check if process is still running
     if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2>/dev/null; then
-      wait "$PID" 2>/dev/null
-      local actual_exit=$?
-      if [[ "$actual_exit" -eq 0 ]]; then
-        STATUS="completed"
-      else
+      # PID is from a different shell invocation; wait() is unreliable for non-child PIDs
+      # (returns 127 which with set -e would kill this script before emitting output).
+      # Instead, give the background job a moment to write its final status, then re-read.
+      sleep 0.1 2>/dev/null || true
+      load_job_state "$job_id" > /dev/null 2>&1 || true
+      if [[ "$STATUS" == "running" ]]; then
+        # Race: background job hasn't updated status yet; mark failed as fallback
         STATUS="failed"
+        EXIT_CODE="1"
+        END_TIME=$(date +%s)
+        update_job_status "$job_id" "$STATUS" "$EXIT_CODE"
       fi
-      update_job_status "$job_id" "$STATUS" "$actual_exit"
-      EXIT_CODE="$actual_exit"
-      END_TIME=$(date +%s)
     fi
 
     local had_output=false
