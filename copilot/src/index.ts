@@ -82,8 +82,8 @@ const printColorDiff = (
   }
 };
 
-/** Remove the last character from a string */
-const trimLastChar = (s: string | number): string => ("" + s).slice(0, -2);
+/** Truncate last 2 digits from a millisecond timestamp for fuzzy time-key matching */
+const truncateMs = (s: string | number): string => ("" + s).slice(0, -2);
 
 /** Denied command patterns — blocks AI from using internal tool patterns or bypassing execution */
 const deniedCommands: {
@@ -146,7 +146,7 @@ interface BashResult {
 
 const checkBashResult = (
   actuatorId: string
-): BashResult | false | undefined => {
+): BashResult | undefined => {
   const actuatorCmd = `actuator -p ${actuatorId}`;
   const toolResultJson = execSync(actuatorCmd, {
     encoding: "utf-8",
@@ -157,7 +157,7 @@ const checkBashResult = (
       logger.error(
         `🐚 Actuator Tool Error:\n${toolResultData.error}\nCommand: ${actuatorCmd}`
       );
-      return false;
+      return;
     }
     if (toolResultData && toolResultData.status !== "running") {
       return toolResultData;
@@ -168,7 +168,7 @@ const checkBashResult = (
 const insertGlobalToolData = (event: any) => {
   const { data, timestamp } = event || {};
   const { toolCallId, toolName } = data || {};
-  const timestampMs = trimLastChar(Math.floor(new Date(timestamp).getTime()));
+  const timestampMs = truncateMs(Math.floor(new Date(timestamp).getTime()));
   const timeKey = `${timestampMs}-${toolName}`;
   gToolTimeMap[timeKey] = toolCallId;
   gToolPools[event.data.toolCallId] = {
@@ -231,10 +231,6 @@ const getPositionalArgs = (): string[] => {
 const loadPromptFile = async (
   filePath: string
 ): Promise<Record<string, any>> => {
-  if (typeof filePath !== "string") {
-    logger.error("Prompt file path must be a string.");
-    process.exit(1);
-  }
   try {
     const content = await Bun.file(filePath).text();
     const parsed = Bun.YAML.parse(content);
@@ -246,10 +242,8 @@ const loadPromptFile = async (
   }
 };
 
-const getPersonaPrompt = (personaName: string, currentIteration?: number) => {
-  const personaPropmpt = `Deploy ${personaName} persona to activate and maintain persistence throughout the entire workflow.${currentIteration && 1 < currentIteration ? " and use the View tool to read the LOOP_MD file for context." : ""}`;
-  return personaPropmpt;
-};
+const getPersonaPrompt = (personaName: string, currentIteration?: number) =>
+  `Deploy ${personaName} persona to activate and maintain persistence throughout the entire workflow.${currentIteration && 1 < currentIteration ? " and use the View tool to read the LOOP_MD file for context." : ""}`;
 
 const setupSignalHandlers = (
   client: CopilotClient,
@@ -314,7 +308,7 @@ const whichCli = (cli: string): string | null => {
   try {
     const output = execSync(`which ${cli}`, { encoding: "utf-8" });
     return output?.trim();
-  } catch (error) {
+  } catch {
     return null;
   }
 };
@@ -505,9 +499,7 @@ const setupSessionEventListener = (session: CopilotSession) => {
             const globalToolData = gToolPools[toolCallId]?.start?.data;
             const actuatorTimer = gToolPools[toolCallId]?.timer;
             if (globalToolData) {
-              if (actuatorTimer) {
-                clearTimeout(actuatorTimer);
-              }
+              clearTimeout(actuatorTimer);
               delete gToolTimeMap[globalToolData?.timeKey];
               delete gToolPools[toolCallId];
             }
@@ -608,7 +600,7 @@ const setupSessionEventListener = (session: CopilotSession) => {
 
         case "session.truncation":
         case "session.compaction_complete":
-          if (null != promptConfig.persona && session) {
+          if (null != promptConfig.persona) {
             session.send({
               prompt: getPersonaPrompt(promptConfig.persona),
             });
@@ -703,7 +695,7 @@ const initSession = async (
     mcpServers,
     systemPromptMode = systemPromptModes[0],
   } = options;
-  let finalSystemPromptMode = systemPromptModes.includes(systemPromptMode)
+  const finalSystemPromptMode = systemPromptModes.includes(systemPromptMode)
     ? systemPromptMode
     : systemPromptModes[0];
   logger.log(
@@ -711,7 +703,7 @@ const initSession = async (
   );
   logger.log(`   📌 systemPromptMode: ${systemPromptMode}`);
   logger.log(`   📌 Session ID: ${gSessionId} | Loop ID: ${loopId}`);
-  const sessionOptoins = {
+  const sessionOptions = {
     model,
     mcpServers,
     streaming: true,
@@ -766,15 +758,18 @@ const initSession = async (
               ).catch(() => {});
               if (hasActuator) {
                 const actuatorId =
-                  gToolTimeMap[`${trimLastChar(timestamp)}-${toolName}`];
+                  gToolTimeMap[`${truncateMs(timestamp)}-${toolName}`];
                 const jobId = actuatorId || `job-${Date.now()}`;
-
+                const strippedCmd = command
+                  .replace(/2>\/dev\/null/g, "")
+                  .replace(/2>&1/g, "");
+                const writeMode = -1 !== strippedCmd.indexOf(">") ? "-w" : "";
                 const escCommand = command.startsWith(": ")
                   ? command.slice(2, command.lastIndexOf("; cat "))
                   : shellEscape(command);
                 try {
                   // Start command via actuator async (returns immediately, no output)
-                  const actuatorStartCmd = `actuator -a -j ${jobId} --- ${escCommand}`;
+                  const actuatorStartCmd = `actuator -a -j ${jobId} ${writeMode} --- ${escCommand}`;
                   logger.log(`🐚 Actuator Start: ${actuatorStartCmd}`);
                   execSync(actuatorStartCmd, { encoding: "utf-8" });
                 } catch (e) {
@@ -812,11 +807,7 @@ const initSession = async (
                     const pollResult = checkBashResult(jobId);
                     if (pollResult) {
                       clearInterval(interval);
-                      try {
-                        resolve(pollResult);
-                      } catch (error) {
-                        resolve({ stderr: String(error) });
-                      }
+                      resolve(pollResult);
                     }
                   }, 1000);
                 });
@@ -872,15 +863,15 @@ const initSession = async (
   try {
     if (null == session) {
       session = await client.createSession({
-        ...sessionOptoins,
+        ...sessionOptions,
         sessionId: gSessionId,
       });
     } else {
-      session = await client.resumeSession(gSessionId, sessionOptoins);
+      session = await client.resumeSession(gSessionId, sessionOptions);
     }
   } catch (error) {
     session = await client.createSession({
-      ...sessionOptoins,
+      ...sessionOptions,
       sessionId: gSessionId,
     });
   }
@@ -929,20 +920,17 @@ const aiThinking = async (
     }
     session
       .sendAndWait({ prompt }, sendTimeoutMs)
-      .then(async (response) => {
-        const content = response?.data?.content ?? "";
-        if (content) {
-          mainResponse = content;
-        }
+      .then((response) => {
+        mainResponse = response?.data?.content ?? "";
       })
       .catch((error) => {
-        mainResponse = error;
+        mainResponse = String(error);
       });
   };
   say(prompt);
-  return new Promise<string>((resolve, _reject) => {
+  return new Promise<string>((resolve) => {
     const checkInterval = setInterval(async () => {
-      if (mainResponse !== "") {
+      if (mainResponse) {
         clearInterval(checkInterval);
         await session.sendAndWait(
           { prompt: `Use edit tool to update LOOP_MD for: ${mainResponse}` },
@@ -981,11 +969,6 @@ const aiCommand = async (prompt: any, aiOption: AIOptions) => {
   }, healthCheckIntervalMs);
 
   try {
-    if (!session) {
-      logger.error("Session not initialized");
-      return "";
-    }
-
     const sendTimeoutMs = promptConfig.timeout * 1000;
     if (null != promptConfig.persona) {
       await session.sendAndWait(
