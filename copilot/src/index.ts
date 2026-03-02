@@ -144,9 +144,7 @@ interface BashResult {
   exit_code?: number;
 }
 
-const checkBashResult = (
-  actuatorId: string
-): BashResult | undefined => {
+const checkBashResult = (actuatorId: string): BashResult | undefined => {
   const actuatorCmd = `actuator -p ${actuatorId}`;
   const toolResultJson = execSync(actuatorCmd, {
     encoding: "utf-8",
@@ -1079,7 +1077,7 @@ let configFile: any;
 const promptConfig: any = {};
 const main = async () => {
   const directPrompt: any = parseCliArgs("-p");
-  const appendPrompt: any = parseCliArgs("-a");
+  let appendPrompt: any = parseCliArgs("-a");
   const sessionOverride = parseCliArgs("-r") || parseCliArgs("--resume");
   const maxIterationsOverride: any = parseCliArgs("--max");
   const promiseOverride = parseCliArgs("--promise");
@@ -1104,15 +1102,29 @@ const main = async () => {
   configFile = isYamlFile
     ? firstArg
     : yamlFromPreArgs || parseCliArgs("--config");
+
+  const positionalText = positionalArgs.join(" ");
+
+  // Append mode: -a flag + --- boundary → treat positional args as append content
+  if (
+    process.argv.includes("-a") &&
+    ddIndex !== -1 &&
+    !appendPrompt &&
+    positionalArgs.length > 0
+  ) {
+    appendPrompt = positionalText;
+  }
+
   const commandPrompt =
-    !isYamlFile && !directPrompt && positionalArgs.length > 0
-      ? positionalArgs.join(" ")
+    !isYamlFile && !directPrompt && !appendPrompt && positionalArgs.length > 0
+      ? positionalText
       : null;
 
   if (
     !configFile &&
     !directPrompt &&
     !commandPrompt &&
+    !appendPrompt &&
     !sessionOverride &&
     !parseCliArgs("--debug") &&
     !parseCliArgs("--update-models")
