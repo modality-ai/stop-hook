@@ -99,6 +99,8 @@ ITERATION=1
 MAX_ITERATIONS=$(extract_json_value "$HOOK_INPUT" "max_iterations" "number" "")
 [[ -z "$MAX_ITERATIONS" ]] && MAX_ITERATIONS=$(extract_json_value "$HOOK_INPUT" "iterations" "number" "50")
 COMPLETION_PROMISE=$(extract_json_value "$HOOK_INPUT" "completion_promise" "string" "attempt_completion" "1000")
+# Strip <promise>...</promise> wrapper if present — store only the inner text
+COMPLETION_PROMISE=$(echo "$COMPLETION_PROMISE" | sed 's/<promise>//g; s/<\/promise>//g')
 PROMPT=$(extract_json_value "$HOOK_INPUT" "prompt" "string" "" "10000")
 
 # Only proceed if this is an agent-loop call
