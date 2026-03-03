@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="1.8.2"
+readonly VERSION="2.0.0"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -403,6 +403,23 @@ start_timeout_monitor() {
 }
 
 # =============================================================================
+# Line Buffering Helper: Force unbuffered output for streaming
+# =============================================================================
+
+make_unbuffered() {
+  local cmd="$1"
+  # Try stdbuf first (Linux/GNU tools), fall back to script (macOS/POSIX)
+  # This forces line buffering so child process output streams in real-time
+  # instead of accumulating in full-buffered pipes
+  if command -v stdbuf &>/dev/null; then
+    printf 'stdbuf -oL -eL bash -c %s' "$(printf '%q' "$cmd")"
+  else
+    # script -q /dev/null forces a pseudo-TTY, enabling line buffering
+    printf 'script -q /dev/null bash -c %s' "$(printf '%q' "$cmd")"
+  fi
+}
+
+# =============================================================================
 # Core Execution: Synchronous
 # =============================================================================
 
@@ -434,7 +451,8 @@ execute_sync() {
     if [[ "$stream_output" == "true" ]]; then
       # Streaming + TTY: Use polling loop to emit heartbeat events while maintaining TTY output
       # Background command but keep output flowing to terminal and files
-      bash -c "$command" < /dev/stdin > "$stdout_file" 2> "$stderr_file" &
+      # Use unbuffered mode to ensure line-by-line streaming (not accumulated dumps)
+      eval "$(make_unbuffered "$command")" < /dev/stdin > "$stdout_file" 2> "$stderr_file" &
       local cmd_pid=$!
 
       # Set global state for signal handler
@@ -593,7 +611,8 @@ execute_sync() {
   # Non-TTY mode: background with output capture
   # This path is used when stdin is piped (not a terminal).
   # NOTE: < /dev/stdin preserves piped input to child process
-  bash -c "$command" < /dev/stdin > "$stdout_file" 2> "$stderr_file" &
+  # Use unbuffered mode to ensure line-by-line streaming (not accumulated dumps)
+  eval "$(make_unbuffered "$command")" < /dev/stdin > "$stdout_file" 2> "$stderr_file" &
   local cmd_pid=$!
 
   # Set global state for signal handler

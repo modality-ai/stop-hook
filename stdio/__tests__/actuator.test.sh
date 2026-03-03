@@ -101,8 +101,40 @@ else
   pass "ANSI strip → no raw ESC bytes in JSON"
 fi
 
+# ---------------------------------------------------------------------------
+echo
+echo "-- streaming output tests (-s flag) --"
+
+# Simple streaming: verify real-time events (not accumulated)
+stream_out=$(ACTUATOR_JOBS_DIR=/tmp/actuator-test-$$ "$ACTUATOR" -s 'echo "line1"; echo "line2"; echo "line3"' 2>&1)
+event_count=$(echo "$stream_out" | grep -c '"event":"stdout"' || echo 0)
+if [[ "$event_count" -ge 3 ]]; then
+  pass "streaming (-s) → multiple stdout events (real-time)"
+else
+  fail "streaming (-s) → expected 3+ events, got $event_count"
+fi
+check "streaming (-s) → status completed" '"status":"completed"' "$stream_out"
+
+# ---------------------------------------------------------------------------
+echo
+echo "-- polling + streaming tests (-p -s flags) --"
+
+# Async job + poll with streaming
+JOBS_DIR=/tmp/actuator-test-poll-stream-$$
+poll_stream_out=$(ACTUATOR_JOBS_DIR="$JOBS_DIR" "$ACTUATOR" -a -q 'echo "async_line1"; echo "async_line2"' 2>&1)
+poll_job_id=$(echo "$poll_stream_out" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+if [[ -n "$poll_job_id" ]]; then
+  pass "poll+stream (-p -s) → async job created"
+  sleep 0.5
+  poll_stream_result=$(ACTUATOR_JOBS_DIR="$JOBS_DIR" "$ACTUATOR" -p "$poll_job_id" -s 2>&1)
+  check "poll+stream (-p -s) → status completed" '"status":"completed"' "$poll_stream_result"
+  check "poll+stream (-p -s) → output captured" 'async_line' "$poll_stream_result"
+else
+  fail "poll+stream (-p -s) → could not create async job"
+fi
+
 # Cleanup test dirs
-rm -rf /tmp/actuator-test-$$ /tmp/actuator-test-async-$$ 2>/dev/null || true
+rm -rf /tmp/actuator-test-$$ /tmp/actuator-test-async-$$ /tmp/actuator-test-poll-stream-$$ 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 echo
