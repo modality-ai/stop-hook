@@ -830,13 +830,14 @@ const initSession = async (
                       : `cat ${stderrFile} >&2; rm -f ${stderrFile}`
                   );
                 }
+                commandArr.push(`(exit ${result.exit_code ?? 1})`);
                 logger.log(
                   `🐚 Actuator Result: ${JSON.stringify(result, null, 2)}`
                 );
 
                 // Run no-op — post-hook replaces this dummy output with actual result
                 // Use a random nonce so AI cannot learn or replicate the pattern
-                const modifiedCommand = `: ${escCommand}; ${commandArr.join(";")}; (exit ${result.exit_code ?? 1})`;
+                const modifiedCommand = `: ${escCommand}; ${commandArr.join("; ")}`;
                 logger.log(`🐚 Modified Command: ${modifiedCommand}`);
 
                 return {
