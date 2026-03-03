@@ -10,6 +10,7 @@ check() {
 }
 
 D=/tmp/actuator-test-$$
+export ACTUATOR_POLL_INTERVAL=0.1
 echo "=== actuator tests ==="
 
 # -- sync --

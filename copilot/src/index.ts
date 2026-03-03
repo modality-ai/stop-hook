@@ -82,8 +82,8 @@ const printColorDiff = (
   }
 };
 
-/** Truncate last 2 digits from a millisecond timestamp for fuzzy time-key matching */
-const truncateMs = (s: string | number): string => ("" + s).slice(0, -2);
+/** Truncate last 3 digits from a millisecond timestamp for fuzzy time-key matching */
+const truncateMs = (s: string | number): string => ("" + s).slice(0, -3);
 
 /** Denied command patterns — blocks AI from using internal tool patterns or bypassing execution */
 const deniedCommands: {
@@ -803,8 +803,9 @@ const initSession = async (
 
                 // Start streaming monitor for logging (non-blocking)
                 let streamProc: ReturnType<typeof Bun.spawn> | null = null;
-                if (actuatorId && gToolPools[actuatorId]) {
-                  gToolPools[actuatorId].timer = setTimeout(async () => {
+                let actuatorTimer: NodeJS.Timeout | null = null;
+                if (actuatorId) {
+                  actuatorTimer = setTimeout(async () => {
                     const proc = Bun.spawn(["actuator", "-s", "-p", jobId], {
                       stdout: "pipe",
                     });
@@ -823,6 +824,9 @@ const initSession = async (
                       }
                     }
                   }, 5000);
+                  if (gToolPools[actuatorId]) {
+                    gToolPools[actuatorId].timer = actuatorTimer;
+                  }
                 }
 
                 // Poll until command completes
@@ -838,8 +842,8 @@ const initSession = async (
                 });
 
                 // Clean up streaming monitor — kill process to prevent zombie
-                if (actuatorId && gToolPools[actuatorId]?.timer) {
-                  clearTimeout(gToolPools[actuatorId].timer);
+                if (actuatorTimer) {
+                  clearTimeout(actuatorTimer);
                 }
                 if (streamProc) {
                   try { (streamProc as any).kill(); } catch {}

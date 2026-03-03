@@ -3,6 +3,7 @@
 set -uo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
+export ACTUATOR_POLL_INTERVAL=0.1
 TOTAL_PASS=0
 TOTAL_FAIL=0
 FAILED_SUITES=()

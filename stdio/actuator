@@ -4,11 +4,12 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.1.0"
+readonly VERSION="2.1.1"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
 readonly STATUS_INTERVAL="${ACTUATOR_STATUS_INTERVAL:-2}"
+readonly POLL_INTERVAL="${ACTUATOR_POLL_INTERVAL:-5}"
 readonly OUTPUT_SIZE_THRESHOLD=23000
 readonly DEFAULT_JOB_ID_WIDTH="${ACTUATOR_JOB_ID_WIDTH:-30}"
 
@@ -607,7 +608,7 @@ execute_sync() {
           fi
         fi
 
-        sleep 0.2 &
+        sleep "$POLL_INTERVAL" &
         wait $! 2>/dev/null || true
       done
 
@@ -750,7 +751,7 @@ execute_sync() {
         fi
       fi
 
-      sleep 0.2 &
+      sleep "$POLL_INTERVAL" &
       wait $! 2>/dev/null || true
     done
 
@@ -1087,7 +1088,7 @@ poll_job_stream() {
       break
     fi
 
-    sleep 0.2 &
+    sleep "$POLL_INTERVAL" &
     wait $! 2>/dev/null || true
   done
 }
@@ -1462,6 +1463,7 @@ EXAMPLES:
 ENVIRONMENT:
   ACTUATOR_JOBS_DIR        Job storage directory (default: /tmp/actuator-jobs)
   ACTUATOR_STATUS_INTERVAL Status update interval in seconds (default: 2)
+  ACTUATOR_POLL_INTERVAL   Streaming poll interval in seconds (default: 5)
 
 OUTPUT:
   All output is JSON-structured for AI consumption.

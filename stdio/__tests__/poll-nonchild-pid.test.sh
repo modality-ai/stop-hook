@@ -35,6 +35,7 @@ check_not() {
 }
 
 JOBS_DIR="/tmp/actuator-poll-test-$$"
+export ACTUATOR_POLL_INTERVAL=0.1
 cleanup() { rm -rf "$JOBS_DIR" 2>/dev/null || true; }
 trap cleanup EXIT
 
@@ -86,7 +87,7 @@ if [[ -z "$job_id" ]]; then
   fail "could not extract job_id for happy path test"
 else
   # Wait for background job to finish and write its status
-  sleep 1
+  sleep 0.1
 
   # PID should be dead now, but .job file should say "completed"
   poll_out=$(ACTUATOR_JOBS_DIR="$JOBS_DIR" "$ACTUATOR" --poll "$job_id" 2>&1)
@@ -106,7 +107,7 @@ job_id=$(echo "$job_out" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 if [[ -z "$job_id" ]]; then
   fail "could not extract job_id for failed exit test"
 else
-  sleep 1
+  sleep 0.1
 
   poll_out=$(ACTUATOR_JOBS_DIR="$JOBS_DIR" "$ACTUATOR" --poll "$job_id" 2>&1)
   check "poll failed job → status failed" '"status":"failed"' "$poll_out"
@@ -167,7 +168,7 @@ job_id=$(echo "$job_out" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 if [[ -z "$job_id" ]]; then
   fail "could not extract job_id for stream test"
 else
-  sleep 1
+  sleep 0.1
 
   # poll_job_stream (-s flag) should also read final status correctly
   # Use a temp file to capture output since timeout + subshell can lose buffered data
@@ -222,7 +223,7 @@ job_id=$(echo "$job_out" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 if [[ -z "$job_id" ]]; then
   fail "could not extract job_id for idempotent test"
 else
-  sleep 1
+  sleep 0.1
 
   poll1=$(ACTUATOR_JOBS_DIR="$JOBS_DIR" "$ACTUATOR" --poll "$job_id" 2>&1)
   poll2=$(ACTUATOR_JOBS_DIR="$JOBS_DIR" "$ACTUATOR" --poll "$job_id" 2>&1)
