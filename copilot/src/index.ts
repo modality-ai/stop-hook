@@ -162,7 +162,9 @@ const checkBashResult = (actuatorId: string): BashResult | undefined => {
     ) {
       return toolResultData;
     }
-  } catch (e) {}
+  } catch (e) {
+    return { stderr: String(e) };
+  }
 };
 
 const insertGlobalToolData = (event: any) => {
@@ -810,7 +812,7 @@ const initSession = async (
                       resolve(pollResult);
                     }
                     logger.log(`🐚 Wait ${jobId}`);
-                  }, 1000);
+                  }, 3000);
                 });
                 const relayFile = `${COPILOT_LOOP_DIR}/.relay-${getSessionId()}`;
                 const commandArr = [];

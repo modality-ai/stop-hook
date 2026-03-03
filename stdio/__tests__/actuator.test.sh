@@ -88,6 +88,19 @@ else
   fail "async exec → could not extract job_id from: $job_out"
 fi
 
+# ---------------------------------------------------------------------------
+echo
+echo "-- ANSI color stripping in JSON output --"
+
+# Command that emits ANSI color codes
+out=$(ACTUATOR_JOBS_DIR=/tmp/actuator-test-$$ "$ACTUATOR" -q "printf '\033[31mred\033[0m \033[1;32mbold-green\033[0m plain'" 2>&1)
+check "ANSI strip → no ESC in JSON stdout" 'red bold-green plain' "$out"
+if echo "$out" | grep -q $'\033'; then
+  fail "ANSI strip → raw ESC bytes still present in JSON"
+else
+  pass "ANSI strip → no raw ESC bytes in JSON"
+fi
+
 # Cleanup test dirs
 rm -rf /tmp/actuator-test-$$ /tmp/actuator-test-async-$$ 2>/dev/null || true
 
