@@ -156,7 +156,10 @@ const checkBashResult = (actuatorId: string): BashResult | undefined => {
         `🐚 Actuator Tool Error:\n${toolResultData.error}\nCommand: ${actuatorCmd}`
       );
     }
-    if (toolResultData && toolResultData.status !== "running") {
+    if (
+      toolResultData &&
+      (toolResultData.status !== "running" || !toolResultData.status)
+    ) {
       return toolResultData;
     }
   } catch (e) {}
