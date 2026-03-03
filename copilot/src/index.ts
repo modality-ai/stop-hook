@@ -762,18 +762,38 @@ const initSession = async (
                 const actuatorId =
                   gToolTimeMap[`${truncateMs(timestamp)}-${toolName}`];
                 const jobId = actuatorId || `job-${Date.now()}`;
-                const strippedCmd = command
-                  .replace(/2>\/dev\/null/g, "")
-                  .replace(/2>&1/g, "");
-                const writeMode = -1 !== strippedCmd.indexOf(">") ? "-w" : "";
-                const escCommand = command.startsWith(": ")
-                  ? command.slice(2, command.lastIndexOf("; cat "))
-                  : shellEscape(command);
+                // Two forms needed:
+                //   escCommand — shell-escaped, for embedding in shell strings (modifiedCommand)
+                //   rawCommand — unescaped, for Bun.spawnSync array args (no shell)
+                // When command starts with ": ", it's a re-intercepted modifiedCommand
+                // where the embedded command is already shell-escaped.
+                let rawCommand: string;
+                let escCommand: string;
+                if (command.startsWith(": ")) {
+                  escCommand = command.slice(2, command.lastIndexOf("; cat "));
+                  // Reverse shellEscape: strip outer single quotes and unescape inner
+                  rawCommand = escCommand.startsWith("'")
+                    ? escCommand.slice(1, -1).replace(/'\\''/g, "'")
+                    : escCommand;
+                } else {
+                  rawCommand = command;
+                  escCommand = shellEscape(command);
+                }
                 try {
                   // Start command via actuator async (returns immediately, no output)
-                  const actuatorStartCmd = `actuator -a -j ${jobId} ${writeMode} --- ${escCommand}`;
-                  logger.log(`🐚 Actuator Start: ${actuatorStartCmd}`);
-                  execSync(actuatorStartCmd, { encoding: "utf-8" });
+                  // NOTE: Do NOT use -w (write mode) with -a (async) — write mode
+                  // blocks until command completes, defeating async fire-and-forget.
+                  // The polling mechanism (checkBashResult) handles waiting for completion.
+                  // NOTE: Use Bun.spawnSync with array args instead of execSync to:
+                  //   - Avoid shell overhead and event loop freeze from shell spawning
+                  //   - Eliminate shell injection risks (no metachar interpretation)
+                  //   - Pass command directly to actuator without double-escaping
+                  const actuatorArgs = ["-a", "-j", jobId, "---", rawCommand];
+                  logger.log(`🐚 Actuator Start: actuator ${actuatorArgs.join(" ")}`);
+                  const startResult = Bun.spawnSync(["actuator", ...actuatorArgs]);
+                  if (startResult.exitCode !== 0) {
+                    throw new Error(`exit ${startResult.exitCode}`);
+                  }
                 } catch (e) {
                   logger.error(
                     `🐚 Actuator start failed, falling back to raw bash`
@@ -782,11 +802,13 @@ const initSession = async (
                 }
 
                 // Start streaming monitor for logging (non-blocking)
+                let streamProc: ReturnType<typeof Bun.spawn> | null = null;
                 if (actuatorId && gToolPools[actuatorId]) {
                   gToolPools[actuatorId].timer = setTimeout(async () => {
                     const proc = Bun.spawn(["actuator", "-s", "-p", jobId], {
                       stdout: "pipe",
                     });
+                    streamProc = proc;
                     const reader = proc.stdout.getReader();
                     const decoder = new TextDecoder();
                     let buffer = "";
@@ -814,6 +836,14 @@ const initSession = async (
                     logger.log(`🐚 Wait ${jobId}`);
                   }, 3000);
                 });
+
+                // Clean up streaming monitor — kill process to prevent zombie
+                if (actuatorId && gToolPools[actuatorId]?.timer) {
+                  clearTimeout(gToolPools[actuatorId].timer);
+                }
+                if (streamProc) {
+                  try { (streamProc as any).kill(); } catch {}
+                }
                 const relayFile = `${COPILOT_LOOP_DIR}/.relay-${getSessionId()}`;
                 const commandArr = [];
                 if (result.stdout) {
