@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.0.1"
+readonly VERSION="2.1.0"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -114,6 +114,10 @@ json_output() {
   json_parts+=("\"stderr\":\"${stderr_value}\"")
   [[ "$stderr_offloaded" == "true" ]] && json_parts+=("\"stderr_offloaded\":true")
 
+  if [[ -n "$SEQ_DATA" ]]; then
+    json_parts+=("\"seq\":\"$(json_escape "$SEQ_DATA")\"")
+  fi
+
   json_parts+=("\"metadata\":{\"start_time\":${start_time:-0},\"end_time\":${end_time:-0},\"duration_seconds\":${duration},\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}")
 
   if [[ -n "$job_id" ]]; then
@@ -164,6 +168,12 @@ plain_output() {
     printf '%s\n' ''
     printf '%s\n' '------ Standard Error ------'
     printf '%s\n' "$stderr_data"
+  fi
+
+  if [[ -n "$SEQ_DATA" ]]; then
+    printf '%s\n' ''
+    printf '%s\n' '------ Output Sequence ------'
+    printf '%s\n' "$SEQ_DATA"
   fi
 }
 
@@ -301,7 +311,8 @@ save_job_state() {
     "CWD='${cwd//\'/\'\\\'\'}'" \
     "WRITE_MODE='${write_mode}'" \
     "STDOUT_FILE='${JOBS_DIR}/${job_id}.stdout'" \
-    "STDERR_FILE='${JOBS_DIR}/${job_id}.stderr'"
+    "STDERR_FILE='${JOBS_DIR}/${job_id}.stderr'" \
+    "SEQ_FILE='${JOBS_DIR}/${job_id}.seq'"
 }
 
 update_job_status() {
@@ -348,6 +359,13 @@ TRAP_COMMAND=""
 TRAP_START_TIME=""
 TIMEOUT_MONITOR_PID=""
 
+# Global state for ordered spawn (FIFO merger)
+ORD_CMD_PID=""
+ORD_MERGER_PID=""
+ORD_FIFOS=()
+TRAP_SEQ_FILE=""
+SEQ_DATA=""
+
 handle_signal() {
   local signal_name="$1"
   local exit_code
@@ -364,6 +382,11 @@ handle_signal() {
     wait "$TRAP_CMD_PID" 2>/dev/null || true
   fi
 
+  # Wait for merger to finish processing remaining output
+  if [[ -n "$ORD_MERGER_PID" ]]; then
+    wait "$ORD_MERGER_PID" 2>/dev/null || true
+  fi
+
   # Kill timeout monitor if active
   if [[ -n "${TIMEOUT_MONITOR_PID:-}" ]]; then
     kill_child "$TIMEOUT_MONITOR_PID" KILL
@@ -378,7 +401,13 @@ handle_signal() {
   [[ -f "$TRAP_STDOUT_FILE" ]] && stdout_data=$(cat "$TRAP_STDOUT_FILE" 2>/dev/null || true)
   [[ -f "$TRAP_STDERR_FILE" ]] && stderr_data=$(cat "$TRAP_STDERR_FILE" 2>/dev/null || true)
 
-  rm -f "$TRAP_STDOUT_FILE" "$TRAP_STDERR_FILE"
+  # Capture seq data if available
+  if [[ -n "$TRAP_SEQ_FILE" && -f "$TRAP_SEQ_FILE" ]]; then
+    SEQ_DATA=$(cut -f2- "$TRAP_SEQ_FILE" 2>/dev/null || true)
+  fi
+
+  rm -f "$TRAP_STDOUT_FILE" "$TRAP_STDERR_FILE" "$TRAP_SEQ_FILE"
+  rm -f "${ORD_FIFOS[@]}" 2>/dev/null || true
 
   emit_result "$WRITE_MODE" "false" "interrupted" "$exit_code" "$TRAP_COMMAND" "$stdout_data" "$stderr_data" "$TRAP_START_TIME" "$end_time" "" "" "$EXEC_SEQUENCE" "$EXEC_CWD"
   exit "$exit_code"
@@ -426,6 +455,64 @@ make_unbuffered() {
 }
 
 # =============================================================================
+# Ordered Output: FIFO merger for stdout/stderr interleaving
+# =============================================================================
+
+# Reads tagged lines from stdin, splits into .stdout/.stderr/.seq files
+# .seq stores "tag\tcontent" per line for full interleaved reconstruction
+seq_split_reader() {
+  local stdout_file="$1" stderr_file="$2" seq_file="$3" tee_output="${4:-false}"
+  while IFS=$'\t' read -r tag line; do
+    if [[ "$tag" == "out" ]]; then
+      printf '%s\n' "$line" >> "$stdout_file"
+      [[ "$tee_output" == "true" ]] && printf '%s\n' "$line"
+    else
+      printf '%s\n' "$line" >> "$stderr_file"
+      [[ "$tee_output" == "true" ]] && printf '%s\n' "$line" >&2
+    fi
+    printf '%s\t%s\n' "$tag" "$line" >> "$seq_file"
+  done
+}
+
+# Spawns command with FIFO merger, sets ORD_CMD_PID/ORD_MERGER_PID globals
+ordered_spawn() {
+  local command="$1" stdout_file="$2" stderr_file="$3" seq_file="$4" tee_output="${5:-false}"
+  local fifo_out fifo_err
+  fifo_out="$(mktemp -u).fifo_out"
+  fifo_err="$(mktemp -u).fifo_err"
+  mkfifo "$fifo_out" "$fifo_err"
+  ORD_FIFOS=("$fifo_out" "$fifo_err")
+
+  {
+    { awk '{print "out\t"$0; fflush()}' < "$fifo_out" &
+      awk '{print "err\t"$0; fflush()}' < "$fifo_err" &
+      wait
+    } | seq_split_reader "$stdout_file" "$stderr_file" "$seq_file" "$tee_output"
+  } &
+  ORD_MERGER_PID=$!
+
+  ( set +e; eval "$(make_unbuffered "$command")"; exit $? ) < /dev/stdin > "$fifo_out" 2> "$fifo_err" &
+  ORD_CMD_PID=$!
+}
+
+# Blocking version: spawns, waits for command + merger, cleans FIFOs
+ordered_exec() {
+  local command="$1" stdout_file="$2" stderr_file="$3" seq_file="$4" tee_output="${5:-false}"
+  ordered_spawn "$command" "$stdout_file" "$stderr_file" "$seq_file" "$tee_output"
+  local exit_code=0
+  wait "$ORD_CMD_PID" 2>/dev/null || exit_code=$?
+  wait "$ORD_MERGER_PID" 2>/dev/null || true
+  rm -f "${ORD_FIFOS[@]}"
+  return $exit_code
+}
+
+# Cleanup FIFOs after ordered_spawn (for async paths)
+ordered_cleanup() {
+  wait "$ORD_MERGER_PID" 2>/dev/null || true
+  rm -f "${ORD_FIFOS[@]}" 2>/dev/null || true
+}
+
+# =============================================================================
 # Core Execution: Synchronous
 # =============================================================================
 
@@ -438,10 +525,13 @@ execute_sync() {
   local quiet="${6:-false}"
   local write_mode="${7:-false}"
 
-  local stdout_file stderr_file start_time end_time exit_code=0
+  local stdout_file stderr_file seq_file start_time end_time exit_code=0
   stdout_file=$(mktemp)
   stderr_file=$(mktemp)
+  seq_file=$(mktemp)
   start_time=$(date +%s)
+
+  TRAP_SEQ_FILE="$seq_file"
 
   if [[ "$stream_output" == "true" ]]; then
     json_status_update "running" "sync" "Executing: ${command}"
@@ -455,11 +545,9 @@ execute_sync() {
   if [[ "$use_tty" == "true" ]]; then
     # TTY Mode: Direct foreground execution OR polling for streaming with heartbeat
     if [[ "$stream_output" == "true" ]]; then
-      # Streaming + TTY: Use polling loop to emit heartbeat events while maintaining TTY output
-      # Background command but keep output flowing to terminal and files
-      # Use unbuffered mode to ensure line-by-line streaming (not accumulated dumps)
-      eval "$(make_unbuffered "$command")" < /dev/stdin > "$stdout_file" 2> "$stderr_file" &
-      local cmd_pid=$!
+      # Streaming + TTY: Use ordered_spawn with FIFO merger for correct interleaving
+      ordered_spawn "$command" "$stdout_file" "$stderr_file" "$seq_file"
+      local cmd_pid=$ORD_CMD_PID
 
       # Set global state for signal handler
       TRAP_CMD_PID="$cmd_pid"
@@ -477,17 +565,8 @@ execute_sync() {
         start_timeout_monitor "$cmd_pid" "$timeout"
       fi
 
-      # Also display output to terminal in real-time via tee
-      if [[ "$quiet" != "true" ]]; then
-        # Continuously tail output to terminal while polling for events
-        tail -f "$stdout_file" 2>/dev/null &
-        local tail_pid=$!
-        tail -f "$stderr_file" 2>/dev/null >&2 &
-        local tail_err_pid=$!
-      fi
-
-      # Polling loop with heartbeat events
-      local stdout_lines=0 stderr_lines=0
+      # Polling loop with heartbeat events (seq-based ordering)
+      local seq_lines=0
       local poll_count=0
       local heartbeat_every=$(( ${STATUS_INTERVAL%.*} * 5 ))
       [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
@@ -495,25 +574,20 @@ execute_sync() {
       while kill -0 "$cmd_pid" 2>/dev/null; do
         local had_output=false
 
-        # Emit new stdout lines
-        local current_out
-        current_out=$(wc -l < "$stdout_file" 2>/dev/null | tr -d ' ')
-        if [[ "${current_out:-0}" -gt "$stdout_lines" ]]; then
-          tail -n +"$((stdout_lines + 1))" "$stdout_file" 2>/dev/null | while IFS= read -r line; do
-            json_stream_line "stdout" "$line"
-          done
-          stdout_lines="$current_out"
-          had_output=true
-        fi
-
-        # Emit new stderr lines
-        local current_err
-        current_err=$(wc -l < "$stderr_file" 2>/dev/null | tr -d ' ')
-        if [[ "${current_err:-0}" -gt "$stderr_lines" ]]; then
-          tail -n +"$((stderr_lines + 1))" "$stderr_file" 2>/dev/null | while IFS= read -r line; do
-            json_stream_line "stderr" "$line"
-          done
-          stderr_lines="$current_err"
+        # Poll seq file for new entries and emit in correct order
+        local current_seq
+        current_seq=$(wc -l < "$seq_file" 2>/dev/null | tr -d ' ')
+        if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
+          while IFS=$'\t' read -r tag sline; do
+            if [[ "$tag" == "out" ]]; then
+              json_stream_line "stdout" "$sline"
+              [[ "$quiet" != "true" ]] && printf '%s\n' "$sline"
+            else
+              json_stream_line "stderr" "$sline"
+              [[ "$quiet" != "true" ]] && printf '%s\n' "$sline" >&2
+            fi
+          done < <(tail -n +"$((seq_lines + 1))" "$seq_file" 2>/dev/null)
+          seq_lines="$current_seq"
           had_output=true
         fi
 
@@ -537,21 +611,24 @@ execute_sync() {
         wait $! 2>/dev/null || true
       done
 
-      # Clean up tail processes if used
-      if [[ "$quiet" != "true" ]]; then
-        kill "$tail_pid" "$tail_err_pid" 2>/dev/null || true
-        wait "$tail_pid" "$tail_err_pid" 2>/dev/null || true
+      # Flush remaining lines after process exits
+      wait "$cmd_pid" 2>/dev/null || exit_code=$?
+      ordered_cleanup
+
+      local current_seq
+      current_seq=$(wc -l < "$seq_file" 2>/dev/null | tr -d ' ')
+      if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
+        while IFS=$'\t' read -r tag sline; do
+          if [[ "$tag" == "out" ]]; then
+            json_stream_line "stdout" "$sline"
+            [[ "$quiet" != "true" ]] && printf '%s\n' "$sline"
+          else
+            json_stream_line "stderr" "$sline"
+            [[ "$quiet" != "true" ]] && printf '%s\n' "$sline" >&2
+          fi
+        done < <(tail -n +"$((seq_lines + 1))" "$seq_file" 2>/dev/null)
       fi
 
-      # Flush any remaining lines after process exits
-      tail -n +"$((stdout_lines + 1))" "$stdout_file" 2>/dev/null | while IFS= read -r line; do
-        json_stream_line "stdout" "$line"
-      done
-      tail -n +"$((stderr_lines + 1))" "$stderr_file" 2>/dev/null | while IFS= read -r line; do
-        json_stream_line "stderr" "$line"
-      done
-
-      wait "$cmd_pid" 2>/dev/null || exit_code=$?
       end_time=$(date +%s)
 
       # Kill timeout monitor if active
@@ -570,23 +647,22 @@ execute_sync() {
       local stdout_data stderr_data
       stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
       stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
-      rm -f "$stdout_file" "$stderr_file"
+      SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
+      rm -f "$stdout_file" "$stderr_file" "$seq_file"
 
       emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "$cmd_pid" "$EXEC_SEQUENCE" "$EXEC_CWD"
       return
     fi
 
-    # Non-streaming TTY: Direct foreground execution (original behavior)
+    # Non-streaming TTY: Direct foreground execution with ordered output
     if [[ "$timeout" -gt 0 ]]; then
       start_timeout_monitor "$$" "$timeout"
     fi
 
     if [[ "$quiet" == "true" || "$write_mode" == "true" ]]; then
-      # Quiet/write mode: capture only, no tee (emit_result handles pass-through in write mode)
-      bash -c "$command" > "$stdout_file" 2> "$stderr_file" || exit_code=$?
+      ordered_exec "$command" "$stdout_file" "$stderr_file" "$seq_file" "false" || exit_code=$?
     else
-      # Normal mode: display to terminal while capturing
-      bash -c "$command" > >(tee "$stdout_file") 2> >(tee "$stderr_file" >&2) || exit_code=$?
+      ordered_exec "$command" "$stdout_file" "$stderr_file" "$seq_file" "true" || exit_code=$?
     fi
     end_time=$(date +%s)
 
@@ -594,9 +670,6 @@ execute_sync() {
       kill "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
       wait "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
     fi
-
-    # Allow tee processes to flush
-    wait 2>/dev/null || true
 
     local status="completed"
     if [[ "$timeout" -gt 0 && ( "$exit_code" -eq 137 || "$exit_code" -eq 143 ) ]]; then
@@ -608,18 +681,17 @@ execute_sync() {
     local stdout_data stderr_data
     stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
     stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
-    rm -f "$stdout_file" "$stderr_file"
+    SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
+    rm -f "$stdout_file" "$stderr_file" "$seq_file"
 
     emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE" "$EXEC_CWD"
     return
   fi
 
-  # Non-TTY mode: background with output capture
+  # Non-TTY mode: background with output capture using ordered_spawn
   # This path is used when stdin is piped (not a terminal).
-  # NOTE: < /dev/stdin preserves piped input to child process
-  # Use unbuffered mode to ensure line-by-line streaming (not accumulated dumps)
-  eval "$(make_unbuffered "$command")" < /dev/stdin > "$stdout_file" 2> "$stderr_file" &
-  local cmd_pid=$!
+  ordered_spawn "$command" "$stdout_file" "$stderr_file" "$seq_file"
+  local cmd_pid=$ORD_CMD_PID
 
   # Set global state for signal handler
   TRAP_CMD_PID="$cmd_pid"
@@ -639,34 +711,26 @@ execute_sync() {
 
   # Wait for command with signal-responsive loop
   if [[ "$stream_output" == "true" ]]; then
-    # Poll for new lines and emit as JSON events (no background processes to leak)
-    local stdout_lines=0 stderr_lines=0
+    # Poll seq file for new entries and emit in correct interleaved order
+    local seq_lines=0
     local poll_count=0
-    local heartbeat_every=$(( ${STATUS_INTERVAL%.*} * 5 ))  # heartbeat every N polls
+    local heartbeat_every=$(( ${STATUS_INTERVAL%.*} * 5 ))
     [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
 
     while kill -0 "$cmd_pid" 2>/dev/null; do
       local had_output=false
 
-      # Emit new stdout lines
-      local current_out
-      current_out=$(wc -l < "$stdout_file" 2>/dev/null | tr -d ' ')
-      if [[ "${current_out:-0}" -gt "$stdout_lines" ]]; then
-        tail -n +"$((stdout_lines + 1))" "$stdout_file" 2>/dev/null | while IFS= read -r line; do
-          json_stream_line "stdout" "$line"
-        done
-        stdout_lines="$current_out"
-        had_output=true
-      fi
-
-      # Emit new stderr lines
-      local current_err
-      current_err=$(wc -l < "$stderr_file" 2>/dev/null | tr -d ' ')
-      if [[ "${current_err:-0}" -gt "$stderr_lines" ]]; then
-        tail -n +"$((stderr_lines + 1))" "$stderr_file" 2>/dev/null | while IFS= read -r line; do
-          json_stream_line "stderr" "$line"
-        done
-        stderr_lines="$current_err"
+      local current_seq
+      current_seq=$(wc -l < "$seq_file" 2>/dev/null | tr -d ' ')
+      if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
+        while IFS=$'\t' read -r tag sline; do
+          if [[ "$tag" == "out" ]]; then
+            json_stream_line "stdout" "$sline"
+          else
+            json_stream_line "stderr" "$sline"
+          fi
+        done < <(tail -n +"$((seq_lines + 1))" "$seq_file" 2>/dev/null)
+        seq_lines="$current_seq"
         had_output=true
       fi
 
@@ -690,21 +754,30 @@ execute_sync() {
       wait $! 2>/dev/null || true
     done
 
-    # Flush any remaining lines after process exits
-    tail -n +"$((stdout_lines + 1))" "$stdout_file" 2>/dev/null | while IFS= read -r line; do
-      json_stream_line "stdout" "$line"
-    done
-    tail -n +"$((stderr_lines + 1))" "$stderr_file" 2>/dev/null | while IFS= read -r line; do
-      json_stream_line "stderr" "$line"
-    done
+    # Flush remaining lines after process exits
+    wait "$cmd_pid" 2>/dev/null || exit_code=$?
+    ordered_cleanup
+
+    local current_seq
+    current_seq=$(wc -l < "$seq_file" 2>/dev/null | tr -d ' ')
+    if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
+      while IFS=$'\t' read -r tag sline; do
+        if [[ "$tag" == "out" ]]; then
+          json_stream_line "stdout" "$sline"
+        else
+          json_stream_line "stderr" "$sline"
+        fi
+      done < <(tail -n +"$((seq_lines + 1))" "$seq_file" 2>/dev/null)
+    fi
   else
     while kill -0 "$cmd_pid" 2>/dev/null; do
       sleep 0.1 &
       wait $! 2>/dev/null || true
     done
+    wait "$cmd_pid" 2>/dev/null || exit_code=$?
+    ordered_cleanup
   fi
 
-  wait "$cmd_pid" 2>/dev/null || exit_code=$?
   end_time=$(date +%s)
 
   # Kill timeout monitor if active
@@ -724,8 +797,9 @@ execute_sync() {
   local stdout_data stderr_data
   stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
   stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
+  SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
 
-  rm -f "$stdout_file" "$stderr_file"
+  rm -f "$stdout_file" "$stderr_file" "$seq_file"
 
   emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "$cmd_pid" "$EXEC_SEQUENCE" "$EXEC_CWD"
 }
@@ -752,21 +826,24 @@ execute_async() {
   fi
   local stdout_file="${JOBS_DIR}/${job_id}.stdout"
   local stderr_file="${JOBS_DIR}/${job_id}.stderr"
+  local seq_file="${JOBS_DIR}/${job_id}.seq"
   local start_time
   start_time=$(date +%s)
 
   # Save job state BEFORE launching process
   save_job_state "$job_id" "0" "$command" "running" "$start_time" "$EXEC_CWD" "$write_mode"
 
-  # Create output files to ensure they exist
-  touch "$stdout_file" "$stderr_file"
+  # Create/truncate output files to ensure clean state
+  : > "$stdout_file"
+  : > "$stderr_file"
+  : > "$seq_file"
 
   # Write mode: background + wait to capture real PID, still blocks until done
   # Raw mode skips this path — uses fire-and-forget below (raw suppresses output in emit_result)
   if [[ "$write_mode" == "true" && "$RAW_MODE" != "true" ]]; then
     local exit_code=0
-    eval "$(make_unbuffered "$command")" >"$stdout_file" 2>"$stderr_file" &
-    local cmd_pid=$!
+    ordered_spawn "$command" "$stdout_file" "$stderr_file" "$seq_file"
+    local cmd_pid=$ORD_CMD_PID
 
     update_job_fields "${JOBS_DIR}/${job_id}.job" "PID='${cmd_pid}'"
 
@@ -774,6 +851,7 @@ execute_async() {
     TRAP_CMD_PID="$cmd_pid"
     TRAP_STDOUT_FILE="$stdout_file"
     TRAP_STDERR_FILE="$stderr_file"
+    TRAP_SEQ_FILE="$seq_file"
     TRAP_COMMAND="$command"
     TRAP_START_TIME="$start_time"
 
@@ -787,6 +865,7 @@ execute_async() {
     fi
 
     wait "$cmd_pid" 2>/dev/null || exit_code=$?
+    ordered_cleanup
     local end_time
     end_time=$(date +%s)
 
@@ -808,6 +887,7 @@ execute_async() {
     local stdout_data stderr_data
     stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
     stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
+    SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
 
     emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "$job_id" "$cmd_pid" "$EXEC_SEQUENCE" "$EXEC_CWD"
     return
@@ -816,7 +896,7 @@ execute_async() {
   # Background mode: fire-and-forget with job tracking
   {
     local exit_code=0
-    eval "$(make_unbuffered "$command")" >"$stdout_file" 2>"$stderr_file" || exit_code=$?
+    ordered_exec "$command" "$stdout_file" "$stderr_file" "$seq_file" "false" || exit_code=$?
 
     # Update job state atomically on completion
     if [[ $exit_code -eq 0 ]]; then
@@ -845,19 +925,15 @@ execute_async() {
 poll_job() {
   local job_id="$1"
   local plain="${2:-false}"
-  local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME CWD WRITE_MODE
+  local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME CWD WRITE_MODE SEQ_FILE
 
   load_job_state "$job_id" || return 1
 
   # Check if process is still running
   if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2>/dev/null; then
-    # PID is from a different shell invocation; wait() is unreliable for non-child PIDs
-    # (returns 127 which with set -e would kill this script before emitting output).
-    # Instead, give the background job a moment to write its final status, then re-read.
     sleep 0.1 2>/dev/null || true
     load_job_state "$job_id" > /dev/null 2>&1 || true
     if [[ "$STATUS" == "running" ]]; then
-      # Race: background job hasn't updated status yet; mark failed as fallback
       STATUS="failed"
       EXIT_CODE="1"
       END_TIME=$(date +%s)
@@ -868,6 +944,7 @@ poll_job() {
   local stdout_data="" stderr_data=""
   [[ -f "$STDOUT_FILE" ]] && stdout_data=$(cat "$STDOUT_FILE" 2>/dev/null || true)
   [[ -f "$STDERR_FILE" ]] && stderr_data=$(cat "$STDERR_FILE" 2>/dev/null || true)
+  [[ -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]] && SEQ_DATA=$(cut -f2- "$SEQ_FILE" 2>/dev/null || true)
 
   if [[ "$plain" == "true" ]]; then
     plain_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
@@ -881,7 +958,7 @@ poll_job() {
 poll_job_stream() {
   local job_id="$1"
   local plain="${2:-false}"
-  local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME CWD WRITE_MODE
+  local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME CWD WRITE_MODE SEQ_FILE
   local poll_count=0
   local heartbeat_every=$(( ${STATUS_INTERVAL%.*} * 5 ))
   [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
@@ -895,22 +972,18 @@ poll_job_stream() {
     json_status_update "running" "$job_id" "Monitoring job: $COMMAND"
   fi
 
-  local stdout_lines=0 stderr_lines=0
+  local seq_lines=0 out_lines=0 err_lines=0
 
-  # Polling loop with heartbeat events
+  # Polling loop with heartbeat events (seq-based ordering)
   while true; do
     # Reload job state
     load_job_state "$job_id" || break
 
     # Check if process is still running
     if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2>/dev/null; then
-      # PID is from a different shell invocation; wait() is unreliable for non-child PIDs
-      # (returns 127 which with set -e would kill this script before emitting output).
-      # Instead, give the background job a moment to write its final status, then re-read.
       sleep 0.1 2>/dev/null || true
       load_job_state "$job_id" > /dev/null 2>&1 || true
       if [[ "$STATUS" == "running" ]]; then
-        # Race: background job hasn't updated status yet; mark failed as fallback
         STATUS="failed"
         EXIT_CODE="1"
         END_TIME=$(date +%s)
@@ -919,41 +992,65 @@ poll_job_stream() {
     fi
 
     local had_output=false
-    local lines_to_emit
 
-    # Emit new stdout lines
-    if [[ -f "$STDOUT_FILE" ]]; then
-      local current_out
-      current_out=$(wc -l < "$STDOUT_FILE" 2>/dev/null | tr -d ' ')
-      if [[ "${current_out:-0}" -gt "$stdout_lines" ]]; then
-        lines_to_emit=$(tail -n +"$((stdout_lines + 1))" "$STDOUT_FILE" 2>/dev/null)
-        while IFS= read -r line; do
-          if [[ "$plain" == "true" ]]; then
-            printf '%s\n' "$line"
+    # Poll seq file for new entries and emit in correct interleaved order
+    if [[ -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]]; then
+      local current_seq
+      current_seq=$(wc -l < "$SEQ_FILE" 2>/dev/null | tr -d ' ')
+      if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
+        while IFS=$'\t' read -r tag sline; do
+          if [[ "$tag" == "out" ]]; then
+            if [[ "$plain" == "true" ]]; then
+              printf '%s\n' "$sline"
+            else
+              json_stream_line "stdout" "$sline"
+            fi
           else
-            json_stream_line "stdout" "$line"
+            if [[ "$plain" == "true" ]]; then
+              printf '[stderr] %s\n' "$sline"
+            else
+              json_stream_line "stderr" "$sline"
+            fi
           fi
-        done <<< "$lines_to_emit"
-        stdout_lines="$current_out"
+        done < <(tail -n +"$((seq_lines + 1))" "$SEQ_FILE" 2>/dev/null)
+        seq_lines="$current_seq"
         had_output=true
       fi
-    fi
-
-    # Emit new stderr lines
-    if [[ -f "$STDERR_FILE" ]]; then
-      local current_err
-      current_err=$(wc -l < "$STDERR_FILE" 2>/dev/null | tr -d ' ')
-      if [[ "${current_err:-0}" -gt "$stderr_lines" ]]; then
-        lines_to_emit=$(tail -n +"$((stderr_lines + 1))" "$STDERR_FILE" 2>/dev/null)
-        while IFS= read -r line; do
-          if [[ "$plain" == "true" ]]; then
-            printf '[stderr] %s\n' "$line"
-          else
-            json_stream_line "stderr" "$line"
-          fi
-        done <<< "$lines_to_emit"
-        stderr_lines="$current_err"
-        had_output=true
+    else
+      # Fallback: no seq file, poll stdout/stderr separately (legacy jobs)
+      if [[ -f "$STDOUT_FILE" ]]; then
+        local current_out
+        current_out=$(wc -l < "$STDOUT_FILE" 2>/dev/null | tr -d ' ')
+        if [[ "${current_out:-0}" -gt "$out_lines" ]]; then
+          local lines_to_emit
+          lines_to_emit=$(tail -n +"$((out_lines + 1))" "$STDOUT_FILE" 2>/dev/null)
+          while IFS= read -r line; do
+            if [[ "$plain" == "true" ]]; then
+              printf '%s\n' "$line"
+            else
+              json_stream_line "stdout" "$line"
+            fi
+          done <<< "$lines_to_emit"
+          out_lines="$current_out"
+          had_output=true
+        fi
+      fi
+      if [[ -f "$STDERR_FILE" ]]; then
+        local current_err
+        current_err=$(wc -l < "$STDERR_FILE" 2>/dev/null | tr -d ' ')
+        if [[ "${current_err:-0}" -gt "$err_lines" ]]; then
+          local lines_to_emit
+          lines_to_emit=$(tail -n +"$((err_lines + 1))" "$STDERR_FILE" 2>/dev/null)
+          while IFS= read -r line; do
+            if [[ "$plain" == "true" ]]; then
+              printf '[stderr] %s\n' "$line"
+            else
+              json_stream_line "stderr" "$line"
+            fi
+          done <<< "$lines_to_emit"
+          err_lines="$current_err"
+          had_output=true
+        fi
       fi
     fi
 
@@ -979,6 +1076,7 @@ poll_job_stream() {
       local stdout_data="" stderr_data=""
       [[ -f "$STDOUT_FILE" ]] && stdout_data=$(cat "$STDOUT_FILE" 2>/dev/null || true)
       [[ -f "$STDERR_FILE" ]] && stderr_data=$(cat "$STDERR_FILE" 2>/dev/null || true)
+      [[ -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]] && SEQ_DATA=$(cut -f2- "$SEQ_FILE" 2>/dev/null || true)
       if [[ "$plain" == "true" ]]; then
         plain_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
           "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE" "${CWD:-}" "${WRITE_MODE:-false}"
@@ -1227,13 +1325,13 @@ cleanup_jobs() {
     fi
 
     if [[ "$should_clean" == "true" ]]; then
-      rm -f "$job_file" "${JOBS_DIR}/${JOB_ID}.stdout" "${JOBS_DIR}/${JOB_ID}.stderr"
+      rm -f "$job_file" "${JOBS_DIR}/${JOB_ID}.stdout" "${JOBS_DIR}/${JOB_ID}.stderr" "${JOBS_DIR}/${JOB_ID}.seq"
       ((cleaned++))
     fi
   done
   # Clean up orphaned stdout/stderr files (sync offloads without matching .job)
   local orphaned=0
-  for output_file in "${JOBS_DIR}"/*.stdout "${JOBS_DIR}"/*.stderr; do
+  for output_file in "${JOBS_DIR}"/*.stdout "${JOBS_DIR}"/*.stderr "${JOBS_DIR}"/*.seq; do
     [[ -f "$output_file" ]] || continue
     local base="${output_file%.*}"
     base="${base##*/}"
