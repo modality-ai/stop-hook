@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.0.0"
+readonly VERSION="2.0.1"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -408,14 +408,20 @@ start_timeout_monitor() {
 
 make_unbuffered() {
   local cmd="$1"
-  # Try stdbuf first (Linux/GNU tools), fall back to script (macOS/POSIX)
-  # This forces line buffering so child process output streams in real-time
-  # instead of accumulating in full-buffered pipes
+  # Force line buffering so child process output streams in real-time
+  # instead of accumulating in full-buffered pipes.
+  # Priority: stdbuf (Linux/GNU) > unbuffer (expect pkg) > plain bash (safe fallback)
+  # NOTE: script -q /dev/null does NOT work when stdout is redirected to file/pipe
+  #       (fails with "tcgetattr/ioctl: Operation not supported on socket")
   if command -v stdbuf &>/dev/null; then
     printf 'stdbuf -oL -eL bash -c %s' "$(printf '%q' "$cmd")"
+  elif command -v unbuffer &>/dev/null; then
+    printf 'unbuffer -p bash -c %s' "$(printf '%q' "$cmd")"
   else
-    # script -q /dev/null forces a pseudo-TTY, enabling line buffering
-    printf 'script -q /dev/null bash -c %s' "$(printf '%q' "$cmd")"
+    # No unbuffering tool available — use plain bash.
+    # Shell builtins (echo, printf) flush per-call anyway;
+    # only external C programs (ls, grep) use libc buffering.
+    printf 'bash -c %s' "$(printf '%q' "$cmd")"
   fi
 }
 
@@ -759,7 +765,7 @@ execute_async() {
   # Raw mode skips this path — uses fire-and-forget below (raw suppresses output in emit_result)
   if [[ "$write_mode" == "true" && "$RAW_MODE" != "true" ]]; then
     local exit_code=0
-    bash -c "$command" >"$stdout_file" 2>"$stderr_file" &
+    eval "$(make_unbuffered "$command")" >"$stdout_file" 2>"$stderr_file" &
     local cmd_pid=$!
 
     update_job_fields "${JOBS_DIR}/${job_id}.job" "PID='${cmd_pid}'"
@@ -810,7 +816,7 @@ execute_async() {
   # Background mode: fire-and-forget with job tracking
   {
     local exit_code=0
-    bash -c "$command" >"$stdout_file" 2>"$stderr_file" || exit_code=$?
+    eval "$(make_unbuffered "$command")" >"$stdout_file" 2>"$stderr_file" || exit_code=$?
 
     # Update job state atomically on completion
     if [[ $exit_code -eq 0 ]]; then
