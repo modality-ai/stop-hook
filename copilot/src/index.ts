@@ -155,7 +155,6 @@ const checkBashResult = (actuatorId: string): BashResult | undefined => {
       logger.error(
         `🐚 Actuator Tool Error:\n${toolResultData.error}\nCommand: ${actuatorCmd}`
       );
-      return;
     }
     if (toolResultData && toolResultData.status !== "running") {
       return toolResultData;
@@ -807,6 +806,7 @@ const initSession = async (
                       clearInterval(interval);
                       resolve(pollResult);
                     }
+                    logger.log(`🐚 Wait ${jobId}`);
                   }, 1000);
                 });
                 const relayFile = `${COPILOT_LOOP_DIR}/.relay-${getSessionId()}`;
