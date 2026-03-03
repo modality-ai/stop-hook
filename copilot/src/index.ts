@@ -989,7 +989,7 @@ const aiCommand = async (prompt: any, aiOption: AIOptions) => {
 
   // Periodic server health check via ping
   const healthCheckIntervalMs = 3000; // 3 seconds
-  const pingTimeoutMs = 1000; // 1 second timeout for ping response
+  const pingTimeoutMs = 1500; // 1 second timeout for ping response
   healthCheckHandle = setInterval(async () => {
     try {
       await Promise.race([
