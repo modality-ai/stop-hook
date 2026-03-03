@@ -105,36 +105,83 @@ fi
 echo
 echo "-- streaming output tests (-s flag) --"
 
-# Simple streaming: verify real-time events (not accumulated)
+# Sync streaming: verify each line emits its own JSON event
 stream_out=$(ACTUATOR_JOBS_DIR=/tmp/actuator-test-$$ "$ACTUATOR" -s 'echo "line1"; echo "line2"; echo "line3"' 2>&1)
+
+# Count stdout events (each echo should produce one)
 event_count=$(echo "$stream_out" | grep -c '"event":"stdout"' || echo 0)
 if [[ "$event_count" -ge 3 ]]; then
-  pass "streaming (-s) → multiple stdout events (real-time)"
+  pass "streaming (-s) → 3 separate stdout events"
 else
-  fail "streaming (-s) → expected 3+ events, got $event_count"
+  fail "streaming (-s) → expected 3+ stdout events, got $event_count"
 fi
+
+# Verify final result reports success
 check "streaming (-s) → status completed" '"status":"completed"' "$stream_out"
+check "streaming (-s) → exit_code 0" '"exit_code":0' "$stream_out"
+
+# Verify event data contains actual output (not corrupted by PTY artifacts)
+check "streaming (-s) → event data has line1" '"data":"line1"' "$stream_out"
+check "streaming (-s) → event data has line3" '"data":"line3"' "$stream_out"
+
+# Verify no PTY control chars leaked (^D from script, raw \r outside JSON)
+if echo "$stream_out" | grep -q $'\x04'; then
+  fail "streaming (-s) → ^D control char leaked (script artifact)"
+else
+  pass "streaming (-s) → no PTY artifacts"
+fi
+
+# Verify each event line is valid JSON
+stream_bad_json=0
+while IFS= read -r sline; do
+  [[ -z "$sline" ]] && continue
+  if ! echo "$sline" | python3 -c 'import sys,json; json.load(sys.stdin)' 2>/dev/null; then
+    (( stream_bad_json++ )) || true
+  fi
+done <<< "$stream_out"
+if [[ "$stream_bad_json" -eq 0 ]]; then
+  pass "streaming (-s) → all output lines are valid JSON"
+else
+  fail "streaming (-s) → $stream_bad_json lines are not valid JSON"
+fi
 
 # ---------------------------------------------------------------------------
 echo
 echo "-- polling + streaming tests (-p -s flags) --"
 
-# Async job + poll with streaming
-JOBS_DIR=/tmp/actuator-test-poll-stream-$$
-poll_stream_out=$(ACTUATOR_JOBS_DIR="$JOBS_DIR" "$ACTUATOR" -a -q 'echo "async_line1"; echo "async_line2"' 2>&1)
+# Async job + poll with streaming: verify events arrive with correct data
+JOBS_DIR_PS=/tmp/actuator-test-poll-stream-$$
+poll_stream_out=$(ACTUATOR_JOBS_DIR="$JOBS_DIR_PS" "$ACTUATOR" -a -q 'echo "ps_alpha"; echo "ps_beta"' 2>&1)
 poll_job_id=$(echo "$poll_stream_out" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
 if [[ -n "$poll_job_id" ]]; then
-  pass "poll+stream (-p -s) → async job created"
+  pass "poll+stream (-p -s) → async job created: $poll_job_id"
   sleep 0.5
-  poll_stream_result=$(ACTUATOR_JOBS_DIR="$JOBS_DIR" "$ACTUATOR" -p "$poll_job_id" -s 2>&1)
+
+  poll_stream_result=$(ACTUATOR_JOBS_DIR="$JOBS_DIR_PS" "$ACTUATOR" -p "$poll_job_id" -s 2>&1)
   check "poll+stream (-p -s) → status completed" '"status":"completed"' "$poll_stream_result"
-  check "poll+stream (-p -s) → output captured" 'async_line' "$poll_stream_result"
+
+  # Verify stdout events contain actual data
+  ps_events=$(echo "$poll_stream_result" | grep -c '"event":"stdout"' || echo 0)
+  if [[ "$ps_events" -ge 2 ]]; then
+    pass "poll+stream (-p -s) → $ps_events stdout events captured"
+  else
+    fail "poll+stream (-p -s) → expected 2+ stdout events, got $ps_events"
+  fi
+  check "poll+stream (-p -s) → data has ps_alpha" 'ps_alpha' "$poll_stream_result"
+  check "poll+stream (-p -s) → data has ps_beta" 'ps_beta' "$poll_stream_result"
+
+  # Verify no PTY artifacts
+  if echo "$poll_stream_result" | grep -q $'\x04'; then
+    fail "poll+stream (-p -s) → ^D control char leaked"
+  else
+    pass "poll+stream (-p -s) → no PTY artifacts"
+  fi
 else
   fail "poll+stream (-p -s) → could not create async job"
 fi
 
 # Cleanup test dirs
-rm -rf /tmp/actuator-test-$$ /tmp/actuator-test-async-$$ /tmp/actuator-test-poll-stream-$$ 2>/dev/null || true
+rm -rf /tmp/actuator-test-$$ /tmp/actuator-test-async-$$ "$JOBS_DIR_PS" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 echo
