@@ -10,6 +10,7 @@ import {
   appendFileSync,
   readFileSync,
   writeFileSync,
+  writeSync,
   existsSync,
   mkdirSync,
 } from "fs";
@@ -74,7 +75,7 @@ const printColorDiff = (
         return `${DIM}${line}${RESET}`;
       })
       .join("\n");
-    process.stdout.write(`\n${colored}\n`);
+    writeSync(1, `\n${colored}\n`);
   } finally {
     try {
       execSync(`rm -f ${shellEscape(tmpOld)} ${shellEscape(tmpNew)}`);
@@ -448,7 +449,7 @@ const setupSessionEventListener = (session: CopilotSession) => {
 
         case "assistant.reasoning_delta":
           // Streaming reasoning content
-          process.stdout.write(event.data.deltaContent);
+          writeSync(1, event.data.deltaContent);
           break;
 
         // ─────────────────────────────────────────────────────────────
@@ -551,7 +552,7 @@ const setupSessionEventListener = (session: CopilotSession) => {
 
         case "assistant.message_delta":
           // Streaming response content (write without newline)
-          process.stdout.write(event.data.deltaContent);
+          writeSync(1, event.data.deltaContent);
           break;
 
         case "assistant.streaming_delta":
@@ -673,7 +674,7 @@ const setupSessionEventListener = (session: CopilotSession) => {
           break;
 
         default:
-          process.stdout.write(`❓ Unhandled event type: ${event.type}\n`);
+          writeSync(1, `❓ Unhandled event type: ${event.type}\n`);
           break;
       }
     } catch (error) {
@@ -1004,7 +1005,7 @@ const aiCommand = async (prompt: any, aiOption: AIOptions) => {
           setTimeout(() => reject(new Error("Ping timeout")), pingTimeoutMs)
         ),
       ]);
-      process.stdout.write(".");
+      writeSync(1, ".");
     } catch (error) {
       logger.error(`⚠️  Server hang detected: ${(error as Error).message}`);
       abortController.abort();
