@@ -61,11 +61,11 @@ else
   pass "poll_job_stream does NOT use wait \$PID"
 fi
 
-# Verify sleep + load_job_state pattern exists (the fix)
-if echo "$poll_section" | grep -q 'sleep 0.1'; then
-  pass "poll_job uses sleep 0.1 grace period before re-read"
+# Verify retry-with-backoff pattern exists (the fix)
+if echo "$poll_section" | grep -q 'for _retry in'; then
+  pass "poll_job uses retry-with-backoff before re-read"
 else
-  fail "poll_job missing sleep 0.1 grace period"
+  fail "poll_job missing retry-with-backoff pattern"
 fi
 
 if echo "$poll_section" | grep -q 'load_job_state.*|| true'; then

@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.2.2"
+readonly VERSION="2.3.0"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -22,11 +22,6 @@ RAW_MODE="false"
 SEQ_MODE="false"
 EXEC_CWD=""
 
-# Cross-platform line-buffered awk: mawk needs -W interactive, gawk/BSD awk use fflush()
-_AWK_INTERACTIVE=()
-if awk -W interactive 'BEGIN{exit}' </dev/null 2>/dev/null; then
-  _AWK_INTERACTIVE=(-W interactive)
-fi
 
 # =============================================================================
 # Sequence Counter (execution order tracking)
@@ -50,7 +45,7 @@ get_next_sequence() {
 json_escape() {
   # Use awk for efficient escaping - bash ${str//} is O(n²) on large strings
   # Also strips ANSI escape sequences (color codes, cursor moves) that corrupt JSON
-  printf '%s' "$1" | awk "${_AWK_INTERACTIVE[@]}" '
+  printf '%s' "$1" | awk '
     BEGIN { ORS="" }
     {
       gsub(/\033\[[0-9;]*[A-Za-z]/, "")
@@ -455,18 +450,21 @@ start_timeout_monitor() {
 # .seq stores "tag\tcontent" per line for full interleaved reconstruction
 seq_split_reader() {
   local stdout_file="$1" stderr_file="$2" seq_file="$3" tee_output="${4:-false}"
-  # Use awk instead of bash while-read: bash read does 1 syscall per byte
-  # (O(n) syscalls per line), awk uses buffered reads (O(1) per line).
-  # fflush(file): explicit filename required — bare fflush() doesn't flush >> files in mawk
-  awk "${_AWK_INTERACTIVE[@]}" -v sout="$stdout_file" -v serr="$stderr_file" -v seq="$seq_file" \
-      -v tee="$tee_output" 'BEGIN { FS="\t"; OFS="\t" }
-  {
-    tag = $1; sub(/^[^\t]*\t/, "")
-    f = (tag == "out" ? sout : serr)
-    print $0 >> f; fflush(f)
-    if (tee == "true") print $0 > (tag == "out" ? "/dev/stdout" : "/dev/stderr")
-    print tag, $0 >> seq; fflush(seq)
-  }'
+  # Bash while-read instead of mawk: mawk -W interactive truncates lines at 4096 bytes,
+  # silently breaking output capture for long lines (e.g. JSON blobs).
+  # Open file descriptors once to avoid per-line open/close overhead.
+  exec 3>>"$stdout_file" 4>>"$stderr_file" 5>>"$seq_file"
+  while IFS=$'\t' read -r tag content; do
+    if [[ "$tag" == "out" ]]; then
+      printf '%s\n' "$content" >&3
+      [[ "$tee_output" == "true" ]] && printf '%s\n' "$content"
+    else
+      printf '%s\n' "$content" >&4
+      [[ "$tee_output" == "true" ]] && printf '%s\n' "$content" >&2
+    fi
+    printf '%s\t%s\n' "$tag" "$content" >&5
+  done
+  exec 3>&- 4>&- 5>&-
 }
 
 # Spawns command with FIFO merger, sets ORD_CMD_PID/ORD_MERGER_PID globals
@@ -479,8 +477,8 @@ ordered_spawn() {
   ORD_FIFOS=("$fifo_out" "$fifo_err")
 
   {
-    { awk "${_AWK_INTERACTIVE[@]}" '{print "out\t"$0; fflush()}' < "$fifo_out" &
-      awk "${_AWK_INTERACTIVE[@]}" '{print "err\t"$0; fflush()}' < "$fifo_err" &
+    { sed -u 's/^/out\t/' < "$fifo_out" &
+      sed -u 's/^/err\t/' < "$fifo_err" &
       wait
     } | seq_split_reader "$stdout_file" "$stderr_file" "$seq_file" "$tee_output"
   } &
@@ -924,10 +922,15 @@ poll_job() {
 
   load_job_state "$job_id" || return 1
 
-  # Check if process is still running
+  # Check if process is still running — retry with backoff to let
+  # the wrapper subshell flush its final status to the job file
   if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2>/dev/null; then
-    sleep 0.1 2>/dev/null || true
-    load_job_state "$job_id" > /dev/null 2>&1 || true
+    local _retry
+    for _retry in 0.1 0.2 0.5 1 2; do
+      sleep "$_retry" 2>/dev/null || true
+      load_job_state "$job_id" > /dev/null 2>&1 || true
+      [[ "$STATUS" != "running" ]] && break
+    done
     if [[ "$STATUS" == "running" ]]; then
       STATUS="failed"
       EXIT_CODE="1"
@@ -974,10 +977,15 @@ poll_job_stream() {
     # Reload job state
     load_job_state "$job_id" || break
 
-    # Check if process is still running
+    # Check if process is still running — retry with backoff to let
+    # the wrapper subshell flush its final status to the job file
     if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2>/dev/null; then
-      sleep 0.1 2>/dev/null || true
-      load_job_state "$job_id" > /dev/null 2>&1 || true
+      local _retry
+      for _retry in 0.1 0.2 0.5 1 2; do
+        sleep "$_retry" 2>/dev/null || true
+        load_job_state "$job_id" > /dev/null 2>&1 || true
+        [[ "$STATUS" != "running" ]] && break
+      done
       if [[ "$STATUS" == "running" ]]; then
         STATUS="failed"
         EXIT_CODE="1"
@@ -1067,6 +1075,44 @@ poll_job_stream() {
 
     # Break if job is done
     if [[ "$STATUS" != "running" ]]; then
+      # Flush any remaining streamed lines not yet emitted
+      if [[ -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]]; then
+        local final_seq
+        final_seq=$(wc -l < "$SEQ_FILE" 2>/dev/null | tr -d ' ')
+        if [[ "${final_seq:-0}" -gt "$seq_lines" ]]; then
+          while IFS=$'\t' read -r tag sline; do
+            if [[ "$tag" == "out" ]]; then
+              if [[ "$plain" == "true" ]]; then printf '%s\n' "$sline"
+              else json_stream_line "stdout" "$sline"; fi
+            else
+              if [[ "$plain" == "true" ]]; then printf '[stderr] %s\n' "$sline"
+              else json_stream_line "stderr" "$sline"; fi
+            fi
+          done < <(tail -n +"$((seq_lines + 1))" "$SEQ_FILE" 2>/dev/null)
+        fi
+      else
+        # Fallback flush for legacy jobs without seq file
+        if [[ -f "$STDOUT_FILE" ]]; then
+          local final_out
+          final_out=$(wc -l < "$STDOUT_FILE" 2>/dev/null | tr -d ' ')
+          if [[ "${final_out:-0}" -gt "$out_lines" ]]; then
+            while IFS= read -r line; do
+              if [[ "$plain" == "true" ]]; then printf '%s\n' "$line"
+              else json_stream_line "stdout" "$line"; fi
+            done < <(tail -n +"$((out_lines + 1))" "$STDOUT_FILE" 2>/dev/null)
+          fi
+        fi
+        if [[ -f "$STDERR_FILE" ]]; then
+          local final_err
+          final_err=$(wc -l < "$STDERR_FILE" 2>/dev/null | tr -d ' ')
+          if [[ "${final_err:-0}" -gt "$err_lines" ]]; then
+            while IFS= read -r line; do
+              if [[ "$plain" == "true" ]]; then printf '[stderr] %s\n' "$line"
+              else json_stream_line "stderr" "$line"; fi
+            done < <(tail -n +"$((err_lines + 1))" "$STDERR_FILE" 2>/dev/null)
+          fi
+        fi
+      fi
       # Emit final state
       local stdout_data="" stderr_data=""
       [[ -f "$STDOUT_FILE" ]] && stdout_data=$(cat "$STDOUT_FILE" 2>/dev/null || true)
@@ -1154,7 +1200,7 @@ list_jobs_json_fast() {
   local timestamp="$1" total="$2"
   shift 2
   # shellcheck disable=SC2016
-  awk "${_AWK_INTERACTIVE[@]}" -v ts="$timestamp" -v total="$total" -v sq="'" '
+  awk -v ts="$timestamp" -v total="$total" -v sq="'" '
   function val(line,    i, v) {
     i = index(line, "=")
     if (i == 0) return ""
@@ -1199,7 +1245,7 @@ list_jobs_plain_fast() {
   local timestamp="$1" total="$2" id_width="${3:-$DEFAULT_JOB_ID_WIDTH}"
   shift 3
   # shellcheck disable=SC2016
-  awk "${_AWK_INTERACTIVE[@]}" -v ts="$timestamp" -v total="$total" -v sq="'" -v id_w="$id_width" '
+  awk -v ts="$timestamp" -v total="$total" -v sq="'" -v id_w="$id_width" '
   function val(line,    i, v) {
     i = index(line, "=")
     if (i == 0) return ""
