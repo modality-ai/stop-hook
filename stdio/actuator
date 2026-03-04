@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.1.2"
+readonly VERSION="2.1.3"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -116,7 +116,15 @@ json_output() {
   [[ "$stderr_offloaded" == "true" ]] && json_parts+=("\"stderr_offloaded\":true")
 
   if [[ -n "$SEQ_DATA" ]]; then
-    json_parts+=("\"seq\":\"$(json_escape "$SEQ_DATA")\"")
+    if [[ ${#SEQ_DATA} -gt $OUTPUT_SIZE_THRESHOLD ]]; then
+      init_jobs_dir
+      local seq_file="${JOBS_DIR}/${job_id:-${sequence}}.seq"
+      [[ ! -f "$seq_file" ]] && printf '%s\n' "$SEQ_DATA" > "$seq_file"
+      json_parts+=("\"seq\":\"$(offload_message "seq" "$seq_file")\"")
+      json_parts+=("\"seq_offloaded\":true")
+    else
+      json_parts+=("\"seq\":\"$(json_escape "$SEQ_DATA")\"")
+    fi
   fi
 
   json_parts+=("\"metadata\":{\"start_time\":${start_time:-0},\"end_time\":${end_time:-0},\"duration_seconds\":${duration},\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}")

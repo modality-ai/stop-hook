@@ -789,8 +789,13 @@ const initSession = async (
                   //   - Eliminate shell injection risks (no metachar interpretation)
                   //   - Pass command directly to actuator without double-escaping
                   const actuatorArgs = ["-a", "-j", jobId, "---", rawCommand];
-                  logger.log(`🐚 Actuator Start: actuator ${actuatorArgs.join(" ")}`);
-                  const startResult = Bun.spawnSync(["actuator", ...actuatorArgs]);
+                  logger.log(
+                    `🐚 Actuator Start: actuator ${actuatorArgs.join(" ")}`
+                  );
+                  const startResult = Bun.spawnSync([
+                    "actuator",
+                    ...actuatorArgs,
+                  ]);
                   if (startResult.exitCode !== 0) {
                     throw new Error(`exit ${startResult.exitCode}`);
                   }
@@ -802,16 +807,17 @@ const initSession = async (
                 }
 
                 // Start streaming monitor for logging (non-blocking)
-                let streamProc: ReturnType<typeof Bun.spawn> | null = null;
+                const streamProc = { ref: null as ReturnType<typeof Bun.spawn> | null };
                 let actuatorTimer: NodeJS.Timeout | null = null;
                 if (actuatorId) {
                   actuatorTimer = setTimeout(async () => {
                     const proc = Bun.spawn(["actuator", "-s", "-p", jobId], {
                       stdout: "pipe",
                     });
-                    streamProc = proc;
+                    streamProc.ref = proc;
                     const reader = proc.stdout.getReader();
                     const decoder = new TextDecoder();
+                    logger.log(`🐚 Start to monitor ${actuatorId}`);
                     let buffer = "";
                     while (true) {
                       const { done, value } = await reader.read();
@@ -844,9 +850,7 @@ const initSession = async (
                 // Clean up streaming monitor — kill process to prevent zombie
                 if (actuatorTimer) {
                   clearTimeout(actuatorTimer);
-                }
-                if (streamProc) {
-                  try { (streamProc as any).kill(); } catch {}
+                  try { streamProc.ref?.kill(); } catch {}
                 }
                 const relayFile = `${COPILOT_LOOP_DIR}/.relay-${getSessionId()}`;
                 const commandArr = [];
