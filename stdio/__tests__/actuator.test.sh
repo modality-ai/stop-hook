@@ -38,8 +38,12 @@ else fail "streaming → expected 3+, got $event_count"; fi
 check "streaming → completed" '"status":"completed"' "$stream_out"
 
 # -- seq interleaving --
-out=$(ACTUATOR_JOBS_DIR=$D "$ACTUATOR" -q 'echo aaa; echo bbb >&2' 2>&1)
-check "seq → field present" '"seq":' "$out"
+out_no_seq=$(ACTUATOR_JOBS_DIR=$D "$ACTUATOR" -q 'echo aaa; echo bbb >&2' 2>&1)
+check "seq → hidden by default" 'aaa' "$out_no_seq"
+if [[ "$out_no_seq" != *'"seq":'* ]]; then pass "seq → no seq field without --seq"
+else fail "seq → no seq field without --seq — got seq in output"; fi
+out=$(ACTUATOR_JOBS_DIR=$D "$ACTUATOR" --seq -q 'echo aaa; echo bbb >&2' 2>&1)
+check "seq → field present with --seq" '"seq":' "$out"
 seq_val=$(echo "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin)["seq"])' 2>/dev/null || echo "")
 check "seq → has stdout" 'aaa' "$seq_val"
 check "seq → has stderr" 'bbb' "$seq_val"

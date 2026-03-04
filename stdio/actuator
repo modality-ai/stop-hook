@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.1.3"
+readonly VERSION="2.2.0"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -19,6 +19,7 @@ PLAIN_MODE="false"
 QUIET_MODE="false"
 WRITE_MODE="false"
 RAW_MODE="false"
+SEQ_MODE="false"
 EXEC_CWD=""
 
 # =============================================================================
@@ -412,7 +413,7 @@ handle_signal() {
 
   # Capture seq data if available
   if [[ -n "$TRAP_SEQ_FILE" && -f "$TRAP_SEQ_FILE" ]]; then
-    SEQ_DATA=$(cut -f2- "$TRAP_SEQ_FILE" 2>/dev/null || true)
+    [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$TRAP_SEQ_FILE" 2>/dev/null || true)
   fi
 
   rm -f "$TRAP_STDOUT_FILE" "$TRAP_STDERR_FILE" "$TRAP_SEQ_FILE"
@@ -448,16 +449,17 @@ start_timeout_monitor() {
 # .seq stores "tag\tcontent" per line for full interleaved reconstruction
 seq_split_reader() {
   local stdout_file="$1" stderr_file="$2" seq_file="$3" tee_output="${4:-false}"
-  while IFS=$'\t' read -r tag line; do
-    if [[ "$tag" == "out" ]]; then
-      printf '%s\n' "$line" >> "$stdout_file"
-      [[ "$tee_output" == "true" ]] && printf '%s\n' "$line"
-    else
-      printf '%s\n' "$line" >> "$stderr_file"
-      [[ "$tee_output" == "true" ]] && printf '%s\n' "$line" >&2
-    fi
-    printf '%s\t%s\n' "$tag" "$line" >> "$seq_file"
-  done
+  # Use awk instead of bash while-read: bash read does 1 syscall per byte
+  # (O(n) syscalls per line), awk uses buffered reads (O(1) per line).
+  awk -v sout="$stdout_file" -v serr="$stderr_file" -v seq="$seq_file" \
+      -v tee="$tee_output" 'BEGIN { FS="\t"; OFS="\t" }
+  {
+    tag = $1; sub(/^[^\t]*\t/, "")
+    print $0 >> (tag == "out" ? sout : serr)
+    if (tee == "true") print $0 > (tag == "out" ? "/dev/stdout" : "/dev/stderr")
+    print tag, $0 >> seq
+    fflush()
+  }'
 }
 
 # Spawns command with FIFO merger, sets ORD_CMD_PID/ORD_MERGER_PID globals
@@ -633,7 +635,7 @@ execute_sync() {
       local stdout_data stderr_data
       stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
       stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
-      SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
+      [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
       rm -f "$stdout_file" "$stderr_file" "$seq_file"
 
       emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "$cmd_pid" "$EXEC_SEQUENCE" "$EXEC_CWD"
@@ -667,7 +669,7 @@ execute_sync() {
     local stdout_data stderr_data
     stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
     stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
-    SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
+    [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
     rm -f "$stdout_file" "$stderr_file" "$seq_file"
 
     emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE" "$EXEC_CWD"
@@ -783,7 +785,7 @@ execute_sync() {
   local stdout_data stderr_data
   stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
   stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
-  SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
+  [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
 
   rm -f "$stdout_file" "$stderr_file" "$seq_file"
 
@@ -873,7 +875,7 @@ execute_async() {
     local stdout_data stderr_data
     stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
     stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
-    SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
+    [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
 
     emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "$job_id" "$cmd_pid" "$EXEC_SEQUENCE" "$EXEC_CWD"
     return
@@ -930,7 +932,7 @@ poll_job() {
   local stdout_data="" stderr_data=""
   [[ -f "$STDOUT_FILE" ]] && stdout_data=$(cat "$STDOUT_FILE" 2>/dev/null || true)
   [[ -f "$STDERR_FILE" ]] && stderr_data=$(cat "$STDERR_FILE" 2>/dev/null || true)
-  [[ -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]] && SEQ_DATA=$(cut -f2- "$SEQ_FILE" 2>/dev/null || true)
+  [[ "$SEQ_MODE" == "true" && -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]] && SEQ_DATA=$(cut -f2- "$SEQ_FILE" 2>/dev/null || true)
 
   if [[ "$plain" == "true" ]]; then
     plain_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
@@ -1062,7 +1064,7 @@ poll_job_stream() {
       local stdout_data="" stderr_data=""
       [[ -f "$STDOUT_FILE" ]] && stdout_data=$(cat "$STDOUT_FILE" 2>/dev/null || true)
       [[ -f "$STDERR_FILE" ]] && stderr_data=$(cat "$STDERR_FILE" 2>/dev/null || true)
-      [[ -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]] && SEQ_DATA=$(cut -f2- "$SEQ_FILE" 2>/dev/null || true)
+      [[ "$SEQ_MODE" == "true" && -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]] && SEQ_DATA=$(cut -f2- "$SEQ_FILE" 2>/dev/null || true)
       if [[ "$plain" == "true" ]]; then
         plain_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
           "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE" "${CWD:-}" "${WRITE_MODE:-false}"
@@ -1388,6 +1390,7 @@ OPTIONS:
   -w, --write             Write mode: pass command stdout to actuator stdout,
                           output JSON/plain result to stderr. Use for commands
                           with shell redirects (e.g., actuator -w --- echo 1 > file)
+  --seq                   Include seq (interleaved stdout/stderr) in output (hidden by default)
   --raw                   Raw mode: like --write but suppresses ALL metadata output.
                           Only command stdout goes to actuator stdout. No JSON/plain
                           on stdout or stderr. Metadata saved to job file only
@@ -1519,7 +1522,7 @@ actuator() {
         ;;
       ---) _collecting=true ;;
       -t|--timeout|-j|--job-id|-p|--poll|-k|--terminate|--filter|--status) _skip_next=true; _has_flags=true ;;
-      -a|--async|-s|--stream|-w|--write|--raw|-q|--quiet|--plain|-l|--list|--cleanup|--terminate-all|--stdin)
+      -a|--async|-s|--stream|-w|--write|--raw|--seq|-q|--quiet|--plain|-l|--list|--cleanup|--terminate-all|--stdin)
         _has_flags=true ;;
       -*) ;;
       *)
@@ -1600,7 +1603,7 @@ require_arg() {
 
 main() {
   local command="" mode="sync" timeout="$DEFAULT_TIMEOUT"
-  local stream="false" plain="false" use_tty="false" quiet="false" write_mode="false" raw_mode="false"
+  local stream="false" plain="false" use_tty="false" quiet="false" write_mode="false" raw_mode="false" seq_mode="false"
   local poll_id="" terminate_id="" terminate_signal="TERM" list_jobs_flag="false" terminate_all_flag="false"
   local custom_job_id="" list_limit="" job_id_width="$DEFAULT_JOB_ID_WIDTH" list_filter="" list_status=""
 
@@ -1654,6 +1657,8 @@ main() {
         write_mode="true"; shift ;;
       --raw)
         raw_mode="true"; write_mode="true"; shift ;;
+      --seq)
+        seq_mode="true"; shift ;;
       -q|--quiet)
         quiet="true"; shift ;;
       -v|--version)
@@ -1710,6 +1715,7 @@ main() {
   QUIET_MODE="$quiet"
   WRITE_MODE="$write_mode"
   RAW_MODE="$raw_mode"
+  SEQ_MODE="$seq_mode"
 
   # Handle deferred actions
   if [[ "$terminate_all_flag" == "true" ]]; then
