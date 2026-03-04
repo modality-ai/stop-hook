@@ -1250,9 +1250,20 @@ list_jobs() {
 
   # Apply status filter
   if [[ -n "$status_filter" && ${#job_files[@]} -gt 0 ]]; then
-    local filtered=()
+    local filtered=() _pid
     for f in "${job_files[@]}"; do
-      grep -qi "^STATUS='${status_filter}'" "$f" 2>/dev/null && filtered+=("$f")
+      if grep -qi "^STATUS='${status_filter}'" "$f" 2>/dev/null; then
+        if [[ "$status_filter" == "running" ]]; then
+          _pid=$(grep "^PID=" "$f" | sed "s/^PID='//;s/'$//")
+          if [[ -n "$_pid" && "$_pid" != "0" ]] && kill -0 "$_pid" 2>/dev/null; then
+            filtered+=("$f")
+          else
+            update_job_fields "$f" "STATUS='failed'" "EXIT_CODE='1'" "END_TIME='$(date +%s)'"
+          fi
+        else
+          filtered+=("$f")
+        fi
+      fi
     done
     job_files=("${filtered[@]}")
   fi
