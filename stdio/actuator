@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.2.1"
+readonly VERSION="2.2.2"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -21,6 +21,12 @@ WRITE_MODE="false"
 RAW_MODE="false"
 SEQ_MODE="false"
 EXEC_CWD=""
+
+# Cross-platform line-buffered awk: mawk needs -W interactive, gawk/BSD awk use fflush()
+_AWK_INTERACTIVE=()
+if awk -W interactive 'BEGIN{exit}' </dev/null 2>/dev/null; then
+  _AWK_INTERACTIVE=(-W interactive)
+fi
 
 # =============================================================================
 # Sequence Counter (execution order tracking)
@@ -44,7 +50,7 @@ get_next_sequence() {
 json_escape() {
   # Use awk for efficient escaping - bash ${str//} is O(n²) on large strings
   # Also strips ANSI escape sequences (color codes, cursor moves) that corrupt JSON
-  printf '%s' "$1" | awk '
+  printf '%s' "$1" | awk "${_AWK_INTERACTIVE[@]}" '
     BEGIN { ORS="" }
     {
       gsub(/\033\[[0-9;]*[A-Za-z]/, "")
@@ -474,14 +480,15 @@ seq_split_reader() {
   local stdout_file="$1" stderr_file="$2" seq_file="$3" tee_output="${4:-false}"
   # Use awk instead of bash while-read: bash read does 1 syscall per byte
   # (O(n) syscalls per line), awk uses buffered reads (O(1) per line).
-  awk -v sout="$stdout_file" -v serr="$stderr_file" -v seq="$seq_file" \
+  # fflush(file): explicit filename required — bare fflush() doesn't flush >> files in mawk
+  awk "${_AWK_INTERACTIVE[@]}" -v sout="$stdout_file" -v serr="$stderr_file" -v seq="$seq_file" \
       -v tee="$tee_output" 'BEGIN { FS="\t"; OFS="\t" }
   {
     tag = $1; sub(/^[^\t]*\t/, "")
-    print $0 >> (tag == "out" ? sout : serr)
+    f = (tag == "out" ? sout : serr)
+    print $0 >> f; fflush(f)
     if (tee == "true") print $0 > (tag == "out" ? "/dev/stdout" : "/dev/stderr")
-    print tag, $0 >> seq
-    fflush()
+    print tag, $0 >> seq; fflush(seq)
   }'
 }
 
@@ -495,8 +502,8 @@ ordered_spawn() {
   ORD_FIFOS=("$fifo_out" "$fifo_err")
 
   {
-    { awk '{print "out\t"$0; fflush()}' < "$fifo_out" &
-      awk '{print "err\t"$0; fflush()}' < "$fifo_err" &
+    { awk "${_AWK_INTERACTIVE[@]}" '{print "out\t"$0; fflush()}' < "$fifo_out" &
+      awk "${_AWK_INTERACTIVE[@]}" '{print "err\t"$0; fflush()}' < "$fifo_err" &
       wait
     } | seq_split_reader "$stdout_file" "$stderr_file" "$seq_file" "$tee_output"
   } &
@@ -1170,7 +1177,7 @@ list_jobs_json_fast() {
   local timestamp="$1" total="$2"
   shift 2
   # shellcheck disable=SC2016
-  awk -v ts="$timestamp" -v total="$total" -v sq="'" '
+  awk "${_AWK_INTERACTIVE[@]}" -v ts="$timestamp" -v total="$total" -v sq="'" '
   function val(line,    i, v) {
     i = index(line, "=")
     if (i == 0) return ""
@@ -1215,7 +1222,7 @@ list_jobs_plain_fast() {
   local timestamp="$1" total="$2" id_width="${3:-$DEFAULT_JOB_ID_WIDTH}"
   shift 3
   # shellcheck disable=SC2016
-  awk -v ts="$timestamp" -v total="$total" -v sq="'" -v id_w="$id_width" '
+  awk "${_AWK_INTERACTIVE[@]}" -v ts="$timestamp" -v total="$total" -v sq="'" -v id_w="$id_width" '
   function val(line,    i, v) {
     i = index(line, "=")
     if (i == 0) return ""
