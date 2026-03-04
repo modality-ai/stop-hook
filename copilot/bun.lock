@@ -23,7 +23,7 @@
 
     "@github/copilot-linux-x64": ["@github/copilot-linux-x64@0.0.420", "", { "os": "linux", "cpu": "x64", "bin": { "copilot-linux-x64": "copilot" } }, "sha512-iL2NpZvXIDZ+3lw7sO2fo5T0nKmP5dZbU2gdYcv+SFBm/ONhCxIY5VRX4yN/9VkFaa9ePv5JzCnsl3vZINiDxg=="],
 
-    "@github/copilot-sdk": ["@github/copilot-sdk@0.1.29", "", { "dependencies": { "@github/copilot": "^0.0.420", "vscode-jsonrpc": "^8.2.1", "zod": "^4.3.6" } }, "sha512-GdcN6bJTeesr1HP6IrhN2MznIf1B3ufqd3PX+uKbDLXNriOmP65Ai29/hxzTidNLHyOf6rW4NwmFfkMXiKfCBw=="],
+    "@github/copilot-sdk": ["@github/copilot-sdk@0.1.30", "", { "dependencies": { "@github/copilot": "^0.0.420", "vscode-jsonrpc": "^8.2.1", "zod": "^4.3.6" } }, "sha512-Stg+h8xsPRR0TNGBQfd9laxhJfWZ6DsdpbowcKIZoyKxZvMAbjnY0zyDeOpewJbxWBTJVhBZb5okOq6iaPNMZw=="],
 
     "@github/copilot-win32-arm64": ["@github/copilot-win32-arm64@0.0.420", "", { "os": "win32", "cpu": "arm64", "bin": { "copilot-win32-arm64": "copilot.exe" } }, "sha512-Njlc2j9vYSBAL+lC6FIEhQ3C+VxO3xavwKnw0ecVRiNLcGLyPrTdzPfPQOmEjC63gpVCqLabikoDGv8fuLPA2w=="],
 
