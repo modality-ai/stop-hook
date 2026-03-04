@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.2.0"
+readonly VERSION="2.2.1"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -442,6 +442,29 @@ start_timeout_monitor() {
 }
 
 # =============================================================================
+# Line Buffering Helper: Force unbuffered output for streaming
+# =============================================================================
+
+make_unbuffered() {
+  local cmd="$1"
+  # Force line buffering so child process output streams in real-time
+  # instead of accumulating in full-buffered pipes.
+  # Priority: stdbuf (Linux/GNU) > unbuffer (expect pkg) > plain bash (safe fallback)
+  # NOTE: script -q /dev/null does NOT work when stdout is redirected to file/pipe
+  #       (fails with "tcgetattr/ioctl: Operation not supported on socket")
+  if command -v stdbuf &>/dev/null; then
+    printf 'stdbuf -oL -eL bash -c %s' "$(printf '%q' "$cmd")"
+  elif command -v unbuffer &>/dev/null; then
+    printf 'unbuffer -p bash -c %s' "$(printf '%q' "$cmd")"
+  else
+    # No unbuffering tool available — use plain bash.
+    # Shell builtins (echo, printf) flush per-call anyway;
+    # only external C programs (ls, grep) use libc buffering.
+    printf 'bash -c %s' "$(printf '%q' "$cmd")"
+  fi
+}
+
+# =============================================================================
 # Ordered Output: FIFO merger for stdout/stderr interleaving
 # =============================================================================
 
@@ -479,7 +502,7 @@ ordered_spawn() {
   } &
   ORD_MERGER_PID=$!
 
-  ( set +e; eval "$command"; exit $? ) < /dev/stdin > "$fifo_out" 2> "$fifo_err" &
+  ( set +e; eval "$(make_unbuffered "$command")"; exit $? ) < /dev/stdin > "$fifo_out" 2> "$fifo_err" &
   ORD_CMD_PID=$!
 }
 
