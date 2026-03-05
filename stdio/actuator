@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.3.0"
+readonly VERSION="2.3.1"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -484,7 +484,10 @@ ordered_spawn() {
   } &
   ORD_MERGER_PID=$!
 
-  ( set +e; eval "$command"; exit $? ) < /dev/stdin > "$fifo_out" 2> "$fifo_err" &
+  ( set +e
+    _se=$(bash -n -c "$command" 2>&1) || { printf 'syntax error: %s\n' "${_se##*: }" >&2; exit 2; }
+    eval "$command"; exit $?
+  ) < /dev/stdin > "$fifo_out" 2> "$fifo_err" &
   ORD_CMD_PID=$!
 }
 
