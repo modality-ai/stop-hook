@@ -810,7 +810,9 @@ const initSession = async (
                 }
 
                 // Start streaming monitor for logging (non-blocking)
-                const streamProc = { ref: null as ReturnType<typeof Bun.spawn> | null };
+                const streamProc = {
+                  ref: null as ReturnType<typeof Bun.spawn> | null,
+                };
                 let actuatorTimer: NodeJS.Timeout | null = null;
                 if (actuatorId) {
                   actuatorTimer = setTimeout(async () => {
@@ -853,7 +855,9 @@ const initSession = async (
                 // Clean up streaming monitor — kill process to prevent zombie
                 if (actuatorTimer) {
                   clearTimeout(actuatorTimer);
-                  try { streamProc.ref?.kill(); } catch {}
+                  try {
+                    streamProc.ref?.kill();
+                  } catch {}
                 }
                 const relayFile = `${COPILOT_LOOP_DIR}/.relay-${getSessionId()}`;
                 const commandArr = [];
@@ -870,6 +874,9 @@ const initSession = async (
                       ? `dd >&2 2>/dev/null < ${stderrFile}; rm -f ${stderrFile}`
                       : `cat ${stderrFile} >&2; rm -f ${stderrFile}`
                   );
+                }
+                if (!commandArr.length) {
+                  commandArr.push("cat /dev/null"); // No output, but ensure have cat
                 }
                 commandArr.push(`(exit ${result.exit_code ?? 1})`);
                 logger.log(
