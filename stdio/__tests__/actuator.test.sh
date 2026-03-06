@@ -11,6 +11,7 @@ check() {
 
 D=/tmp/actuator-test-$$
 export ACTUATOR_POLL_INTERVAL=0.1
+export ACTUATOR_POLL_BACKOFF="0.05 0.05 0.05 0.05 0.05"
 echo "=== actuator tests ==="
 
 # -- sync --
@@ -25,7 +26,7 @@ check "sync fail → exit_code 1" '"exit_code":1' "$out"
 job_out=$(ACTUATOR_JOBS_DIR=$D "$ACTUATOR" -a -q "echo async_ok" 2>&1)
 check "async → running" '"status":"running"' "$job_out"
 job_id=$(echo "$job_out" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
-sleep 0.5
+sleep 0.2
 poll_out=$(ACTUATOR_JOBS_DIR=$D "$ACTUATOR" -p "$job_id" 2>&1)
 check "async poll → completed" '"status":"completed"' "$poll_out"
 check "async poll → stdout" 'async_ok' "$poll_out"

@@ -10,6 +10,7 @@ readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
 readonly STATUS_INTERVAL="${ACTUATOR_STATUS_INTERVAL:-2}"
 readonly POLL_INTERVAL="${ACTUATOR_POLL_INTERVAL:-5}"
+readonly POLL_BACKOFF="${ACTUATOR_POLL_BACKOFF:-0.1 0.2 0.5 1 2}"
 readonly OUTPUT_SIZE_THRESHOLD=23000
 readonly DEFAULT_JOB_ID_WIDTH="${ACTUATOR_JOB_ID_WIDTH:-30}"
 
@@ -939,7 +940,7 @@ poll_job() {
   # the wrapper subshell flush its final status to the job file
   if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2> /dev/null; then
     local _retry
-    for _retry in 0.1 0.2 0.5 1 2; do
+    for _retry in $POLL_BACKOFF; do
       sleep "$_retry" 2> /dev/null || true
       load_job_state "$job_id" > /dev/null 2>&1 || true
       [[ "$STATUS" != "running" ]] && break
@@ -994,7 +995,7 @@ poll_job_stream() {
     # the wrapper subshell flush its final status to the job file
     if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2> /dev/null; then
       local _retry
-      for _retry in 0.1 0.2 0.5 1 2; do
+      for _retry in $POLL_BACKOFF; do
         sleep "$_retry" 2> /dev/null || true
         load_job_state "$job_id" > /dev/null 2>&1 || true
         [[ "$STATUS" != "running" ]] && break
