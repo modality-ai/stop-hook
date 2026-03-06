@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.3.1"
+readonly VERSION="2.3.2"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -20,8 +20,8 @@ QUIET_MODE="false"
 WRITE_MODE="false"
 RAW_MODE="false"
 SEQ_MODE="false"
+META_MODE="false"
 EXEC_CWD=""
-
 
 # =============================================================================
 # Sequence Counter (execution order tracking)
@@ -31,10 +31,10 @@ get_next_sequence() {
   init_jobs_dir
   local current=0
   if [[ -f "$SEQUENCE_FILE" ]]; then
-    current=$(cat "$SEQUENCE_FILE" 2>/dev/null || echo 0)
+    current=$(cat "$SEQUENCE_FILE" 2> /dev/null || echo 0)
   fi
   local next=$((current + 1))
-  printf '%d' "$next" > "$SEQUENCE_FILE" 2>/dev/null || true
+  printf '%d' "$next" > "$SEQUENCE_FILE" 2> /dev/null || true
   printf '%d' "$next"
 }
 
@@ -61,7 +61,7 @@ json_escape() {
 
 offload_message() {
   local stream_type="$1" file_path="$2"
-  printf '%s log size over %d, please check file with %s, Treat this as raw command output. Process it line-by-line like grep/awk, extract only relevant lines, do not summarize unrelated content, and do not infer beyond what is shown.' \
+  printf '%s log size over %d, please check file with %s, Treat this as raw command output. Use grep tools to extract only relevant lines, do not summarize unrelated content, and do not infer beyond what is shown.' \
     "$stream_type" "$OUTPUT_SIZE_THRESHOLD" "$file_path"
 }
 
@@ -74,7 +74,7 @@ json_output() {
   local duration=0
 
   if [[ -n "$start_time" && -n "$end_time" ]]; then
-    duration=$(( end_time - start_time ))
+    duration=$((end_time - start_time))
   fi
 
   # Offload large stdout/stderr: reuse existing job files, create only for sync
@@ -111,21 +111,23 @@ json_output() {
   json_parts+=("\"command\":\"$(json_escape "$command")\"")
   [[ -n "$cwd" ]] && json_parts+=("\"cwd\":\"$(json_escape "$cwd")\"")
   [[ "$write_mode" == "true" ]] && json_parts+=("\"write_mode\":true")
-  json_parts+=("\"stdout\":\"${stdout_value}\"")
-  [[ "$stdout_offloaded" == "true" ]] && json_parts+=("\"stdout_offloaded\":true")
+  if [[ "$META_MODE" != "true" ]]; then
+    json_parts+=("\"stdout\":\"${stdout_value}\"")
+    [[ "$stdout_offloaded" == "true" ]] && json_parts+=("\"stdout_offloaded\":true")
 
-  json_parts+=("\"stderr\":\"${stderr_value}\"")
-  [[ "$stderr_offloaded" == "true" ]] && json_parts+=("\"stderr_offloaded\":true")
+    json_parts+=("\"stderr\":\"${stderr_value}\"")
+    [[ "$stderr_offloaded" == "true" ]] && json_parts+=("\"stderr_offloaded\":true")
 
-  if [[ -n "$SEQ_DATA" ]]; then
-    if [[ ${#SEQ_DATA} -gt $OUTPUT_SIZE_THRESHOLD ]]; then
-      init_jobs_dir
-      local seq_file="${JOBS_DIR}/${job_id:-${sequence}}.seq"
-      [[ ! -f "$seq_file" ]] && printf '%s\n' "$SEQ_DATA" > "$seq_file"
-      json_parts+=("\"seq\":\"$(offload_message "seq" "$seq_file")\"")
-      json_parts+=("\"seq_offloaded\":true")
-    else
-      json_parts+=("\"seq\":\"$(json_escape "$SEQ_DATA")\"")
+    if [[ -n "$SEQ_DATA" ]]; then
+      if [[ ${#SEQ_DATA} -gt $OUTPUT_SIZE_THRESHOLD ]]; then
+        init_jobs_dir
+        local seq_file="${JOBS_DIR}/${job_id:-${sequence}}.seq"
+        [[ ! -f "$seq_file" ]] && printf '%s\n' "$SEQ_DATA" > "$seq_file"
+        json_parts+=("\"seq\":\"$(offload_message "seq" "$seq_file")\"")
+        json_parts+=("\"seq_offloaded\":true")
+      else
+        json_parts+=("\"seq\":\"$(json_escape "$SEQ_DATA")\"")
+      fi
     fi
   fi
 
@@ -151,13 +153,13 @@ plain_output() {
   local duration=0
 
   if [[ -n "$start_time" && -n "$end_time" ]]; then
-    duration=$(( end_time - start_time ))
+    duration=$((end_time - start_time))
   fi
 
   printf '%s\n' '------ Command Execution Result ------'
-  printf 'Status: %s\n' "$status"
   [[ "$exit_code" -ne -1 ]] && printf 'Exit Code: %d\n' "$exit_code"
   printf 'Command: %s\n' "$command"
+  printf 'Status: %s\n' "$status"
   [[ -n "$cwd" ]] && printf 'Working Directory: %s\n' "$cwd"
   [[ "$write_mode" == "true" ]] && printf 'Write Mode: yes\n'
   printf 'Duration: %d seconds\n' "$duration"
@@ -169,22 +171,24 @@ plain_output() {
     printf 'PID: %s\n' "$pid"
   fi
 
-  if [[ -n "$stdout_data" ]]; then
-    printf '%s\n' ''
-    printf '%s\n' '------ Standard Output ------'
-    printf '%s\n' "$stdout_data"
-  fi
+  if [[ "$META_MODE" != "true" ]]; then
+    if [[ -n "$stdout_data" ]]; then
+      printf '%s\n' ''
+      printf '%s\n' '------ Standard Output ------'
+      printf '%s\n' "$stdout_data"
+    fi
 
-  if [[ -n "$stderr_data" ]]; then
-    printf '%s\n' ''
-    printf '%s\n' '------ Standard Error ------'
-    printf '%s\n' "$stderr_data"
-  fi
+    if [[ -n "$stderr_data" ]]; then
+      printf '%s\n' ''
+      printf '%s\n' '------ Standard Error ------'
+      printf '%s\n' "$stderr_data"
+    fi
 
-  if [[ -n "$SEQ_DATA" ]]; then
-    printf '%s\n' ''
-    printf '%s\n' '------ Output Sequence ------'
-    printf '%s\n' "$SEQ_DATA"
+    if [[ -n "$SEQ_DATA" ]]; then
+      printf '%s\n' ''
+      printf '%s\n' '------ Output Sequence ------'
+      printf '%s\n' "$SEQ_DATA"
+    fi
   fi
 }
 
@@ -202,7 +206,7 @@ emit_result() {
       printf '%s\n' "$stdout_data"
     fi
     local cmd_exit_code="$2"
-    [[ "$cmd_exit_code" -ge 0 ]] 2>/dev/null && return "$cmd_exit_code"
+    [[ "$cmd_exit_code" -ge 0 ]] 2> /dev/null && return "$cmd_exit_code"
     return 0
   fi
 
@@ -231,7 +235,7 @@ emit_result() {
 json_status_update() {
   [[ "$PLAIN_MODE" == "true" ]] && return
   local status="$1" job_id="$2" message="${3:-}"
-  cat <<ENDJSON
+  cat << ENDJSON
 {"event": "status_update", "status": "$(json_escape "$status")", "job_id": "$(json_escape "$job_id")", "message": "$(json_escape "$message")", "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 ENDJSON
 }
@@ -359,7 +363,7 @@ load_job_state() {
 
 kill_child() {
   local pid="$1" signal="${2:-TERM}"
-  kill -"$signal" "$pid" 2>/dev/null || true
+  kill -"$signal" "$pid" 2> /dev/null || true
 }
 
 # Global state for signal handler (avoids quote escaping issues in trap strings)
@@ -382,26 +386,26 @@ handle_signal() {
   local exit_code
 
   case "$signal_name" in
-    INT)  exit_code=130 ;;
+    INT) exit_code=130 ;;
     TERM) exit_code=143 ;;
-    *)    exit_code=1 ;;
+    *) exit_code=1 ;;
   esac
 
   # Kill child process immediately
   if [[ -n "$TRAP_CMD_PID" ]]; then
     kill_child "$TRAP_CMD_PID" KILL
-    wait "$TRAP_CMD_PID" 2>/dev/null || true
+    wait "$TRAP_CMD_PID" 2> /dev/null || true
   fi
 
   # Wait for merger to finish processing remaining output
   if [[ -n "$ORD_MERGER_PID" ]]; then
-    wait "$ORD_MERGER_PID" 2>/dev/null || true
+    wait "$ORD_MERGER_PID" 2> /dev/null || true
   fi
 
   # Kill timeout monitor if active
   if [[ -n "${TIMEOUT_MONITOR_PID:-}" ]]; then
     kill_child "$TIMEOUT_MONITOR_PID" KILL
-    wait "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
+    wait "$TIMEOUT_MONITOR_PID" 2> /dev/null || true
   fi
 
   local end_time
@@ -409,16 +413,16 @@ handle_signal() {
 
   # Capture whatever output was produced before interruption
   local stdout_data="" stderr_data=""
-  [[ -f "$TRAP_STDOUT_FILE" ]] && stdout_data=$(cat "$TRAP_STDOUT_FILE" 2>/dev/null || true)
-  [[ -f "$TRAP_STDERR_FILE" ]] && stderr_data=$(cat "$TRAP_STDERR_FILE" 2>/dev/null || true)
+  [[ -f "$TRAP_STDOUT_FILE" ]] && stdout_data=$(cat "$TRAP_STDOUT_FILE" 2> /dev/null || true)
+  [[ -f "$TRAP_STDERR_FILE" ]] && stderr_data=$(cat "$TRAP_STDERR_FILE" 2> /dev/null || true)
 
   # Capture seq data if available
   if [[ -n "$TRAP_SEQ_FILE" && -f "$TRAP_SEQ_FILE" ]]; then
-    [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$TRAP_SEQ_FILE" 2>/dev/null || true)
+    [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$TRAP_SEQ_FILE" 2> /dev/null || true)
   fi
 
   rm -f "$TRAP_STDOUT_FILE" "$TRAP_STDERR_FILE" "$TRAP_SEQ_FILE"
-  rm -f "${ORD_FIFOS[@]}" 2>/dev/null || true
+  rm -f "${ORD_FIFOS[@]}" 2> /dev/null || true
 
   emit_result "$WRITE_MODE" "false" "interrupted" "$exit_code" "$TRAP_COMMAND" "$stdout_data" "$stderr_data" "$TRAP_START_TIME" "$end_time" "" "" "$EXEC_SEQUENCE" "$EXEC_CWD"
   exit "$exit_code"
@@ -432,11 +436,11 @@ start_timeout_monitor() {
   local pid="$1" timeout="$2"
 
   {
-    sleep "$timeout" 2>/dev/null
-    if kill -0 "$pid" 2>/dev/null; then
+    sleep "$timeout" 2> /dev/null
+    if kill -0 "$pid" 2> /dev/null; then
       kill_child "$pid" TERM
       sleep 2
-      kill -0 "$pid" 2>/dev/null && kill_child "$pid" KILL
+      kill -0 "$pid" 2> /dev/null && kill_child "$pid" KILL
     fi
   } &
   TIMEOUT_MONITOR_PID=$!
@@ -453,7 +457,7 @@ seq_split_reader() {
   # Bash while-read instead of mawk: mawk -W interactive truncates lines at 4096 bytes,
   # silently breaking output capture for long lines (e.g. JSON blobs).
   # Open file descriptors once to avoid per-line open/close overhead.
-  exec 3>>"$stdout_file" 4>>"$stderr_file" 5>>"$seq_file"
+  exec 3>> "$stdout_file" 4>> "$stderr_file" 5>> "$seq_file"
   while IFS=$'\t' read -r tag content; do
     if [[ "$tag" == "out" ]]; then
       printf '%s\n' "$content" >&3
@@ -477,16 +481,22 @@ ordered_spawn() {
   ORD_FIFOS=("$fifo_out" "$fifo_err")
 
   {
-    { sed -u 's/^/out\t/' < "$fifo_out" &
+    {
+      sed -u 's/^/out\t/' < "$fifo_out" &
       sed -u 's/^/err\t/' < "$fifo_err" &
       wait
     } | seq_split_reader "$stdout_file" "$stderr_file" "$seq_file" "$tee_output"
   } &
   ORD_MERGER_PID=$!
 
-  ( set +e
-    _se=$(bash -n -c "$command" 2>&1) || { printf 'syntax error: %s\n' "${_se##*: }" >&2; exit 2; }
-    eval "$command"; exit $?
+  (
+    set +e
+    _se=$(bash -n -c "$command" 2>&1) || {
+      printf 'syntax error: %s\n' "${_se##*: }" >&2
+      exit 2
+    }
+    eval "$command"
+    exit $?
   ) < /dev/stdin > "$fifo_out" 2> "$fifo_err" &
   ORD_CMD_PID=$!
 }
@@ -496,16 +506,16 @@ ordered_exec() {
   local command="$1" stdout_file="$2" stderr_file="$3" seq_file="$4" tee_output="${5:-false}"
   ordered_spawn "$command" "$stdout_file" "$stderr_file" "$seq_file" "$tee_output"
   local exit_code=0
-  wait "$ORD_CMD_PID" 2>/dev/null || exit_code=$?
-  wait "$ORD_MERGER_PID" 2>/dev/null || true
+  wait "$ORD_CMD_PID" 2> /dev/null || exit_code=$?
+  wait "$ORD_MERGER_PID" 2> /dev/null || true
   rm -f "${ORD_FIFOS[@]}"
   return $exit_code
 }
 
 # Cleanup FIFOs after ordered_spawn (for async paths)
 ordered_cleanup() {
-  wait "$ORD_MERGER_PID" 2>/dev/null || true
-  rm -f "${ORD_FIFOS[@]}" 2>/dev/null || true
+  wait "$ORD_MERGER_PID" 2> /dev/null || true
+  rm -f "${ORD_FIFOS[@]}" 2> /dev/null || true
 }
 
 # =============================================================================
@@ -564,15 +574,15 @@ execute_sync() {
       # Polling loop with heartbeat events (seq-based ordering)
       local seq_lines=0
       local poll_count=0
-      local heartbeat_every=$(( ${STATUS_INTERVAL%.*} * 5 ))
+      local heartbeat_every=$((${STATUS_INTERVAL%.*} * 5))
       [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
 
-      while kill -0 "$cmd_pid" 2>/dev/null; do
+      while kill -0 "$cmd_pid" 2> /dev/null; do
         local had_output=false
 
         # Poll seq file for new entries and emit in correct order
         local current_seq
-        current_seq=$(wc -l < "$seq_file" 2>/dev/null | tr -d ' ')
+        current_seq=$(wc -l < "$seq_file" 2> /dev/null | tr -d ' ')
         if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
           while IFS=$'\t' read -r tag sline; do
             if [[ "$tag" == "out" ]]; then
@@ -582,18 +592,18 @@ execute_sync() {
               json_stream_line "stderr" "$sline"
               [[ "$quiet" != "true" ]] && printf '%s\n' "$sline" >&2
             fi
-          done < <(tail -n +"$((seq_lines + 1))" "$seq_file" 2>/dev/null)
+          done < <(tail -n +"$((seq_lines + 1))" "$seq_file" 2> /dev/null)
           seq_lines="$current_seq"
           had_output=true
         fi
 
         # Heartbeat: emit status even when no new output
-        (( poll_count++ )) || true
-        if [[ "$had_output" == "false" && $(( poll_count % heartbeat_every )) -eq 0 ]]; then
-          local elapsed=$(( $(date +%s) - start_time ))
+        ((poll_count++)) || true
+        if [[ "$had_output" == "false" && $((poll_count % heartbeat_every)) -eq 0 ]]; then
+          local elapsed=$(($(date +%s) - start_time))
           local out_bytes err_bytes
-          out_bytes=$(wc -c < "$stdout_file" 2>/dev/null | tr -d ' ')
-          err_bytes=$(wc -c < "$stderr_file" 2>/dev/null | tr -d ' ')
+          out_bytes=$(wc -c < "$stdout_file" 2> /dev/null | tr -d ' ')
+          err_bytes=$(wc -c < "$stderr_file" 2> /dev/null | tr -d ' ')
           if [[ "$PLAIN_MODE" == "true" ]]; then
             [[ "$QUIET_MODE" != "true" ]] && printf '[heartbeat] running %ds stdout=%sB stderr=%sB\n' \
               "$elapsed" "${out_bytes:-0}" "${err_bytes:-0}"
@@ -604,15 +614,15 @@ execute_sync() {
         fi
 
         sleep "$POLL_INTERVAL" &
-        wait $! 2>/dev/null || true
+        wait $! 2> /dev/null || true
       done
 
       # Flush remaining lines after process exits
-      wait "$cmd_pid" 2>/dev/null || exit_code=$?
+      wait "$cmd_pid" 2> /dev/null || exit_code=$?
       ordered_cleanup
 
       local current_seq
-      current_seq=$(wc -l < "$seq_file" 2>/dev/null | tr -d ' ')
+      current_seq=$(wc -l < "$seq_file" 2> /dev/null | tr -d ' ')
       if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
         while IFS=$'\t' read -r tag sline; do
           if [[ "$tag" == "out" ]]; then
@@ -622,28 +632,28 @@ execute_sync() {
             json_stream_line "stderr" "$sline"
             [[ "$quiet" != "true" ]] && printf '%s\n' "$sline" >&2
           fi
-        done < <(tail -n +"$((seq_lines + 1))" "$seq_file" 2>/dev/null)
+        done < <(tail -n +"$((seq_lines + 1))" "$seq_file" 2> /dev/null)
       fi
 
       end_time=$(date +%s)
 
       # Kill timeout monitor if active
       if [[ -n "$TIMEOUT_MONITOR_PID" ]]; then
-        kill "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
-        wait "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
+        kill "$TIMEOUT_MONITOR_PID" 2> /dev/null || true
+        wait "$TIMEOUT_MONITOR_PID" 2> /dev/null || true
       fi
 
       local status="completed"
-      if [[ "$timeout" -gt 0 && ( "$exit_code" -eq 137 || "$exit_code" -eq 143 ) ]]; then
+      if [[ "$timeout" -gt 0 && ("$exit_code" -eq 137 || "$exit_code" -eq 143) ]]; then
         status="timeout"
       elif [[ "$exit_code" -ne 0 ]]; then
         status="failed"
       fi
 
       local stdout_data stderr_data
-      stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
-      stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
-      [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
+      stdout_data=$(cat "$stdout_file" 2> /dev/null || true)
+      stderr_data=$(cat "$stderr_file" 2> /dev/null || true)
+      [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$seq_file" 2> /dev/null || true)
       rm -f "$stdout_file" "$stderr_file" "$seq_file"
 
       emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "$cmd_pid" "$EXEC_SEQUENCE" "$EXEC_CWD"
@@ -663,21 +673,21 @@ execute_sync() {
     end_time=$(date +%s)
 
     if [[ -n "$TIMEOUT_MONITOR_PID" ]]; then
-      kill "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
-      wait "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
+      kill "$TIMEOUT_MONITOR_PID" 2> /dev/null || true
+      wait "$TIMEOUT_MONITOR_PID" 2> /dev/null || true
     fi
 
     local status="completed"
-    if [[ "$timeout" -gt 0 && ( "$exit_code" -eq 137 || "$exit_code" -eq 143 ) ]]; then
+    if [[ "$timeout" -gt 0 && ("$exit_code" -eq 137 || "$exit_code" -eq 143) ]]; then
       status="timeout"
     elif [[ "$exit_code" -ne 0 ]]; then
       status="failed"
     fi
 
     local stdout_data stderr_data
-    stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
-    stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
-    [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
+    stdout_data=$(cat "$stdout_file" 2> /dev/null || true)
+    stderr_data=$(cat "$stderr_file" 2> /dev/null || true)
+    [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$seq_file" 2> /dev/null || true)
     rm -f "$stdout_file" "$stderr_file" "$seq_file"
 
     emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE" "$EXEC_CWD"
@@ -710,14 +720,14 @@ execute_sync() {
     # Poll seq file for new entries and emit in correct interleaved order
     local seq_lines=0
     local poll_count=0
-    local heartbeat_every=$(( ${STATUS_INTERVAL%.*} * 5 ))
+    local heartbeat_every=$((${STATUS_INTERVAL%.*} * 5))
     [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
 
-    while kill -0 "$cmd_pid" 2>/dev/null; do
+    while kill -0 "$cmd_pid" 2> /dev/null; do
       local had_output=false
 
       local current_seq
-      current_seq=$(wc -l < "$seq_file" 2>/dev/null | tr -d ' ')
+      current_seq=$(wc -l < "$seq_file" 2> /dev/null | tr -d ' ')
       if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
         while IFS=$'\t' read -r tag sline; do
           if [[ "$tag" == "out" ]]; then
@@ -725,18 +735,18 @@ execute_sync() {
           else
             json_stream_line "stderr" "$sline"
           fi
-        done < <(tail -n +"$((seq_lines + 1))" "$seq_file" 2>/dev/null)
+        done < <(tail -n +"$((seq_lines + 1))" "$seq_file" 2> /dev/null)
         seq_lines="$current_seq"
         had_output=true
       fi
 
       # Heartbeat: emit status even when no new output
-      (( poll_count++ )) || true
-      if [[ "$had_output" == "false" && $(( poll_count % heartbeat_every )) -eq 0 ]]; then
-        local elapsed=$(( $(date +%s) - start_time ))
+      ((poll_count++)) || true
+      if [[ "$had_output" == "false" && $((poll_count % heartbeat_every)) -eq 0 ]]; then
+        local elapsed=$(($(date +%s) - start_time))
         local out_bytes err_bytes
-        out_bytes=$(wc -c < "$stdout_file" 2>/dev/null | tr -d ' ')
-        err_bytes=$(wc -c < "$stderr_file" 2>/dev/null | tr -d ' ')
+        out_bytes=$(wc -c < "$stdout_file" 2> /dev/null | tr -d ' ')
+        err_bytes=$(wc -c < "$stderr_file" 2> /dev/null | tr -d ' ')
         if [[ "$PLAIN_MODE" == "true" ]]; then
           printf '[heartbeat] running %ds stdout=%sB stderr=%sB\n' \
             "$elapsed" "${out_bytes:-0}" "${err_bytes:-0}"
@@ -747,15 +757,15 @@ execute_sync() {
       fi
 
       sleep "$POLL_INTERVAL" &
-      wait $! 2>/dev/null || true
+      wait $! 2> /dev/null || true
     done
 
     # Flush remaining lines after process exits
-    wait "$cmd_pid" 2>/dev/null || exit_code=$?
+    wait "$cmd_pid" 2> /dev/null || exit_code=$?
     ordered_cleanup
 
     local current_seq
-    current_seq=$(wc -l < "$seq_file" 2>/dev/null | tr -d ' ')
+    current_seq=$(wc -l < "$seq_file" 2> /dev/null | tr -d ' ')
     if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
       while IFS=$'\t' read -r tag sline; do
         if [[ "$tag" == "out" ]]; then
@@ -763,14 +773,14 @@ execute_sync() {
         else
           json_stream_line "stderr" "$sline"
         fi
-      done < <(tail -n +"$((seq_lines + 1))" "$seq_file" 2>/dev/null)
+      done < <(tail -n +"$((seq_lines + 1))" "$seq_file" 2> /dev/null)
     fi
   else
-    while kill -0 "$cmd_pid" 2>/dev/null; do
+    while kill -0 "$cmd_pid" 2> /dev/null; do
       sleep 0.1 &
-      wait $! 2>/dev/null || true
+      wait $! 2> /dev/null || true
     done
-    wait "$cmd_pid" 2>/dev/null || exit_code=$?
+    wait "$cmd_pid" 2> /dev/null || exit_code=$?
     ordered_cleanup
   fi
 
@@ -778,22 +788,22 @@ execute_sync() {
 
   # Kill timeout monitor if active
   if [[ -n "$TIMEOUT_MONITOR_PID" ]]; then
-    kill "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
-    wait "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
+    kill "$TIMEOUT_MONITOR_PID" 2> /dev/null || true
+    wait "$TIMEOUT_MONITOR_PID" 2> /dev/null || true
   fi
 
   # Check if killed by timeout (SIGTERM=143, SIGKILL=137)
   local status="completed"
-  if [[ "$timeout" -gt 0 && ( "$exit_code" -eq 137 || "$exit_code" -eq 143 ) ]]; then
+  if [[ "$timeout" -gt 0 && ("$exit_code" -eq 137 || "$exit_code" -eq 143) ]]; then
     status="timeout"
   elif [[ "$exit_code" -ne 0 ]]; then
     status="failed"
   fi
 
   local stdout_data stderr_data
-  stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
-  stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
-  [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
+  stdout_data=$(cat "$stdout_file" 2> /dev/null || true)
+  stderr_data=$(cat "$stderr_file" 2> /dev/null || true)
+  [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$seq_file" 2> /dev/null || true)
 
   rm -f "$stdout_file" "$stderr_file" "$seq_file"
 
@@ -860,19 +870,19 @@ execute_async() {
       start_timeout_monitor "$cmd_pid" "$timeout"
     fi
 
-    wait "$cmd_pid" 2>/dev/null || exit_code=$?
+    wait "$cmd_pid" 2> /dev/null || exit_code=$?
     ordered_cleanup
     local end_time
     end_time=$(date +%s)
 
     # Kill timeout monitor if active
     if [[ -n "$TIMEOUT_MONITOR_PID" ]]; then
-      kill "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
-      wait "$TIMEOUT_MONITOR_PID" 2>/dev/null || true
+      kill "$TIMEOUT_MONITOR_PID" 2> /dev/null || true
+      wait "$TIMEOUT_MONITOR_PID" 2> /dev/null || true
     fi
 
     local status="completed"
-    if [[ "$timeout" -gt 0 && ( "$exit_code" -eq 137 || "$exit_code" -eq 143 ) ]]; then
+    if [[ "$timeout" -gt 0 && ("$exit_code" -eq 137 || "$exit_code" -eq 143) ]]; then
       status="timeout"
     elif [[ "$exit_code" -ne 0 ]]; then
       status="failed"
@@ -881,9 +891,9 @@ execute_async() {
     update_job_status "$job_id" "$status" "$exit_code"
 
     local stdout_data stderr_data
-    stdout_data=$(cat "$stdout_file" 2>/dev/null || true)
-    stderr_data=$(cat "$stderr_file" 2>/dev/null || true)
-    [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$seq_file" 2>/dev/null || true)
+    stdout_data=$(cat "$stdout_file" 2> /dev/null || true)
+    stderr_data=$(cat "$stderr_file" 2> /dev/null || true)
+    [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$seq_file" 2> /dev/null || true)
 
     emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "$job_id" "$cmd_pid" "$EXEC_SEQUENCE" "$EXEC_CWD"
     return
@@ -927,10 +937,10 @@ poll_job() {
 
   # Check if process is still running — retry with backoff to let
   # the wrapper subshell flush its final status to the job file
-  if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2>/dev/null; then
+  if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2> /dev/null; then
     local _retry
     for _retry in 0.1 0.2 0.5 1 2; do
-      sleep "$_retry" 2>/dev/null || true
+      sleep "$_retry" 2> /dev/null || true
       load_job_state "$job_id" > /dev/null 2>&1 || true
       [[ "$STATUS" != "running" ]] && break
     done
@@ -943,9 +953,9 @@ poll_job() {
   fi
 
   local stdout_data="" stderr_data=""
-  [[ -f "$STDOUT_FILE" ]] && stdout_data=$(cat "$STDOUT_FILE" 2>/dev/null || true)
-  [[ -f "$STDERR_FILE" ]] && stderr_data=$(cat "$STDERR_FILE" 2>/dev/null || true)
-  [[ "$SEQ_MODE" == "true" && -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]] && SEQ_DATA=$(cut -f2- "$SEQ_FILE" 2>/dev/null || true)
+  [[ -f "$STDOUT_FILE" ]] && stdout_data=$(cat "$STDOUT_FILE" 2> /dev/null || true)
+  [[ -f "$STDERR_FILE" ]] && stderr_data=$(cat "$STDERR_FILE" 2> /dev/null || true)
+  [[ "$SEQ_MODE" == "true" && -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]] && SEQ_DATA=$(cut -f2- "$SEQ_FILE" 2> /dev/null || true)
 
   if [[ "$plain" == "true" ]]; then
     plain_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
@@ -961,7 +971,7 @@ poll_job_stream() {
   local plain="${2:-false}"
   local JOB_ID PID COMMAND STATUS START_TIME STDOUT_FILE STDERR_FILE EXIT_CODE END_TIME CWD WRITE_MODE SEQ_FILE
   local poll_count=0
-  local heartbeat_every=$(( ${STATUS_INTERVAL%.*} * 5 ))
+  local heartbeat_every=$((${STATUS_INTERVAL%.*} * 5))
   [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
 
   load_job_state "$job_id" || return 1
@@ -982,10 +992,10 @@ poll_job_stream() {
 
     # Check if process is still running — retry with backoff to let
     # the wrapper subshell flush its final status to the job file
-    if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2>/dev/null; then
+    if [[ "$STATUS" == "running" ]] && ! kill -0 "$PID" 2> /dev/null; then
       local _retry
       for _retry in 0.1 0.2 0.5 1 2; do
-        sleep "$_retry" 2>/dev/null || true
+        sleep "$_retry" 2> /dev/null || true
         load_job_state "$job_id" > /dev/null 2>&1 || true
         [[ "$STATUS" != "running" ]] && break
       done
@@ -1002,7 +1012,7 @@ poll_job_stream() {
     # Poll seq file for new entries and emit in correct interleaved order
     if [[ -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]]; then
       local current_seq
-      current_seq=$(wc -l < "$SEQ_FILE" 2>/dev/null | tr -d ' ')
+      current_seq=$(wc -l < "$SEQ_FILE" 2> /dev/null | tr -d ' ')
       if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
         while IFS=$'\t' read -r tag sline; do
           if [[ "$tag" == "out" ]]; then
@@ -1018,7 +1028,7 @@ poll_job_stream() {
               json_stream_line "stderr" "$sline"
             fi
           fi
-        done < <(tail -n +"$((seq_lines + 1))" "$SEQ_FILE" 2>/dev/null)
+        done < <(tail -n +"$((seq_lines + 1))" "$SEQ_FILE" 2> /dev/null)
         seq_lines="$current_seq"
         had_output=true
       fi
@@ -1026,10 +1036,10 @@ poll_job_stream() {
       # Fallback: no seq file, poll stdout/stderr separately (legacy jobs)
       if [[ -f "$STDOUT_FILE" ]]; then
         local current_out
-        current_out=$(wc -l < "$STDOUT_FILE" 2>/dev/null | tr -d ' ')
+        current_out=$(wc -l < "$STDOUT_FILE" 2> /dev/null | tr -d ' ')
         if [[ "${current_out:-0}" -gt "$out_lines" ]]; then
           local lines_to_emit
-          lines_to_emit=$(tail -n +"$((out_lines + 1))" "$STDOUT_FILE" 2>/dev/null)
+          lines_to_emit=$(tail -n +"$((out_lines + 1))" "$STDOUT_FILE" 2> /dev/null)
           while IFS= read -r line; do
             if [[ "$plain" == "true" ]]; then
               printf '%s\n' "$line"
@@ -1043,10 +1053,10 @@ poll_job_stream() {
       fi
       if [[ -f "$STDERR_FILE" ]]; then
         local current_err
-        current_err=$(wc -l < "$STDERR_FILE" 2>/dev/null | tr -d ' ')
+        current_err=$(wc -l < "$STDERR_FILE" 2> /dev/null | tr -d ' ')
         if [[ "${current_err:-0}" -gt "$err_lines" ]]; then
           local lines_to_emit
-          lines_to_emit=$(tail -n +"$((err_lines + 1))" "$STDERR_FILE" 2>/dev/null)
+          lines_to_emit=$(tail -n +"$((err_lines + 1))" "$STDERR_FILE" 2> /dev/null)
           while IFS= read -r line; do
             if [[ "$plain" == "true" ]]; then
               printf '[stderr] %s\n' "$line"
@@ -1061,13 +1071,13 @@ poll_job_stream() {
     fi
 
     # Heartbeat: emit status even when no new output
-    (( poll_count++ )) || true
-    if [[ "$had_output" == "false" && $(( poll_count % heartbeat_every )) -eq 0 ]]; then
+    ((poll_count++)) || true
+    if [[ "$had_output" == "false" && $((poll_count % heartbeat_every)) -eq 0 ]]; then
       local out_bytes=0 err_bytes=0
-      [[ -f "$STDOUT_FILE" ]] && out_bytes=$(wc -c < "$STDOUT_FILE" 2>/dev/null | tr -d ' ')
-      [[ -f "$STDERR_FILE" ]] && err_bytes=$(wc -c < "$STDERR_FILE" 2>/dev/null | tr -d ' ')
+      [[ -f "$STDOUT_FILE" ]] && out_bytes=$(wc -c < "$STDOUT_FILE" 2> /dev/null | tr -d ' ')
+      [[ -f "$STDERR_FILE" ]] && err_bytes=$(wc -c < "$STDERR_FILE" 2> /dev/null | tr -d ' ')
       if [[ "$plain" == "true" ]]; then
-        local elapsed=$(( $(date +%s) - START_TIME ))
+        local elapsed=$(($(date +%s) - START_TIME))
         printf '[heartbeat] %s %ds stdout=%sB stderr=%sB\n' \
           "$STATUS" "$elapsed" "${out_bytes:-0}" "${err_bytes:-0}"
       else
@@ -1081,46 +1091,50 @@ poll_job_stream() {
       # Flush any remaining streamed lines not yet emitted
       if [[ -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]]; then
         local final_seq
-        final_seq=$(wc -l < "$SEQ_FILE" 2>/dev/null | tr -d ' ')
+        final_seq=$(wc -l < "$SEQ_FILE" 2> /dev/null | tr -d ' ')
         if [[ "${final_seq:-0}" -gt "$seq_lines" ]]; then
           while IFS=$'\t' read -r tag sline; do
             if [[ "$tag" == "out" ]]; then
-              if [[ "$plain" == "true" ]]; then printf '%s\n' "$sline"
+              if [[ "$plain" == "true" ]]; then
+                printf '%s\n' "$sline"
               else json_stream_line "stdout" "$sline"; fi
             else
-              if [[ "$plain" == "true" ]]; then printf '[stderr] %s\n' "$sline"
+              if [[ "$plain" == "true" ]]; then
+                printf '[stderr] %s\n' "$sline"
               else json_stream_line "stderr" "$sline"; fi
             fi
-          done < <(tail -n +"$((seq_lines + 1))" "$SEQ_FILE" 2>/dev/null)
+          done < <(tail -n +"$((seq_lines + 1))" "$SEQ_FILE" 2> /dev/null)
         fi
       else
         # Fallback flush for legacy jobs without seq file
         if [[ -f "$STDOUT_FILE" ]]; then
           local final_out
-          final_out=$(wc -l < "$STDOUT_FILE" 2>/dev/null | tr -d ' ')
+          final_out=$(wc -l < "$STDOUT_FILE" 2> /dev/null | tr -d ' ')
           if [[ "${final_out:-0}" -gt "$out_lines" ]]; then
             while IFS= read -r line; do
-              if [[ "$plain" == "true" ]]; then printf '%s\n' "$line"
+              if [[ "$plain" == "true" ]]; then
+                printf '%s\n' "$line"
               else json_stream_line "stdout" "$line"; fi
-            done < <(tail -n +"$((out_lines + 1))" "$STDOUT_FILE" 2>/dev/null)
+            done < <(tail -n +"$((out_lines + 1))" "$STDOUT_FILE" 2> /dev/null)
           fi
         fi
         if [[ -f "$STDERR_FILE" ]]; then
           local final_err
-          final_err=$(wc -l < "$STDERR_FILE" 2>/dev/null | tr -d ' ')
+          final_err=$(wc -l < "$STDERR_FILE" 2> /dev/null | tr -d ' ')
           if [[ "${final_err:-0}" -gt "$err_lines" ]]; then
             while IFS= read -r line; do
-              if [[ "$plain" == "true" ]]; then printf '[stderr] %s\n' "$line"
+              if [[ "$plain" == "true" ]]; then
+                printf '[stderr] %s\n' "$line"
               else json_stream_line "stderr" "$line"; fi
-            done < <(tail -n +"$((err_lines + 1))" "$STDERR_FILE" 2>/dev/null)
+            done < <(tail -n +"$((err_lines + 1))" "$STDERR_FILE" 2> /dev/null)
           fi
         fi
       fi
       # Emit final state
       local stdout_data="" stderr_data=""
-      [[ -f "$STDOUT_FILE" ]] && stdout_data=$(cat "$STDOUT_FILE" 2>/dev/null || true)
-      [[ -f "$STDERR_FILE" ]] && stderr_data=$(cat "$STDERR_FILE" 2>/dev/null || true)
-      [[ "$SEQ_MODE" == "true" && -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]] && SEQ_DATA=$(cut -f2- "$SEQ_FILE" 2>/dev/null || true)
+      [[ -f "$STDOUT_FILE" ]] && stdout_data=$(cat "$STDOUT_FILE" 2> /dev/null || true)
+      [[ -f "$STDERR_FILE" ]] && stderr_data=$(cat "$STDERR_FILE" 2> /dev/null || true)
+      [[ "$SEQ_MODE" == "true" && -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]] && SEQ_DATA=$(cut -f2- "$SEQ_FILE" 2> /dev/null || true)
       if [[ "$plain" == "true" ]]; then
         plain_output "$STATUS" "${EXIT_CODE:--1}" "$COMMAND" "$stdout_data" "$stderr_data" \
           "$START_TIME" "${END_TIME:-}" "$JOB_ID" "$PID" "$EXEC_SEQUENCE" "${CWD:-}" "${WRITE_MODE:-false}"
@@ -1132,7 +1146,7 @@ poll_job_stream() {
     fi
 
     sleep "$POLL_INTERVAL" &
-    wait $! 2>/dev/null || true
+    wait $! 2> /dev/null || true
   done
 }
 
@@ -1143,11 +1157,11 @@ terminate_job() {
 
   load_job_state "$job_id" || return 1
 
-  if kill -0 "$PID" 2>/dev/null; then
-    kill -"$signal" "$PID" 2>/dev/null
+  if kill -0 "$PID" 2> /dev/null; then
+    kill -"$signal" "$PID" 2> /dev/null
     sleep 1
-    if kill -0 "$PID" 2>/dev/null && [[ "$signal" != "KILL" ]]; then
-      kill -KILL "$PID" 2>/dev/null
+    if kill -0 "$PID" 2> /dev/null && [[ "$signal" != "KILL" ]]; then
+      kill -KILL "$PID" 2> /dev/null
     fi
     update_job_status "$job_id" "terminated" "143"
     json_status_update "terminated" "$job_id" "Process terminated with signal ${signal}"
@@ -1170,10 +1184,10 @@ terminate_all_jobs() {
     source "$job_file" || continue
 
     # Only terminate if running and PID is valid (not 0 or empty)
-    if [[ "$STATUS" == "running" ]] && [[ -n "$PID" && "$PID" != "0" ]] && kill -0 "$PID" 2>/dev/null; then
-      kill -TERM "$PID" 2>/dev/null || true
+    if [[ "$STATUS" == "running" ]] && [[ -n "$PID" && "$PID" != "0" ]] && kill -0 "$PID" 2> /dev/null; then
+      kill -TERM "$PID" 2> /dev/null || true
       sleep 0.5
-      kill -0 "$PID" 2>/dev/null && kill -KILL "$PID" 2>/dev/null || true
+      kill -0 "$PID" 2> /dev/null && kill -KILL "$PID" 2> /dev/null || true
       update_job_status "$JOB_ID" "terminated" "143" || true
 
       if [[ "$plain" == "true" ]]; then
@@ -1309,19 +1323,20 @@ list_jobs() {
   if [[ -n "$filter" && ${#job_files[@]} -gt 0 ]]; then
     local filtered=()
     for f in "${job_files[@]}"; do
-      grep -qi "^COMMAND=.*${filter}" "$f" 2>/dev/null && filtered+=("$f")
+      grep -qi "^COMMAND=.*${filter}" "$f" 2> /dev/null && filtered+=("$f")
     done
     job_files=("${filtered[@]}")
   fi
 
-  # Apply status filter
+  # Apply status filter (prefix match: "run" matches "running", "comp" matches "completed", etc.)
   if [[ -n "$status_filter" && ${#job_files[@]} -gt 0 ]]; then
-    local filtered=() _pid
+    local filtered=() _pid _matched_status
     for f in "${job_files[@]}"; do
-      if grep -qi "^STATUS='${status_filter}'" "$f" 2>/dev/null; then
-        if [[ "$status_filter" == "running" ]]; then
+      _matched_status=$(grep -i "^STATUS='" "$f" 2> /dev/null | sed "s/^STATUS='//;s/'$//" | grep -i "^${status_filter}" | head -1)
+      if [[ -n "$_matched_status" ]]; then
+        if [[ "$_matched_status" == "running" ]]; then
           _pid=$(grep "^PID=" "$f" | sed "s/^PID='//;s/'$//")
-          if [[ -n "$_pid" && "$_pid" != "0" ]] && kill -0 "$_pid" 2>/dev/null; then
+          if [[ -n "$_pid" && "$_pid" != "0" ]] && kill -0 "$_pid" 2> /dev/null; then
             filtered+=("$f")
           else
             update_job_fields "$f" "STATUS='failed'" "EXIT_CODE='1'" "END_TIME='$(date +%s)'"
@@ -1370,7 +1385,7 @@ list_jobs() {
 cleanup_jobs() {
   init_jobs_dir
   local cleaned=0
-  shopt -s nullglob  # Make glob expand to nothing if no matches
+  shopt -s nullglob # Make glob expand to nothing if no matches
   for job_file in "${JOBS_DIR}"/*.job; do
     local JOB_ID="" PID="" STATUS=""
     # shellcheck disable=SC1090
@@ -1383,7 +1398,7 @@ cleanup_jobs() {
     elif [[ -z "$PID" || "$PID" == "0" ]]; then
       # Invalid PID - clean up orphaned job
       should_clean=true
-    elif ! kill -0 "$PID" 2>/dev/null; then
+    elif ! kill -0 "$PID" 2> /dev/null; then
       # Process is dead
       should_clean=true
     fi
@@ -1403,7 +1418,7 @@ cleanup_jobs() {
     rm -f "$output_file"
     ((orphaned++))
   done
-  shopt -u nullglob  # Reset
+  shopt -u nullglob # Reset
   printf '{"cleaned": %d, "orphaned_cleaned": %d, "timestamp": "%s"}\n' "$cleaned" "$orphaned" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 
@@ -1412,13 +1427,14 @@ cleanup_jobs() {
 # =============================================================================
 
 usage() {
-  local _c=0; [[ -t 1 ]] && _c=1
+  local _c=0
+  [[ -t 1 ]] && _c=1
   if [[ $_c -eq 1 ]]; then
     printf '\033[1;35mUniversal CLI Execution Tool\033[0m \033[1;33mv%s\033[0m\n' "$VERSION"
   else
     printf 'Universal CLI Execution Tool v%s\n' "$VERSION"
   fi
-  cat <<'ENDHELP' | awk -v c="$_c" '
+  cat << 'ENDHELP' | awk -v c="$_c" '
 BEGIN {
   if (c+0) {
     B="\033[1m"; R="\033[0m"; Y="\033[1;33m"
@@ -1456,7 +1472,7 @@ OPTIONS:
   --terminate-all         Terminate all running jobs
   -l, --list              List all tracked jobs (JSON output, use --plain for table format)
   --filter <keyword>      Filter job list by command keyword (use with -l, case-insensitive)
-  --status <status>       Filter job list by status: running, completed, failed, timeout, terminated
+  --status <prefix>       Filter job list by status prefix: run→running, comp→completed, fail→failed, etc.
   -n, --limit <N>         Limit job list to N most recent entries (use with -l)
   -L, --id-width <N>      Job ID column width in plain list output (default: 30)
   --cleanup               Remove completed job artifacts
@@ -1466,6 +1482,7 @@ OPTIONS:
                           output JSON/plain result to stderr. Use for commands
                           with shell redirects (e.g., actuator -w --- echo 1 > file)
   --seq                   Include seq (interleaved stdout/stderr) in output (hidden by default)
+  --meta                  Output metadata only; omit stdout, stderr, and seq fields
   --raw                   Raw mode: like --write but suppresses ALL metadata output.
                           Only command stdout goes to actuator stdout. No JSON/plain
                           on stdout or stderr. Metadata saved to job file only
@@ -1542,6 +1559,7 @@ EXAMPLES:
   actuator -l --filter npm           # Show only jobs matching "npm"
   actuator -l --filter npm --plain   # Same in table format
   actuator -l --status running       # Show only running jobs
+  actuator -l --status run           # Same (prefix match)
   actuator -l --status running --plain  # Same in table format
   actuator --terminate-all
   actuator --cleanup
@@ -1562,7 +1580,7 @@ ENDHELP
 # =============================================================================
 
 emit_shell_init() {
-  cat <<'SHELL_INIT'
+  cat << 'SHELL_INIT'
 # Actuator shell wrapper — enables commands that affect the current shell
 # (cd, pushd, popd) to work through actuator.
 # Add to your shell profile: eval "$(actuator --init)"
@@ -1597,7 +1615,7 @@ actuator() {
         ;;
       ---) _collecting=true ;;
       -t|--timeout|-j|--job-id|-p|--poll|-k|--terminate|--filter|--status) _skip_next=true; _has_flags=true ;;
-      -a|--async|-s|--stream|-w|--write|--raw|--seq|-q|--quiet|--plain|-l|--list|--cleanup|--terminate-all|--stdin)
+      -a|--async|-s|--stream|-w|--write|--raw|--seq|--meta|-q|--quiet|--plain|-l|--list|--cleanup|--terminate-all|--stdin)
         _has_flags=true ;;
       -*) ;;
       *)
@@ -1678,7 +1696,7 @@ require_arg() {
 
 main() {
   local command="" mode="sync" timeout="$DEFAULT_TIMEOUT"
-  local stream="false" plain="false" use_tty="false" quiet="false" write_mode="false" raw_mode="false" seq_mode="false"
+  local stream="false" plain="false" use_tty="false" quiet="false" write_mode="false" raw_mode="false" seq_mode="false" meta_mode="false"
   local poll_id="" terminate_id="" terminate_signal="TERM" list_jobs_flag="false" terminate_all_flag="false"
   local custom_job_id="" list_limit="" job_id_width="$DEFAULT_JOB_ID_WIDTH" list_filter="" list_status=""
 
@@ -1707,65 +1725,126 @@ main() {
   # First pass: collect all flags
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -c|--command)
-        require_arg "$1" "$#"; command="$2"; shift 2 ;;
-      -a|--async)
-        mode="async"; shift ;;
-      -j|--job-id)
-        require_arg "$1" "$#"; custom_job_id="$2"; shift 2 ;;
-      -s|--stream)
-        stream="true"; shift ;;
-      -t|--timeout)
-        require_arg "$1" "$#"; timeout="$2"; shift 2 ;;
-      -p|--poll)
-        require_arg "$1" "$#"; poll_id="$2"; shift 2 ;;
-      -k|--terminate)
-        require_arg "$1" "$#"; terminate_id="$2"
+      -c | --command)
+        require_arg "$1" "$#"
+        command="$2"
         shift 2
-        [[ $# -gt 0 && "$1" != -* ]] && { terminate_signal="$1"; shift; }
+        ;;
+      -a | --async)
+        mode="async"
+        shift
+        ;;
+      -j | --job-id)
+        require_arg "$1" "$#"
+        custom_job_id="$2"
+        shift 2
+        ;;
+      -s | --stream)
+        stream="true"
+        shift
+        ;;
+      -t | --timeout)
+        require_arg "$1" "$#"
+        timeout="$2"
+        shift 2
+        ;;
+      -p | --poll)
+        require_arg "$1" "$#"
+        poll_id="$2"
+        shift 2
+        ;;
+      -k | --terminate)
+        require_arg "$1" "$#"
+        terminate_id="$2"
+        shift 2
+        [[ $# -gt 0 && "$1" != -* ]] && {
+          terminate_signal="$1"
+          shift
+        }
         ;;
       --stdin)
-        command=$(cat); shift ;;
+        command=$(cat)
+        shift
+        ;;
       --plain)
-        plain="true"; shift ;;
-      -w|--write)
-        write_mode="true"; shift ;;
+        plain="true"
+        shift
+        ;;
+      -w | --write)
+        write_mode="true"
+        shift
+        ;;
       --raw)
-        raw_mode="true"; write_mode="true"; shift ;;
+        raw_mode="true"
+        write_mode="true"
+        shift
+        ;;
       --seq)
-        seq_mode="true"; shift ;;
-      -q|--quiet)
-        quiet="true"; shift ;;
-      -v|--version)
-        printf '{"version": "%s"}\n' "$VERSION"; exit 0 ;;
+        seq_mode="true"
+        shift
+        ;;
+      --meta)
+        meta_mode="true"
+        shift
+        ;;
+      -q | --quiet)
+        quiet="true"
+        shift
+        ;;
+      -v | --version)
+        printf '{"version": "%s"}\n' "$VERSION"
+        exit 0
+        ;;
       --init)
-        emit_shell_init; exit 0 ;;
-      -h|--help)
-        usage; exit 0 ;;
-      -l|--list)
-        list_jobs_flag="true"; shift ;;
+        emit_shell_init
+        exit 0
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -l | --list)
+        list_jobs_flag="true"
+        shift
+        ;;
       --filter)
-        require_arg "$1" "$#"; list_filter="$2"; shift 2 ;;
+        require_arg "$1" "$#"
+        list_filter="$2"
+        shift 2
+        ;;
       --status)
-        require_arg "$1" "$#"; list_status="$2"; shift 2 ;;
-      -n|--limit)
-        require_arg "$1" "$#"; list_limit="$2"; shift 2 ;;
-      -L|--id-width)
-        require_arg "$1" "$#"; job_id_width="$2"; shift 2 ;;
+        require_arg "$1" "$#"
+        list_status="$2"
+        shift 2
+        ;;
+      -n | --limit)
+        require_arg "$1" "$#"
+        list_limit="$2"
+        shift 2
+        ;;
+      -L | --id-width)
+        require_arg "$1" "$#"
+        job_id_width="$2"
+        shift 2
+        ;;
       --terminate-all)
-        terminate_all_flag="true"; shift ;;
+        terminate_all_flag="true"
+        shift
+        ;;
       --cleanup)
-        cleanup_jobs || true  # Ignore any errors from cleanup
-        wait  # Wait for any remaining background jobs
-        exit 0 ;;
+        cleanup_jobs || true # Ignore any errors from cleanup
+        wait                 # Wait for any remaining background jobs
+        exit 0
+        ;;
       ---)
         shift
         if [[ $# -eq 1 ]]; then
-          command="$1"  # Single arg: preserve as-is (supports "cmd1 && cmd2")
+          command="$1" # Single arg: preserve as-is (supports "cmd1 && cmd2")
         else
-          command=$(printf '%q ' "$@")  # Multiple args: quote each separately
+          command=$(printf '%q ' "$@") # Multiple args: quote each separately
         fi
-        break ;;
+        break
+        ;;
       -*)
         if [[ "$plain" == "true" ]]; then
           printf '%s\n' "------ Error ------" >&2
@@ -1773,9 +1852,12 @@ main() {
         else
           printf '{"status":"error","error":"Unknown option: %s"}\n' "$1" >&2
         fi
-        exit 1 ;;
+        exit 1
+        ;;
       *)
-        command="$*"; break ;;
+        command="$*"
+        break
+        ;;
     esac
   done
 
@@ -1791,6 +1873,7 @@ main() {
   WRITE_MODE="$write_mode"
   RAW_MODE="$raw_mode"
   SEQ_MODE="$seq_mode"
+  META_MODE="$meta_mode"
 
   # Handle deferred actions
   if [[ "$terminate_all_flag" == "true" ]]; then
