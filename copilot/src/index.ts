@@ -782,6 +782,9 @@ const initSession = async (
                   rawCommand = command;
                   escCommand = shellEscape(command);
                 }
+                if (!rawCommand.trim()) {
+                  return { permissionDecision: "allow" };
+                }
                 try {
                   // Start command via actuator async (returns immediately, no output)
                   // NOTE: Do NOT use -w (write mode) with -a (async) — write mode
