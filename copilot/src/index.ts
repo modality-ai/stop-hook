@@ -22,16 +22,17 @@ mkdirSync(COPILOT_LOOP_DIR, { recursive: true });
 
 const LAST_SESSION_FILE = `${COPILOT_LOOP_DIR}/last-session`;
 const MODELS_CACHE_FILE = `${COPILOT_LOOP_DIR}/models.json`;
-const gToolPools = Object.create(null);
-const gToolTimeMap = Object.create(null);
 // Map keyed by jobId: pre-hook sets actuator results, post-hook looks up by jobId to avoid race conditions
 let sessionTimout: NodeJS.Timeout;
 let healthCheckHandle: NodeJS.Timeout;
 let currentSession: CopilotSession;
 // Global session ID - Snowflake-like ID (distributed system friendly)
 let gSessionId = getSessionId();
+const gToolPools = Object.create(null);
+const gToolTimeMap = Object.create(null);
+let gToolRunning = false;
+let gNeedContinue = false;
 let loopId = gSessionId;
-let gAbortController: AbortController | null = null;
 
 /** Shell-escape a string using single quotes (POSIX-safe, handles all metacharacters) */
 const shellEscape = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
@@ -119,7 +120,7 @@ const logger = {
     const filePath = `${COPILOT_LOOP_DIR}/${loopId}-${logType}.txt`;
     appendFileSync(filePath, `${message}\n`);
     clearTimeout(sessionTimout);
-    sessionTimout = setTimeout(() => gAbortController?.abort(), 10 * 60 * 1000); // 10 minutes
+    sessionTimout = setTimeout(() => (gNeedContinue = true), 5 * 60 * 1000); // 10 minutes
   },
 
   log: (message?: any, ...args: any[]) => {
@@ -725,7 +726,7 @@ const initSession = async (
       const denyTools: string[] = promptConfig["denyTools"] ?? [];
       if (denyTools.includes(request?.kind)) {
         logger.log(`🚫 Permission denied for tool: ${request?.kind}`);
-        return { kind: "denied-by-rules" as const };
+        return { kind: "denied-by-rules" as const, rules: [] };
       }
       return { kind: "approved" as const };
     },
@@ -798,10 +799,8 @@ const initSession = async (
                   logger.log(
                     `🐚 Actuator Start: actuator ${actuatorArgs.join(" ")}`
                   );
-                  const startResult = Bun.spawnSync([
-                    "actuator",
-                    ...actuatorArgs,
-                  ]);
+                  const startResult = Bun.spawn(["actuator", ...actuatorArgs]);
+                  gToolRunning = true;
                   if (startResult.exitCode !== 0) {
                     throw new Error(`exit ${startResult.exitCode}`);
                   }
@@ -858,6 +857,7 @@ const initSession = async (
                 // Clean up streaming monitor — kill process to prevent zombie
                 if (actuatorTimer) {
                   clearTimeout(actuatorTimer);
+                  gToolRunning = false;
                   try {
                     streamProc.ref?.kill();
                   } catch {}
@@ -993,6 +993,11 @@ const aiThinking = async (
         );
         resolve(mainResponse);
       }
+      if (gNeedContinue) {
+        say(
+          `Continue — review your progress and proceed with the next step toward completing the task.`
+        );
+      }
     }, 500);
   });
 };
@@ -1000,14 +1005,14 @@ const aiThinking = async (
 const aiCommand = async (prompt: any, aiOption: AIOptions) => {
   const { systemPrompt, mode, currentIteration }: AIOptions = aiOption;
   const abortController = new AbortController();
-  gAbortController = abortController;
   const session = await initSession(systemPrompt, promptConfig);
   currentSession = session;
 
   // Periodic server health check via ping
   const healthCheckIntervalMs = 3000; // 3 seconds
-  const pingTimeoutMs = 1500; // 1 second timeout for ping response
+  const pingTimeoutMs = 1000; // 1 second timeout for ping response
   healthCheckHandle = setInterval(async () => {
+    let timeout = 0;
     try {
       await Promise.race([
         client.ping("O.K."),
@@ -1018,8 +1023,10 @@ const aiCommand = async (prompt: any, aiOption: AIOptions) => {
       writeSync(1, ".");
     } catch (error) {
       logger.error(`⚠️  Server hang detected: ${(error as Error).message}`);
-      abortController.abort();
-      session?.abort?.().catch(() => {});
+      if (timeout >= 3 && !gToolRunning) {
+        abortController.abort();
+      }
+      timeout += 1;
     }
   }, healthCheckIntervalMs);
 
@@ -1043,7 +1050,13 @@ const aiCommand = async (prompt: any, aiOption: AIOptions) => {
     // Race between aiThinking and abort signal
     const response = await Promise.race([
       aiThinking({ prompt }, sendTimeoutMs, session),
-      new Promise<never>((_, reject) => {
+      new Promise((_, reject) => {
+        const interval = setInterval(() => {
+          if (abortController.signal.aborted) {
+            clearInterval(interval);
+            reject(new Error("Operation aborted due to server hang"));
+          }
+        }, 5000);
         abortController.signal.addEventListener("abort", () => {
           reject(new Error("Operation aborted due to server hang"));
         });
@@ -1051,15 +1064,14 @@ const aiCommand = async (prompt: any, aiOption: AIOptions) => {
     ]);
     return response;
   } catch (error) {
+    const errorMessage = (error as Error).message || "";
     if (abortController.signal.aborted) {
       logger.error(
-        "Returning to readline due to server hang - next loop will handle recovery"
+        "Returning to readline due to server hang - next loop will handle recovery",
+        errorMessage
       );
     } else {
-      logger.error(
-        "Error during AI command execution:",
-        (error as Error).message
-      );
+      logger.error("Error during AI command execution:", errorMessage);
     }
     return "";
   } finally {
@@ -1067,7 +1079,7 @@ const aiCommand = async (prompt: any, aiOption: AIOptions) => {
       gSessionId = getSessionId();
     }
     clearInterval(healthCheckHandle);
-    session?.destroy?.().catch(() => {});
+    session.disconnect();
   }
 };
 
@@ -1141,7 +1153,9 @@ const main = async () => {
   const modelOverride = parseCliArgs("--model");
   const personaOverride = parseCliArgs("--persona");
   const loopIdOverride = parseCliArgs("--loop-id");
-  const reasoningEffortOverride = parseCliArgs("--think");
+  const reasoningEffortOverride =
+    parseCliArgs("--think") ??
+    (process.argv.includes("--think") ? "medium" : null);
   const timeout = parseCliArgs("--timeout") || 86400 * 7; // 7 days
 
   // Positional args: everything from argv[2] until first "-" prefixed arg
