@@ -103,8 +103,11 @@ json_output() {
   fi
 
   # Build JSON object as single line (JSONL format)
+  local event_type="end"
+  [[ "$status" == "running" ]] && event_type="start"
   local json_parts=()
-  json_parts+=("\"actuatorJobVersion\":${sequence}")
+  json_parts+=("\"event\":\"${event_type}\"")
+  json_parts+=("\"executeSeq\":${sequence}")
   json_parts+=("\"status\":\"$(json_escape "$status")\"")
 
   [[ "$exit_code" -ne -1 ]] && json_parts+=("\"exit_code\":${exit_code}")
