@@ -799,14 +799,14 @@ const initSession = async (
                   logger.log(
                     `🐚 Actuator Start: actuator ${actuatorArgs.join(" ")}`
                   );
-                  const startResult = Bun.spawn(["actuator", ...actuatorArgs]);
+                  const startResult = Bun.spawnSync(["actuator", ...actuatorArgs]);
                   gToolRunning = true;
                   if (startResult.exitCode !== 0) {
                     throw new Error(`exit ${startResult.exitCode}`);
                   }
                 } catch (e) {
                   logger.error(
-                    `🐚 Actuator start failed, falling back to raw bash`
+                    `🐚 Actuator start failed, falling back to raw bash | jobId=${jobId} | cmd=${rawCommand} | error=${e instanceof Error ? e.message : String(e)}`
                   );
                   return { permissionDecision: "allow" };
                 }

@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.3.2"
+readonly VERSION="2.3.3"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -661,7 +661,7 @@ execute_sync() {
       rm -f "$stdout_file" "$stderr_file" "$seq_file"
 
       emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "$cmd_pid" "$EXEC_SEQUENCE" "$EXEC_CWD"
-      return
+      return $exit_code
     fi
 
     # Non-streaming TTY: Direct foreground execution with ordered output
@@ -695,7 +695,7 @@ execute_sync() {
     rm -f "$stdout_file" "$stderr_file" "$seq_file"
 
     emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE" "$EXEC_CWD"
-    return
+    return $exit_code
   fi
 
   # Non-TTY mode: background with output capture using ordered_spawn
@@ -812,6 +812,7 @@ execute_sync() {
   rm -f "$stdout_file" "$stderr_file" "$seq_file"
 
   emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "$cmd_pid" "$EXEC_SEQUENCE" "$EXEC_CWD"
+  return $exit_code
 }
 
 # =============================================================================
@@ -900,7 +901,7 @@ execute_async() {
     [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$seq_file" 2> /dev/null || true)
 
     emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "$job_id" "$cmd_pid" "$EXEC_SEQUENCE" "$EXEC_CWD"
-    return
+    return $exit_code
   fi
 
   # Background mode: fire-and-forget with job tracking
