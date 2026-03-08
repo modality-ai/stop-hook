@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.3.3"
+readonly VERSION="2.3.4"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -1337,7 +1337,7 @@ list_jobs() {
   if [[ -n "$status_filter" && ${#job_files[@]} -gt 0 ]]; then
     local filtered=() _pid _matched_status
     for f in "${job_files[@]}"; do
-      _matched_status=$(grep -i "^STATUS='" "$f" 2> /dev/null | sed "s/^STATUS='//;s/'$//" | grep -i "^${status_filter}" | head -1)
+      _matched_status=$(grep -i "^STATUS='" "$f" 2> /dev/null | sed "s/^STATUS='//;s/'$//" | grep -i "^${status_filter}" | head -1 || true)
       if [[ -n "$_matched_status" ]]; then
         if [[ "$_matched_status" == "running" ]]; then
           _pid=$(grep "^PID=" "$f" | sed "s/^PID='//;s/'$//")
