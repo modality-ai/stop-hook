@@ -799,7 +799,10 @@ const initSession = async (
                   logger.log(
                     `🐚 Actuator Start: actuator ${actuatorArgs.join(" ")}`
                   );
-                  const startResult = Bun.spawnSync(["actuator", ...actuatorArgs]);
+                  const startResult = Bun.spawnSync([
+                    "actuator",
+                    ...actuatorArgs,
+                  ]);
                   gToolRunning = true;
                   if (startResult.exitCode !== 0) {
                     throw new Error(`exit ${startResult.exitCode}`);
@@ -828,7 +831,7 @@ const initSession = async (
                     let buffer = "";
                     while (true) {
                       const { done, value } = await reader.read();
-                      if (done) break;
+                      if (done || null == actuatorTimer) break;
                       buffer += decoder.decode(value, { stream: true });
                       const lines = buffer.split("\n");
                       buffer = lines.pop() ?? "";
@@ -858,6 +861,7 @@ const initSession = async (
                 if (actuatorTimer) {
                   clearTimeout(actuatorTimer);
                   gToolRunning = false;
+                  actuatorTimer = null;
                   try {
                     streamProc.ref?.kill();
                   } catch {}
