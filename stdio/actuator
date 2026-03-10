@@ -4,12 +4,12 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.3.4"
+readonly VERSION="2.3.5"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
-readonly STATUS_INTERVAL="${ACTUATOR_STATUS_INTERVAL:-2}"
-readonly POLL_INTERVAL="${ACTUATOR_POLL_INTERVAL:-5}"
+readonly STATUS_INTERVAL="${ACTUATOR_STATUS_INTERVAL:-5}"
+readonly POLL_INTERVAL="${ACTUATOR_POLL_INTERVAL:-10}"
 readonly POLL_BACKOFF="${ACTUATOR_POLL_BACKOFF:-0.1 0.2 0.5 1 2}"
 readonly OUTPUT_SIZE_THRESHOLD=23000
 readonly DEFAULT_JOB_ID_WIDTH="${ACTUATOR_JOB_ID_WIDTH:-30}"
