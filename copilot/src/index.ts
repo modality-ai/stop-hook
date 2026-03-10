@@ -120,7 +120,7 @@ const logger = {
     const filePath = `${COPILOT_LOOP_DIR}/${loopId}-${logType}.txt`;
     appendFileSync(filePath, `${message}\n`);
     clearTimeout(sessionTimout);
-    sessionTimout = setTimeout(() => (gNeedContinue = true), 5 * 60 * 1000); // 10 minutes
+    sessionTimout = setTimeout(() => (gNeedContinue = true), 5 * 60 * 1000); // 5 minutes
   },
 
   log: (message?: any, ...args: any[]) => {
@@ -998,6 +998,7 @@ const aiThinking = async (
         resolve(mainResponse);
       }
       if (gNeedContinue) {
+        gNeedContinue = false;
         say(
           `Continue — review your progress and proceed with the next step toward completing the task.`
         );
