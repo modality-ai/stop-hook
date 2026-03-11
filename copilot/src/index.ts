@@ -17,6 +17,19 @@ import {
 import { appendFile } from "fs/promises";
 import { execSync } from "child_process";
 
+type PreToolUseHookOutput = {
+  permissionDecision: "allow" | "deny" | "ask";
+  permissionDecisionReason?: string;
+  modifiedArgs?: Record<string, any>;
+  additionalContext?: string;
+};
+
+interface BashResult {
+  stdout?: string;
+  stderr?: string;
+  exit_code?: number;
+}
+
 const COPILOT_LOOP_DIR = "/tmp/copilot-loop";
 mkdirSync(COPILOT_LOOP_DIR, { recursive: true });
 
@@ -33,6 +46,32 @@ const gToolTimeMap = Object.create(null);
 let gToolRunning = false;
 let gNeedContinue = false;
 let loopId = gSessionId;
+
+// Simple logger wrapper
+const logger = {
+  store: (logType: string, message: string) => {
+    const filePath = `${COPILOT_LOOP_DIR}/${loopId}-${logType}.txt`;
+    appendFileSync(filePath, `${message}\n`);
+    clearTimeout(sessionTimout);
+    sessionTimout = setTimeout(() => (gNeedContinue = true), 5 * 60 * 1000); // 5 minutes
+  },
+
+  log: (message?: any, ...args: any[]) => {
+    logger.store("log", message);
+    console.log(
+      `\n${new Date().toISOString()} ${gSessionId} ${message}`,
+      ...args
+    );
+  },
+
+  error: (message?: any, ...args: any[]) => {
+    logger.store("error", message);
+    console.error(
+      `\n${new Date().toISOString()} ${gSessionId} ${message}`,
+      ...args
+    );
+  },
+};
 
 /** Shell-escape a string using single quotes (POSIX-safe, handles all metacharacters) */
 const shellEscape = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
@@ -106,45 +145,6 @@ const deniedCommands: {
 
 const getDeniedCommand = (command: string) =>
   deniedCommands.find((rule) => rule.test(command)) ?? null;
-
-type PreToolUseHookOutput = {
-  permissionDecision: "allow" | "deny" | "ask";
-  permissionDecisionReason?: string;
-  modifiedArgs?: Record<string, any>;
-  additionalContext?: string;
-};
-
-// Simple logger wrapper
-const logger = {
-  store: (logType: string, message: string) => {
-    const filePath = `${COPILOT_LOOP_DIR}/${loopId}-${logType}.txt`;
-    appendFileSync(filePath, `${message}\n`);
-    clearTimeout(sessionTimout);
-    sessionTimout = setTimeout(() => (gNeedContinue = true), 5 * 60 * 1000); // 5 minutes
-  },
-
-  log: (message?: any, ...args: any[]) => {
-    logger.store("log", message);
-    console.log(
-      `\n${new Date().toISOString()} ${gSessionId} ${message}`,
-      ...args
-    );
-  },
-
-  error: (message?: any, ...args: any[]) => {
-    logger.store("error", message);
-    console.error(
-      `\n${new Date().toISOString()} ${gSessionId} ${message}`,
-      ...args
-    );
-  },
-};
-
-interface BashResult {
-  stdout?: string;
-  stderr?: string;
-  exit_code?: number;
-}
 
 const checkBashResult = (actuatorId: string): BashResult | undefined => {
   const actuatorCmd = `actuator -p ${actuatorId}`;
@@ -999,6 +999,8 @@ const aiThinking = async (
       }
       if (gNeedContinue) {
         gNeedContinue = false;
+        writeSync(1, `\n🩹 Prepare Continue...\n`);
+        session.abort();
         say(
           `Continue — review your progress and proceed with the next step toward completing the task.`
         );
