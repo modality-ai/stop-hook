@@ -670,6 +670,7 @@ const setupSessionEventListener = (session: CopilotSession) => {
         case "session.handoff":
         case "session.snapshot_rewind":
         case "session.compaction_start":
+        case "session.tools_updated":
         case "permission.requested":
         case "permission.completed":
           break;
