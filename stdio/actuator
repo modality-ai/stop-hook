@@ -8,9 +8,13 @@ readonly VERSION="2.3.5"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
+
+# Check if a numeric value (integer or decimal) is > 0
+_gt0() { awk "BEGIN { exit ($1 + 0 > 0) ? 0 : 1 }"; }
 readonly STATUS_INTERVAL="${ACTUATOR_STATUS_INTERVAL:-5}"
 readonly POLL_INTERVAL="${ACTUATOR_POLL_INTERVAL:-10}"
 readonly POLL_BACKOFF="${ACTUATOR_POLL_BACKOFF:-0.1 0.2 0.5 1 2}"
+readonly KILL_GRACE="${ACTUATOR_KILL_GRACE:-3}"
 readonly OUTPUT_SIZE_THRESHOLD=23000
 readonly DEFAULT_JOB_ID_WIDTH="${ACTUATOR_JOB_ID_WIDTH:-30}"
 
@@ -370,6 +374,64 @@ kill_child() {
   kill -"$signal" "$pid" 2> /dev/null || true
 }
 
+# Collect all descendant PIDs of a process (children, grandchildren, etc.)
+# Usage: _get_descendants <pid>  — prints space-separated list
+_get_descendants() {
+  local parent="$1"
+  local children
+  children=$(pgrep -P "$parent" 2> /dev/null) || return 0
+  local child
+  for child in $children; do
+    printf '%s ' "$child"
+    _get_descendants "$child"
+  done
+}
+
+# Gracefully kill a process and all its descendants.
+# SIGTERM the tree → wait grace period → SIGKILL survivors.
+# Works on macOS and Linux without requiring setsid.
+# Usage: kill_tree <pid> [grace_seconds]
+kill_tree() {
+  local pid="$1" grace="${2:-3}"
+  [[ -z "$pid" || "$pid" == "0" ]] && return 0
+  kill -0 "$pid" 2> /dev/null || return 0
+
+  # Collect all descendant PIDs (bottom-up order: deepest children first)
+  local descendants
+  descendants=$(_get_descendants "$pid")
+  local all_pids="$pid $descendants"
+
+  # Step 1: SIGTERM the entire tree (children first, then root)
+  local p
+  for p in $descendants $pid; do
+    kill -TERM "$p" 2> /dev/null || true
+  done
+
+  # Step 2: Wait up to grace seconds for ALL pids to die
+  # Use awk for iteration count to support fractional grace (e.g., 0.5)
+  local max_iter
+  max_iter=$(awk "BEGIN { printf \"%d\", $grace * 10 }")
+  local i=0
+  while [[ $i -lt $max_iter ]]; do
+    local any_alive=false
+    for p in $all_pids; do
+      if kill -0 "$p" 2> /dev/null; then
+        any_alive=true
+        break
+      fi
+    done
+    [[ "$any_alive" == "false" ]] && return 0
+    sleep 0.1
+    ((i++)) || true
+  done
+
+  # Step 3: SIGKILL survivors (re-collect in case new children spawned)
+  descendants=$(_get_descendants "$pid")
+  for p in $descendants $pid; do
+    kill -KILL "$p" 2> /dev/null || true
+  done
+}
+
 # Global state for signal handler (avoids quote escaping issues in trap strings)
 TRAP_CMD_PID=""
 TRAP_STDOUT_FILE=""
@@ -395,14 +457,15 @@ handle_signal() {
     *) exit_code=1 ;;
   esac
 
-  # Kill child process immediately
+  # Kill child process tree gracefully (TERM → grace → KILL)
   if [[ -n "$TRAP_CMD_PID" ]]; then
-    kill_child "$TRAP_CMD_PID" KILL
+    kill_tree "$TRAP_CMD_PID" "$KILL_GRACE"
     wait "$TRAP_CMD_PID" 2> /dev/null || true
   fi
 
   # Wait for merger to finish processing remaining output
   if [[ -n "$ORD_MERGER_PID" ]]; then
+    kill_child "$ORD_MERGER_PID" TERM
     wait "$ORD_MERGER_PID" 2> /dev/null || true
   fi
 
@@ -442,9 +505,7 @@ start_timeout_monitor() {
   {
     sleep "$timeout" 2> /dev/null
     if kill -0 "$pid" 2> /dev/null; then
-      kill_child "$pid" TERM
-      sleep 2
-      kill -0 "$pid" 2> /dev/null && kill_child "$pid" KILL
+      kill_tree "$pid" "$KILL_GRACE"
     fi
   } &
   TIMEOUT_MONITOR_PID=$!
@@ -571,7 +632,7 @@ execute_sync() {
 
       # Start timeout monitor if configured
       TIMEOUT_MONITOR_PID=""
-      if [[ "$timeout" -gt 0 ]]; then
+      if _gt0 "$timeout"; then
         start_timeout_monitor "$cmd_pid" "$timeout"
       fi
 
@@ -648,7 +709,7 @@ execute_sync() {
       fi
 
       local status="completed"
-      if [[ "$timeout" -gt 0 && ("$exit_code" -eq 137 || "$exit_code" -eq 143) ]]; then
+      if _gt0 "$timeout" && [[ "$exit_code" -eq 137 || "$exit_code" -eq 143 ]]; then
         status="timeout"
       elif [[ "$exit_code" -ne 0 ]]; then
         status="failed"
@@ -665,7 +726,7 @@ execute_sync() {
     fi
 
     # Non-streaming TTY: Direct foreground execution with ordered output
-    if [[ "$timeout" -gt 0 ]]; then
+    if _gt0 "$timeout"; then
       start_timeout_monitor "$$" "$timeout"
     fi
 
@@ -682,7 +743,7 @@ execute_sync() {
     fi
 
     local status="completed"
-    if [[ "$timeout" -gt 0 && ("$exit_code" -eq 137 || "$exit_code" -eq 143) ]]; then
+    if _gt0 "$timeout" && [[ "$exit_code" -eq 137 || "$exit_code" -eq 143 ]]; then
       status="timeout"
     elif [[ "$exit_code" -ne 0 ]]; then
       status="failed"
@@ -715,7 +776,7 @@ execute_sync() {
 
   # Start timeout monitor if configured
   TIMEOUT_MONITOR_PID=""
-  if [[ "$timeout" -gt 0 ]]; then
+  if _gt0 "$timeout"; then
     start_timeout_monitor "$cmd_pid" "$timeout"
   fi
 
@@ -798,7 +859,7 @@ execute_sync() {
 
   # Check if killed by timeout (SIGTERM=143, SIGKILL=137)
   local status="completed"
-  if [[ "$timeout" -gt 0 && ("$exit_code" -eq 137 || "$exit_code" -eq 143) ]]; then
+  if _gt0 "$timeout" && [[ "$exit_code" -eq 137 || "$exit_code" -eq 143 ]]; then
     status="timeout"
   elif [[ "$exit_code" -ne 0 ]]; then
     status="failed"
@@ -871,7 +932,7 @@ execute_async() {
 
     # Start timeout monitor if configured
     TIMEOUT_MONITOR_PID=""
-    if [[ "$timeout" -gt 0 ]]; then
+    if _gt0 "$timeout"; then
       start_timeout_monitor "$cmd_pid" "$timeout"
     fi
 
@@ -887,7 +948,7 @@ execute_async() {
     fi
 
     local status="completed"
-    if [[ "$timeout" -gt 0 && ("$exit_code" -eq 137 || "$exit_code" -eq 143) ]]; then
+    if _gt0 "$timeout" && [[ "$exit_code" -eq 137 || "$exit_code" -eq 143 ]]; then
       status="timeout"
     elif [[ "$exit_code" -ne 0 ]]; then
       status="failed"
@@ -905,6 +966,9 @@ execute_async() {
   fi
 
   # Background mode: fire-and-forget with job tracking
+  # Close inherited stdout/stderr (>/dev/null 2>&1) so that pipe consumers
+  # (e.g., $() command substitution) don't block waiting for this subshell.
+  # All output goes to files via ordered_exec, not stdout/stderr.
   {
     local exit_code=0
     ordered_exec "$command" "$stdout_file" "$stderr_file" "$seq_file" "false" || exit_code=$?
@@ -915,14 +979,14 @@ execute_async() {
     else
       update_job_status "$job_id" "failed" "$exit_code"
     fi
-  } &
+  } > /dev/null 2>&1 &
   local cmd_pid=$!
 
   # Update with actual process ID (atomic)
   update_job_fields "${JOBS_DIR}/${job_id}.job" "PID='${cmd_pid}'"
 
   # Start timeout monitor if configured
-  if [[ "$timeout" -gt 0 ]]; then
+  if _gt0 "$timeout"; then
     start_timeout_monitor "$cmd_pid" "$timeout"
   fi
 
@@ -1163,10 +1227,10 @@ terminate_job() {
   load_job_state "$job_id" || return 1
 
   if kill -0 "$PID" 2> /dev/null; then
-    kill -"$signal" "$PID" 2> /dev/null
-    sleep 1
-    if kill -0 "$PID" 2> /dev/null && [[ "$signal" != "KILL" ]]; then
-      kill -KILL "$PID" 2> /dev/null
+    if [[ "$signal" == "KILL" ]]; then
+      kill_child "$PID" KILL
+    else
+      kill_tree "$PID" "$KILL_GRACE"
     fi
     update_job_status "$job_id" "terminated" "143"
     json_status_update "terminated" "$job_id" "Process terminated with signal ${signal}"
@@ -1190,9 +1254,7 @@ terminate_all_jobs() {
 
     # Only terminate if running and PID is valid (not 0 or empty)
     if [[ "$STATUS" == "running" ]] && [[ -n "$PID" && "$PID" != "0" ]] && kill -0 "$PID" 2> /dev/null; then
-      kill -TERM "$PID" 2> /dev/null || true
-      sleep 0.5
-      kill -0 "$PID" 2> /dev/null && kill -KILL "$PID" 2> /dev/null || true
+      kill_tree "$PID" "$KILL_GRACE"
       update_job_status "$JOB_ID" "terminated" "143" || true
 
       if [[ "$plain" == "true" ]]; then

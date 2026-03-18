@@ -36,7 +36,7 @@ check_not() {
 
 JOBS_DIR="/tmp/actuator-poll-test-$$"
 export ACTUATOR_POLL_INTERVAL=0.1
-export ACTUATOR_POLL_BACKOFF="0.05 0.05 0.05 0.05 0.05"
+export ACTUATOR_POLL_BACKOFF="0.01 0.01 0.01 0.01 0.01"
 cleanup() { rm -rf "$JOBS_DIR" 2>/dev/null || true; }
 trap cleanup EXIT
 
