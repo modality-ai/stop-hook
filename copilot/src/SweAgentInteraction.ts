@@ -61,19 +61,22 @@ class SweAgent {
   private executeCommand: any = null;
   private completionPromise: string = DEFAULT_COMPLETION_PROMISE;
   private maxIterations: number = DEFAULT_MAX_ITERATIONS;
+  private minIterations: number = 0;
   private loopId: string;
   private loopMdPath: string;
 
   constructor({
     loopId = getSessionId(),
-    aiCommand = DEFAULT_FUNC,
+    loopMd = null,
     executeCommand = null,
+    aiCommand = DEFAULT_FUNC,
     completionPromise = DEFAULT_COMPLETION_PROMISE,
     maxIterations = DEFAULT_MAX_ITERATIONS,
+    minIterations = 0,
   } = {}) {
     this.aiCommand = aiCommand;
     this.loopId = loopId;
-    this.loopMdPath = `/tmp/swe_agent_loop_${this.loopId}.md`;
+    this.loopMdPath = loopMd || `/tmp/swe_agent_loop_${this.loopId}.md`;
     if (!existsSync(this.loopMdPath)) {
       writeFileSync(
         this.loopMdPath,
@@ -88,6 +91,9 @@ class SweAgent {
     }
     if (null != maxIterations) {
       this.maxIterations = maxIterations;
+    }
+    if (null != minIterations) {
+      this.minIterations = minIterations;
     }
   }
 
@@ -109,7 +115,7 @@ class SweAgent {
   ): Promise<void> {
     this.iteration++;
     console.log(
-      `${Colors.magenta}You (${this.iteration} / ${this.maxIterations}): ${userPrompt}${Colors.reset}`
+      `${Colors.magenta}You (${this.iteration} / ${this.minIterations}-${this.maxIterations}): ${userPrompt}${Colors.reset}`
     );
     await new Promise((resolve) => setTimeout(resolve, 1000));
     let aiCommand = await this.aiCommand(userPrompt || "", {
@@ -135,7 +141,11 @@ class SweAgent {
     content: string,
     userPrompt: string | null
   ): Promise<void> {
-    if ("string" === typeof content && content?.trim()) {
+    if (
+      "string" === typeof content &&
+      content?.trim() &&
+      this.iteration >= this.minIterations
+    ) {
       const lines = content.split("\n").slice(-CONFIG.PROMISE_LINES);
       for (let i = lines.length - 1; i >= 0; i--) {
         const line = lines[i];

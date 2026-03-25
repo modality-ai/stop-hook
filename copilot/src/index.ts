@@ -671,6 +671,8 @@ const setupSessionEventListener = (session: CopilotSession) => {
         case "session.snapshot_rewind":
         case "session.compaction_start":
         case "session.tools_updated":
+        case "session.background_tasks_changed":
+        case "session.mcp_servers_loaded":
         case "permission.requested":
         case "permission.completed":
           break;
@@ -1275,12 +1277,15 @@ const main = async () => {
 
   const completionPromise = promptConfig.promise;
   const maxIterations = promptConfig["max-iterations"];
+  const minIterations = promptConfig["min-iterations"];
 
   new SweAgentInteraction({
     aiCommand,
     completionPromise,
     maxIterations,
+    minIterations,
     loopId,
+    loopMd: promptConfig.loopMd,
   }).init(mode, initialPrompt);
   setupSignalHandlers(client, () => currentSession);
 };
