@@ -673,6 +673,7 @@ const setupSessionEventListener = (session: CopilotSession) => {
         case "session.tools_updated":
         case "session.background_tasks_changed":
         case "session.mcp_servers_loaded":
+        case "session.mcp_server_status_changed":
         case "permission.requested":
         case "permission.completed":
           break;
