@@ -11,6 +11,17 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "input=$(cat); desc=$(echo \"$input\" | jq -r '(.tool_input.description // \"\") + \" \" + (.tool_input.prompt // \"\")'); if echo \"$desc\" | grep -qE '_Counter__Deploy'; then echo '{\"decision\": \"block\", \"reason\": \"Do not use Agent tool for hero deployment. Call _Counter__Deploy directly.\"}'; else echo '{\"decision\": \"approve\"}'; fi"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "mcp__.*___Counter__ExecuteMethod",
