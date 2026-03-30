@@ -49,11 +49,14 @@ let loopId = gSessionId;
 
 // Simple logger wrapper
 const logger = {
-  store: (logType: string, message: string) => {
-    const filePath = `${COPILOT_LOOP_DIR}/${loopId}-${logType}.txt`;
-    appendFileSync(filePath, `${message}\n`);
+  resetTimeout: () => {
     clearTimeout(sessionTimout);
     sessionTimout = setTimeout(() => (gNeedContinue = true), 5 * 60 * 1000); // 5 minutes
+  },
+  store: (logType: string, message: string) => {
+    logger.resetTimeout();
+    const filePath = `${COPILOT_LOOP_DIR}/${loopId}-${logType}.txt`;
+    appendFileSync(filePath, `${message}\n`);
   },
 
   log: (message?: any, ...args: any[]) => {
@@ -450,6 +453,7 @@ const setupSessionEventListener = (session: CopilotSession) => {
 
         case "assistant.reasoning_delta":
           // Streaming reasoning content
+          logger.resetTimeout();
           writeSync(1, event.data.deltaContent);
           break;
 
@@ -553,6 +557,7 @@ const setupSessionEventListener = (session: CopilotSession) => {
 
         case "assistant.message_delta":
           // Streaming response content (write without newline)
+          logger.resetTimeout();
           writeSync(1, event.data.deltaContent);
           break;
 
@@ -679,6 +684,7 @@ const setupSessionEventListener = (session: CopilotSession) => {
           break;
 
         default:
+          logger.resetTimeout();
           writeSync(1, `❓ Unhandled event type: ${event.type}\n`);
           break;
       }

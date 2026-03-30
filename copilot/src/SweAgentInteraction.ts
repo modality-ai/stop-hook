@@ -40,7 +40,7 @@ You are executing PDCA (Plan-Do-Check-Act) Round [CURRENT] of [MAX].
 
 LOOP_MD: '[LOOP_MD]'
 - File is ready to use editing and rewriting, You don't need create it.
-- READ '[LOOP_MD]' at the start of this round to load the current state
+- READ '[LOOP_MD]' at the start of this round to orient yourself before acting — understand where the work stands, what has already been completed, and what the most valuable next action is for this round
 - REWRITE '[LOOP_MD]' at the end of this round to capture current status and what the next round should do
 - Treat it as one living document — not a log. Each round refines and consolidates it, not appends to it
 
