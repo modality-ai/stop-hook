@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.4.0"
+readonly VERSION="2.5.0"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -15,7 +15,7 @@ readonly STATUS_INTERVAL="${ACTUATOR_STATUS_INTERVAL:-5}"
 readonly POLL_INTERVAL="${ACTUATOR_POLL_INTERVAL:-10}"
 readonly POLL_BACKOFF="${ACTUATOR_POLL_BACKOFF:-0.1 0.2 0.5 1 2}"
 readonly KILL_GRACE="${ACTUATOR_KILL_GRACE:-3}"
-readonly OUTPUT_SIZE_THRESHOLD=23000
+readonly OUTPUT_SIZE_THRESHOLD="${ACTUATOR_OUTPUT_SIZE_THRESHOLD:-23000}"
 readonly DEFAULT_JOB_ID_WIDTH="${ACTUATOR_JOB_ID_WIDTH:-30}"
 
 # Global execution sequence (set in main before any command execution)
@@ -26,6 +26,7 @@ WRITE_MODE="false"
 RAW_MODE="false"
 SEQ_MODE="false"
 META_MODE="false"
+VERBOSE_LEVEL=0
 EXEC_CWD=""
 
 # =============================================================================
@@ -66,8 +67,14 @@ json_escape() {
 
 offload_message() {
   local stream_type="$1" file_path="$2"
-  printf '%s log size over %d, please check file with %s, Treat this as raw command output. Use grep tools to extract only relevant lines, do not summarize unrelated content, and do not infer beyond what is shown.' \
-    "$stream_type" "$OUTPUT_SIZE_THRESHOLD" "$file_path"
+  local line_count=0 error_count=0 tail_lines=""
+  if [[ -f "$file_path" ]]; then
+    line_count=$(($(wc -l < "$file_path" 2>/dev/null)))
+    error_count=$(($(grep -ciE '(error|fatal|exception|traceback|panic|failed)' "$file_path" 2>/dev/null || echo 0)))
+    tail_lines=$(tail -10 "$file_path" 2>/dev/null)
+  fi
+  printf '%s log: %d lines, %d error(s). Full output at %s. Last 10 lines:\n%s\nTreat as raw output. Use grep to extract relevant lines only.' \
+    "$stream_type" "$line_count" "$error_count" "$file_path" "$tail_lines"
 }
 
 json_output() {
@@ -139,7 +146,9 @@ json_output() {
     fi
   fi
 
-  json_parts+=("\"metadata\":{\"start_time\":${start_time:-0},\"end_time\":${end_time:-0},\"duration_seconds\":${duration},\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}")
+  local total_output_chars=$(( ${#stdout_data} + ${#stderr_data} ))
+  local token_estimate=$(( (total_output_chars + 3) / 4 ))
+  json_parts+=("\"metadata\":{\"start_time\":${start_time:-0},\"end_time\":${end_time:-0},\"duration_seconds\":${duration},\"output_bytes\":${total_output_chars},\"token_estimate\":${token_estimate},\"timestamp\":\"$(_get_timestamp)\"}")
 
   if [[ -n "$job_id" ]]; then
     json_parts+=("\"job\":{\"id\":\"$(json_escape "$job_id")\",\"pid\":${pid:-0}}")
@@ -183,19 +192,19 @@ plain_output() {
     if [[ -n "$stdout_data" ]]; then
       printf '%s\n' ''
       printf '%s\n' '------ Standard Output ------'
-      printf '%s\n' "$stdout_data"
+      printf '%s\n' "$stdout_data" | sed $'s/\033\\[[0-9;]*[A-Za-z]//g'
     fi
 
     if [[ -n "$stderr_data" ]]; then
       printf '%s\n' ''
       printf '%s\n' '------ Standard Error ------'
-      printf '%s\n' "$stderr_data"
+      printf '%s\n' "$stderr_data" | sed $'s/\033\\[[0-9;]*[A-Za-z]//g'
     fi
 
     if [[ -n "$SEQ_DATA" ]]; then
       printf '%s\n' ''
       printf '%s\n' '------ Output Sequence ------'
-      printf '%s\n' "$SEQ_DATA"
+      printf '%s\n' "$SEQ_DATA" | sed $'s/\033\\[[0-9;]*[A-Za-z]//g'
     fi
   fi
 }
@@ -260,7 +269,7 @@ json_stream_line() {
     return
   fi
   printf '{"event":"%s","status":"running","data":"%s","timestamp":"%s"}\n' \
-    "$stream" "$(json_escape "$data")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    "$stream" "$(json_escape "$data")" "$(_get_timestamp)"
 }
 
 # =============================================================================
@@ -272,8 +281,26 @@ init_jobs_dir() {
 }
 
 generate_job_id() {
-  printf '%s_%s' "$(date +%s)" "$$"
+  printf '%s_%s_%04x' "$(date +%s)" "$$" "$RANDOM"
 }
+
+# No-fork timestamp: uses bash printf builtin (4.2+) with date fallback
+_get_timestamp() {
+  printf -v _ts '%(%Y-%m-%dT%H:%M:%SZ)T' -1 2>/dev/null && { printf '%s' "$_ts"; return; }
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+# Returns unbuffered command prefix (stdbuf -oL -eL or unbuffer) if available
+# Enables real-time line streaming for commands that buffer when piped
+_UNBUFFERED_PREFIX=""
+_init_unbuffered() {
+  if command -v stdbuf >/dev/null 2>&1; then
+    _UNBUFFERED_PREFIX="stdbuf -oL -eL"
+  elif command -v unbuffer >/dev/null 2>&1; then
+    _UNBUFFERED_PREFIX="unbuffer"
+  fi
+}
+_init_unbuffered
 
 # Write complete job file atomically (temp file + mv)
 # Usage: write_job_file "$job_file" "KEY1='val1'" "KEY2='val2'" ...
@@ -560,7 +587,7 @@ ordered_spawn() {
       printf 'syntax error: %s\n' "${_se##*: }" >&2
       exit 2
     }
-    eval "$command"
+    eval "${_UNBUFFERED_PREFIX:+$_UNBUFFERED_PREFIX }$command"
     exit $?
   ) < /dev/stdin > "$fifo_out" 2> "$fifo_err" &
   ORD_CMD_PID=$!
@@ -607,6 +634,8 @@ execute_sync() {
   if [[ "$stream_output" == "true" ]]; then
     json_status_update "running" "sync" "Executing: ${command}"
   fi
+  [[ "$VERBOSE_LEVEL" -ge 1 ]] && printf '[verbose] command: %s\n' "$command" >&2
+  [[ "$VERBOSE_LEVEL" -ge 2 ]] && printf '[verbose] start_time: %s cwd: %s\n' "$start_time" "$EXEC_CWD" >&2
 
   # Foreground mode: run command directly (not backgrounded) to avoid
   # SIGTTIN/SIGTTOU signals that suspend backgrounded terminal processes.
@@ -647,7 +676,7 @@ execute_sync() {
 
         # Poll seq file for new entries and emit in correct order
         local current_seq
-        current_seq=$(wc -l < "$seq_file" 2> /dev/null | tr -d ' ')
+        current_seq=$(( $(wc -l < "$seq_file" 2>/dev/null) ))
         if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
           while IFS=$'\t' read -r tag sline; do
             if [[ "$tag" == "out" ]]; then
@@ -687,7 +716,7 @@ execute_sync() {
       ordered_cleanup
 
       local current_seq
-      current_seq=$(wc -l < "$seq_file" 2> /dev/null | tr -d ' ')
+      current_seq=$(( $(wc -l < "$seq_file" 2>/dev/null) ))
       if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
         while IFS=$'\t' read -r tag sline; do
           if [[ "$tag" == "out" ]]; then
@@ -792,7 +821,7 @@ execute_sync() {
       local had_output=false
 
       local current_seq
-      current_seq=$(wc -l < "$seq_file" 2> /dev/null | tr -d ' ')
+      current_seq=$(( $(wc -l < "$seq_file" 2>/dev/null) ))
       if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
         while IFS=$'\t' read -r tag sline; do
           if [[ "$tag" == "out" ]]; then
@@ -830,7 +859,7 @@ execute_sync() {
     ordered_cleanup
 
     local current_seq
-    current_seq=$(wc -l < "$seq_file" 2> /dev/null | tr -d ' ')
+    current_seq=$(( $(wc -l < "$seq_file" 2>/dev/null) ))
     if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
       while IFS=$'\t' read -r tag sline; do
         if [[ "$tag" == "out" ]]; then
@@ -871,6 +900,9 @@ execute_sync() {
   [[ "$SEQ_MODE" == "true" ]] && SEQ_DATA=$(cut -f2- "$seq_file" 2> /dev/null || true)
 
   rm -f "$stdout_file" "$stderr_file" "$seq_file"
+
+  [[ "$VERBOSE_LEVEL" -ge 2 ]] && printf '[verbose] duration: %ds status: %s exit_code: %d\n' "$((end_time - start_time))" "$status" "$exit_code" >&2
+  [[ "$VERBOSE_LEVEL" -ge 3 ]] && { printf '[verbose] stdout (%d bytes):\n%s\n' "${#stdout_data}" "$stdout_data" >&2; printf '[verbose] stderr (%d bytes):\n%s\n' "${#stderr_data}" "$stderr_data" >&2; }
 
   emit_result "$write_mode" "$plain" "$status" "$exit_code" "$command" "$stdout_data" "$stderr_data" "$start_time" "$end_time" "" "$cmd_pid" "$EXEC_SEQUENCE" "$EXEC_CWD"
   return $exit_code
@@ -1081,7 +1113,7 @@ poll_job_stream() {
     # Poll seq file for new entries and emit in correct interleaved order
     if [[ -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]]; then
       local current_seq
-      current_seq=$(wc -l < "$SEQ_FILE" 2> /dev/null | tr -d ' ')
+      current_seq=$(( $(wc -l < "$SEQ_FILE" 2>/dev/null) ))
       if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
         while IFS=$'\t' read -r tag sline; do
           if [[ "$tag" == "out" ]]; then
@@ -1105,7 +1137,7 @@ poll_job_stream() {
       # Fallback: no seq file, poll stdout/stderr separately (legacy jobs)
       if [[ -f "$STDOUT_FILE" ]]; then
         local current_out
-        current_out=$(wc -l < "$STDOUT_FILE" 2> /dev/null | tr -d ' ')
+        current_out=$(( $(wc -l < "$STDOUT_FILE" 2>/dev/null) ))
         if [[ "${current_out:-0}" -gt "$out_lines" ]]; then
           local lines_to_emit
           lines_to_emit=$(tail -n +"$((out_lines + 1))" "$STDOUT_FILE" 2> /dev/null)
@@ -1122,7 +1154,7 @@ poll_job_stream() {
       fi
       if [[ -f "$STDERR_FILE" ]]; then
         local current_err
-        current_err=$(wc -l < "$STDERR_FILE" 2> /dev/null | tr -d ' ')
+        current_err=$(( $(wc -l < "$STDERR_FILE" 2>/dev/null) ))
         if [[ "${current_err:-0}" -gt "$err_lines" ]]; then
           local lines_to_emit
           lines_to_emit=$(tail -n +"$((err_lines + 1))" "$STDERR_FILE" 2> /dev/null)
@@ -1160,7 +1192,7 @@ poll_job_stream() {
       # Flush any remaining streamed lines not yet emitted
       if [[ -n "${SEQ_FILE:-}" && -f "$SEQ_FILE" ]]; then
         local final_seq
-        final_seq=$(wc -l < "$SEQ_FILE" 2> /dev/null | tr -d ' ')
+        final_seq=$(( $(wc -l < "$SEQ_FILE" 2>/dev/null) ))
         if [[ "${final_seq:-0}" -gt "$seq_lines" ]]; then
           while IFS=$'\t' read -r tag sline; do
             if [[ "$tag" == "out" ]]; then
@@ -1178,7 +1210,7 @@ poll_job_stream() {
         # Fallback flush for legacy jobs without seq file
         if [[ -f "$STDOUT_FILE" ]]; then
           local final_out
-          final_out=$(wc -l < "$STDOUT_FILE" 2> /dev/null | tr -d ' ')
+          final_out=$(( $(wc -l < "$STDOUT_FILE" 2>/dev/null) ))
           if [[ "${final_out:-0}" -gt "$out_lines" ]]; then
             while IFS= read -r line; do
               if [[ "$plain" == "true" ]]; then
@@ -1189,7 +1221,7 @@ poll_job_stream() {
         fi
         if [[ -f "$STDERR_FILE" ]]; then
           local final_err
-          final_err=$(wc -l < "$STDERR_FILE" 2> /dev/null | tr -d ' ')
+          final_err=$(( $(wc -l < "$STDERR_FILE" 2>/dev/null) ))
           if [[ "${final_err:-0}" -gt "$err_lines" ]]; then
             while IFS= read -r line; do
               if [[ "$plain" == "true" ]]; then
@@ -1431,8 +1463,12 @@ list_jobs() {
   fi
 
   # Sort oldest first by modification time (newest last)
-  IFS=$'\n' job_files=($(ls -1tr "${job_files[@]}"))
-  unset IFS
+  # Use printf+sort instead of ls to handle edge cases robustly
+  local _sorted _f
+  _sorted=$(for _f in "${job_files[@]}"; do
+    printf '%s\t%s\n' "$(stat -f%m "$_f" 2>/dev/null || stat -c%Y "$_f" 2>/dev/null || echo 0)" "$_f"
+  done | sort -t$'\t' -k1,1n | cut -f2-)
+  IFS=$'\n' read -r -d '' -a job_files <<< "$_sorted" || true
 
   # Apply limit
   if [[ "$limit" -gt 0 && "$limit" -lt "$total" ]]; then
@@ -1555,6 +1591,7 @@ OPTIONS:
                           on stdout or stderr. Metadata saved to job file only
                           (accessible via actuator -p <job_id>)
   -q, --quiet             Suppress command output from terminal and metadata
+  --verbose               Increase verbosity (repeat for more: level 1=command, 2=timing, 3=raw output)
   --init                  Output shell function for eval (enables cd through actuator)
   -v, --version           Show version
   -h, --help              Show this help
@@ -1632,9 +1669,10 @@ EXAMPLES:
   actuator --cleanup
 
 ENVIRONMENT:
-  ACTUATOR_JOBS_DIR        Job storage directory (default: /tmp/actuator-jobs)
-  ACTUATOR_STATUS_INTERVAL Status update interval in seconds (default: 2)
-  ACTUATOR_POLL_INTERVAL   Streaming poll interval in seconds (default: 5)
+  ACTUATOR_JOBS_DIR             Job storage directory (default: /tmp/actuator-jobs)
+  ACTUATOR_STATUS_INTERVAL      Status update interval in seconds (default: 5)
+  ACTUATOR_POLL_INTERVAL        Streaming poll interval in seconds (default: 10)
+  ACTUATOR_OUTPUT_SIZE_THRESHOLD Output offload threshold in bytes (default: 23000)
 
 OUTPUT:
   All output is JSON-structured for AI consumption.
@@ -1856,6 +1894,10 @@ main() {
         ;;
       -q | --quiet)
         quiet="true"
+        shift
+        ;;
+      --verbose)
+        ((VERBOSE_LEVEL++)) || true
         shift
         ;;
       -v | --version)
