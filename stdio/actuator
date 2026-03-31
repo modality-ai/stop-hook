@@ -16,6 +16,12 @@ readonly POLL_INTERVAL="${ACTUATOR_POLL_INTERVAL:-10}"
 readonly POLL_BACKOFF="${ACTUATOR_POLL_BACKOFF:-0.1 0.2 0.5 1 2}"
 readonly KILL_GRACE="${ACTUATOR_KILL_GRACE:-3}"
 readonly OUTPUT_SIZE_THRESHOLD="${ACTUATOR_OUTPUT_SIZE_THRESHOLD:-23000}"
+readonly STDERR_SIZE_THRESHOLD="${ACTUATOR_STDERR_SIZE_THRESHOLD:-5000}"
+readonly STREAM_MAX_LINES="${ACTUATOR_STREAM_LINES:-0}"
+readonly STREAM_TIMESTAMPS="${ACTUATOR_STREAM_TIMESTAMPS:-false}"
+readonly SEQ_VERBOSE_ONLY="${ACTUATOR_SEQ_VERBOSE_ONLY:-false}"
+readonly TRACK_TOKENS="${ACTUATOR_TRACK_TOKENS:-false}"
+readonly COMPRESS_OUTPUT="${ACTUATOR_COMPRESS_OUTPUT:-false}"
 readonly DEFAULT_JOB_ID_WIDTH="${ACTUATOR_JOB_ID_WIDTH:-30}"
 
 # Global execution sequence (set in main before any command execution)
@@ -67,14 +73,159 @@ json_escape() {
 
 offload_message() {
   local stream_type="$1" file_path="$2"
-  local line_count=0 error_count=0 tail_lines=""
+  local line_count=0 error_count=0
+
   if [[ -f "$file_path" ]]; then
-    line_count=$(($(wc -l < "$file_path" 2>/dev/null)))
-    error_count=$(($(grep -ciE '(error|fatal|exception|traceback|panic|failed)' "$file_path" 2>/dev/null || echo 0)))
-    tail_lines=$(tail -10 "$file_path" 2>/dev/null)
+    line_count=$(wc -l < "$file_path" 2>/dev/null || echo 0)
+    error_count=$(grep -ciE '(error|fatal|exception|traceback|panic|failed)' \
+      "$file_path" 2>/dev/null || echo 0)
   fi
-  printf '%s log: %d lines, %d error(s). Full output at %s. Last 10 lines:\n%s\nTreat as raw output. Use grep to extract relevant lines only.' \
-    "$stream_type" "$line_count" "$error_count" "$file_path" "$tail_lines"
+
+  case "${VERBOSE_LEVEL:-0}" in
+    0)  # Ultra: 1 line
+        printf '[x]%d/%dL → %s | grep for details' \
+          "$error_count" "$line_count" "$file_path"
+        ;;
+    1)  # Compact: top errors surfaced
+        local errs
+        errs=$(grep -iE '(error|fatal|exception|traceback|panic)' \
+          "$file_path" 2>/dev/null | head -5)
+        printf '%s %dL [x]%d %s\n%s' \
+          "$stream_type" "$line_count" "$error_count" "$file_path" "$errs"
+        ;;
+    *)  # Verbose: tail behavior
+        local tail_depth=$(( VERBOSE_LEVEL >= 3 ? 20 : 10 ))
+        local tail_lines
+        tail_lines=$(tail -"$tail_depth" "$file_path" 2>/dev/null)
+        printf '%s: %d lines, %d error(s). Full output at %s. Last %d lines:\n%s\nUse grep to extract relevant lines only.' \
+          "$stream_type" "$line_count" "$error_count" "$file_path" \
+          "$tail_depth" "$tail_lines"
+        ;;
+  esac
+}
+
+_detect_tool() {
+  local cmd="$1"
+  case "$cmd" in
+    *vitest*|*jest*|*pytest*|*bun\ test*)  echo "test" ;;
+    *eslint*|*tsc\ *|*tsc)                echo "lint" ;;
+    *"git status"*)                        echo "git_status" ;;
+    *"git diff"*)                          echo "git_diff" ;;
+    *npm\ install*|*yarn\ add*|*pnpm\ install*|*bun\ install*) echo "pkg_install" ;;
+    *"cargo build"*|*"cargo test"*|*make*) echo "build" ;;
+    *grep*|*rg\ *)                         echo "grep" ;;
+    *)                                     echo "unknown" ;;
+  esac
+}
+
+_compress_test() {
+  local out="$1" mode="${2:-0}"
+  local passed=0 failed=0 skipped=0 duration="?"
+  passed=$(printf '%s' "$out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | tail -1)
+  failed=$(printf '%s' "$out" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' | tail -1)
+  skipped=$(printf '%s' "$out" | grep -oE '[0-9]+ (skipped|pending|todo)' | grep -oE '[0-9]+' | tail -1)
+  duration=$(printf '%s' "$out" | grep -oE '[0-9]+(\.[0-9]+)?(ms|s)' | tail -1)
+  case "$mode" in
+    0) printf '[ok]%s [x]%s [skip]%s (%s)' \
+         "${passed:-0}" "${failed:-0}" "${skipped:-0}" "${duration:-?}" ;;
+    1) printf 'Tests: %s passed, %s failed, %s skipped (%s)\n%s' \
+         "${passed:-0}" "${failed:-0}" "${skipped:-0}" "${duration:-?}" \
+         "$(printf '%s' "$out" | grep -iE 'FAIL|●|Error' | head -5)" ;;
+    *) printf '%s' "$out" ;;
+  esac
+}
+
+_compress_lint() {
+  local out="$1" mode="${2:-0}"
+  local errors=0 warnings=0 files=0
+  errors=$(printf '%s' "$out" | grep -oE '[0-9]+ error' | grep -oE '[0-9]+' | paste -sd+ | bc 2>/dev/null || echo 0)
+  warnings=$(printf '%s' "$out" | grep -oE '[0-9]+ warning' | grep -oE '[0-9]+' | paste -sd+ | bc 2>/dev/null || echo 0)
+  files=$(printf '%s' "$out" | grep -cE '^[^[:space:]].*\.(ts|js|tsx|jsx):' 2>/dev/null || echo 0)
+  case "$mode" in
+    0) printf '[x]%s [!]%s %sF' "${errors:-0}" "${warnings:-0}" "${files:-0}" ;;
+    1) printf '[x]%s errors [!]%s warnings in %s files\n%s' \
+         "${errors:-0}" "${warnings:-0}" "${files:-0}" \
+         "$(printf '%s' "$out" | grep -E 'error TS|Error:' | head -5)" ;;
+    *) printf '%s' "$out" ;;
+  esac
+}
+
+_compress_git_status() {
+  local out="$1" mode="${2:-0}"
+  local modified added deleted untracked
+  modified=$(printf '%s' "$out" | grep -cE '^.M|^M' 2>/dev/null || echo 0)
+  added=$(printf '%s' "$out" | grep -cE '^A|^.A' 2>/dev/null || echo 0)
+  deleted=$(printf '%s' "$out" | grep -cE '^.D|^D' 2>/dev/null || echo 0)
+  untracked=$(printf '%s' "$out" | grep -cF '??' 2>/dev/null || echo 0)
+  case "$mode" in
+    0) printf 'M:%s A:%s D:%s ?:%s' \
+         "${modified:-0}" "${added:-0}" "${deleted:-0}" "${untracked:-0}" ;;
+    1) printf 'Modified:%s Added:%s Deleted:%s Untracked:%s\n%s' \
+         "${modified:-0}" "${added:-0}" "${deleted:-0}" "${untracked:-0}" \
+         "$(printf '%s' "$out" | head -20)" ;;
+    *) printf '%s' "$out" ;;
+  esac
+}
+
+_compress_pkg_install() {
+  local out="$1" mode="${2:-0}"
+  local pkgs added duration vulns
+  pkgs=$(printf '%s' "$out" | grep -oE '[0-9]+ packages?' | grep -oE '[0-9]+' | tail -1)
+  added=$(printf '%s' "$out" | grep -oE 'added [0-9]+' | grep -oE '[0-9]+' | tail -1)
+  vulns=$(printf '%s' "$out" | grep -oE '[0-9]+ (vulnerabilit|audit)' | grep -oE '[0-9]+' | tail -1)
+  duration=$(printf '%s' "$out" | grep -oE '[0-9]+(\.[0-9]+)?(ms|s)' | tail -1)
+  case "$mode" in
+    0) printf 'pkg:%s +%s vuln:%s (%s)' \
+         "${pkgs:-?}" "${added:-0}" "${vulns:-0}" "${duration:-?}" ;;
+    *) printf '%s' "$out" ;;
+  esac
+}
+
+_compress_build() {
+  local out="$1" mode="${2:-0}"
+  local errors warnings duration status="ok"
+  errors=$(printf '%s' "$out" | grep -ciE '^error|: error\[' 2>/dev/null || echo 0)
+  warnings=$(printf '%s' "$out" | grep -ciE '^warning|: warning\[' 2>/dev/null || echo 0)
+  duration=$(printf '%s' "$out" | grep -oE '[0-9]+(\.[0-9]+)?(ms|s)' | tail -1)
+  [[ "${errors:-0}" -gt 0 ]] && status="[x]"
+  case "$mode" in
+    0) printf '%s [x]%s [!]%s (%s)' "$status" "${errors:-0}" "${warnings:-0}" "${duration:-?}" ;;
+    1) printf 'Build %s: %s errors, %s warnings (%s)\n%s' \
+         "$status" "${errors:-0}" "${warnings:-0}" "${duration:-?}" \
+         "$(printf '%s' "$out" | grep -E '^error' | head -5)" ;;
+    *) printf '%s' "$out" ;;
+  esac
+}
+
+_compress_grep() {
+  local out="$1" mode="${2:-0}"
+  local matches files
+  matches=$(printf '%s' "$out" | wc -l | tr -d ' ')
+  files=$(printf '%s' "$out" | grep -oE '^[^:]+:' | sort -u | wc -l | tr -d ' ')
+  case "$mode" in
+    0) printf '%s matches in %s files' "${matches:-0}" "${files:-0}" ;;
+    *) printf '%s' "$out" ;;
+  esac
+}
+
+_compress_output() {
+  local cmd="$1" stdout="$2" mode="${VERBOSE_LEVEL:-0}"
+  [[ "$COMPRESS_OUTPUT" != "true" ]] && { printf '%s' "$stdout"; return; }
+  [[ -z "$stdout" ]] && return
+
+  local tool
+  tool=$(_detect_tool "$cmd")
+  case "$tool" in
+    test)        _compress_test       "$stdout" "$mode" ;;
+    lint)        _compress_lint       "$stdout" "$mode" ;;
+    git_status)  _compress_git_status "$stdout" "$mode" ;;
+    git_diff)    [[ "$mode" -ge 2 ]] && printf '%s' "$stdout" \
+                   || printf '%s lines changed' "$(printf '%s' "$stdout" | wc -l | tr -d ' ')" ;;
+    pkg_install) _compress_pkg_install "$stdout" "$mode" ;;
+    build)       _compress_build      "$stdout" "$mode" ;;
+    grep)        _compress_grep       "$stdout" "$mode" ;;
+    *)           printf '%s' "$stdout" ;;
+  esac
 }
 
 json_output() {
@@ -84,6 +235,7 @@ json_output() {
   local job_id="${8:-}" pid="${9:-}" sequence="${10:-0}"
   local cwd="${11:-}" write_mode="${12:-false}"
   local duration=0
+  local _COMPRESSED=false
 
   if [[ -n "$start_time" && -n "$end_time" ]]; then
     duration=$((end_time - start_time))
@@ -103,7 +255,7 @@ json_output() {
     stdout_value="$(json_escape "$stdout_data")"
   fi
 
-  if [[ ${#stderr_data} -gt $OUTPUT_SIZE_THRESHOLD ]]; then
+  if [[ ${#stderr_data} -gt $STDERR_SIZE_THRESHOLD ]]; then
     init_jobs_dir
     local stderr_file="${JOBS_DIR}/${job_id:-${sequence}}.stderr"
     [[ ! -f "$stderr_file" ]] && printf '%s' "$stderr_data" > "$stderr_file"
@@ -111,6 +263,18 @@ json_output() {
     stderr_offloaded="true"
   else
     stderr_value="$(json_escape "$stderr_data")"
+  fi
+
+  # Compress stdout if enabled (original preserved in job file via write path)
+  if [[ "$COMPRESS_OUTPUT" == "true" && "${VERBOSE_LEVEL:-0}" -lt 2 ]]; then
+    local compressed_stdout
+    compressed_stdout=$(_compress_output "$command" "$stdout_data")
+    if [[ "$compressed_stdout" != "$stdout_data" ]]; then
+      stdout_data="$compressed_stdout"
+      _COMPRESSED=true
+      # Re-encode stdout_value with compressed data (only if not already offloaded)
+      [[ "$stdout_offloaded" != "true" ]] && stdout_value="$(json_escape "$stdout_data")"
+    fi
   fi
 
   # Build JSON object as single line (JSONL format)
@@ -133,7 +297,7 @@ json_output() {
     json_parts+=("\"stderr\":\"${stderr_value}\"")
     [[ "$stderr_offloaded" == "true" ]] && json_parts+=("\"stderr_offloaded\":true")
 
-    if [[ -n "$SEQ_DATA" ]]; then
+    if [[ -n "$SEQ_DATA" ]] && [[ "$SEQ_VERBOSE_ONLY" != "true" || "${VERBOSE_LEVEL:-0}" -ge 1 ]]; then
       if [[ ${#SEQ_DATA} -gt $OUTPUT_SIZE_THRESHOLD ]]; then
         init_jobs_dir
         local seq_file="${JOBS_DIR}/${job_id:-${sequence}}.seq"
@@ -149,6 +313,9 @@ json_output() {
   local total_output_chars=$(( ${#stdout_data} + ${#stderr_data} ))
   local token_estimate=$(( (total_output_chars + 3) / 4 ))
   json_parts+=("\"metadata\":{\"start_time\":${start_time:-0},\"end_time\":${end_time:-0},\"duration_seconds\":${duration},\"output_bytes\":${total_output_chars},\"token_estimate\":${token_estimate},\"timestamp\":\"$(_get_timestamp)\"}")
+  _track_tokens "$command" "$total_output_chars" "$token_estimate"
+  [[ "${_COMPRESSED:-false}" == "true" ]] && \
+    json_parts+=("\"compressed\":true")
 
   if [[ -n "$job_id" ]]; then
     json_parts+=("\"job\":{\"id\":\"$(json_escape "$job_id")\",\"pid\":${pid:-0}}")
@@ -207,6 +374,16 @@ plain_output() {
       printf '%s\n' "$SEQ_DATA" | sed $'s/\033\\[[0-9;]*[A-Za-z]//g'
     fi
   fi
+}
+
+_track_tokens() {
+  local cmd="$1" output_bytes="$2" token_est="$3"
+  [[ "$TRACK_TOKENS" != "true" ]] && return
+  local track_file="${JOBS_DIR}/.token_log"
+  init_jobs_dir
+  printf '{"ts":"%s","cmd":"%s","bytes":%s,"tokens":%s}\n' \
+    "$(_get_timestamp)" "$(json_escape "${cmd:0:80}")" \
+    "$output_bytes" "$token_est" >> "$track_file" 2>/dev/null || true
 }
 
 emit_result() {
@@ -268,8 +445,12 @@ json_stream_line() {
     fi
     return
   fi
-  printf '{"event":"%s","status":"running","data":"%s","timestamp":"%s"}\n' \
-    "$stream" "$(json_escape "$data")" "$(_get_timestamp)"
+  if [[ "$STREAM_TIMESTAMPS" == "true" ]]; then
+    printf '{"event":"%s","data":"%s","timestamp":"%s"}\n' \
+      "$stream" "$(json_escape "$data")" "$(_get_timestamp)"
+  else
+    printf '{"event":"%s","data":"%s"}\n' "$stream" "$(json_escape "$data")"
+  fi
 }
 
 # =============================================================================
@@ -587,7 +768,11 @@ ordered_spawn() {
       printf 'syntax error: %s\n' "${_se##*: }" >&2
       exit 2
     }
-    eval "${_UNBUFFERED_PREFIX:+$_UNBUFFERED_PREFIX }$command"
+    if [[ -n "$_UNBUFFERED_PREFIX" ]]; then
+      $_UNBUFFERED_PREFIX bash -c "$command"
+    else
+      eval "$command"
+    fi
     exit $?
   ) < /dev/stdin > "$fifo_out" 2> "$fifo_err" &
   ORD_CMD_PID=$!
@@ -670,6 +855,7 @@ execute_sync() {
       local poll_count=0
       local heartbeat_every=$((${STATUS_INTERVAL%.*} * 5))
       [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
+      local _stream_count=0
 
       while kill -0 "$cmd_pid" 2> /dev/null; do
         local had_output=false
@@ -680,12 +866,23 @@ execute_sync() {
         if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
           while IFS=$'\t' read -r tag sline; do
             if [[ "$tag" == "out" ]]; then
-              json_stream_line "stdout" "$sline"
-              [[ "$quiet" != "true" ]] && printf '%s\n' "$sline"
+              if [[ "$STREAM_MAX_LINES" -gt 0 && "$_stream_count" -ge "$STREAM_MAX_LINES" ]]; then
+                [[ "$_stream_count" -eq "$STREAM_MAX_LINES" ]] && \
+                  printf '{"event":"capped","at":%d,"file":"%s"}\n' "$STREAM_MAX_LINES" "$(json_escape "$seq_file")"
+              else
+                json_stream_line "stdout" "$sline"
+                [[ "$quiet" != "true" ]] && printf '%s\n' "$sline"
+              fi
             else
-              json_stream_line "stderr" "$sline"
-              [[ "$quiet" != "true" ]] && printf '%s\n' "$sline" >&2
+              if [[ "$STREAM_MAX_LINES" -gt 0 && "$_stream_count" -ge "$STREAM_MAX_LINES" ]]; then
+                [[ "$_stream_count" -eq "$STREAM_MAX_LINES" ]] && \
+                  printf '{"event":"capped","at":%d,"file":"%s"}\n' "$STREAM_MAX_LINES" "$(json_escape "$seq_file")"
+              else
+                json_stream_line "stderr" "$sline"
+                [[ "$quiet" != "true" ]] && printf '%s\n' "$sline" >&2
+              fi
             fi
+            ((_stream_count++)) || true
           done < <(tail -n +"$((seq_lines + 1))" "$seq_file" 2> /dev/null)
           seq_lines="$current_seq"
           had_output=true
@@ -816,6 +1013,7 @@ execute_sync() {
     local poll_count=0
     local heartbeat_every=$((${STATUS_INTERVAL%.*} * 5))
     [[ "$heartbeat_every" -lt 5 ]] && heartbeat_every=5
+    local _stream_count=0
 
     while kill -0 "$cmd_pid" 2> /dev/null; do
       local had_output=false
@@ -825,10 +1023,21 @@ execute_sync() {
       if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
         while IFS=$'\t' read -r tag sline; do
           if [[ "$tag" == "out" ]]; then
-            json_stream_line "stdout" "$sline"
+            if [[ "$STREAM_MAX_LINES" -gt 0 && "$_stream_count" -ge "$STREAM_MAX_LINES" ]]; then
+              [[ "$_stream_count" -eq "$STREAM_MAX_LINES" ]] && \
+                printf '{"event":"capped","at":%d,"file":"%s"}\n' "$STREAM_MAX_LINES" "$(json_escape "$seq_file")"
+            else
+              json_stream_line "stdout" "$sline"
+            fi
           else
-            json_stream_line "stderr" "$sline"
+            if [[ "$STREAM_MAX_LINES" -gt 0 && "$_stream_count" -ge "$STREAM_MAX_LINES" ]]; then
+              [[ "$_stream_count" -eq "$STREAM_MAX_LINES" ]] && \
+                printf '{"event":"capped","at":%d,"file":"%s"}\n' "$STREAM_MAX_LINES" "$(json_escape "$seq_file")"
+            else
+              json_stream_line "stderr" "$sline"
+            fi
           fi
+          ((_stream_count++)) || true
         done < <(tail -n +"$((seq_lines + 1))" "$seq_file" 2> /dev/null)
         seq_lines="$current_seq"
         had_output=true
@@ -1085,6 +1294,7 @@ poll_job_stream() {
   fi
 
   local seq_lines=0 out_lines=0 err_lines=0
+  local _stream_count=0
 
   # Polling loop with heartbeat events (seq-based ordering)
   while true; do
@@ -1117,18 +1327,25 @@ poll_job_stream() {
       if [[ "${current_seq:-0}" -gt "$seq_lines" ]]; then
         while IFS=$'\t' read -r tag sline; do
           if [[ "$tag" == "out" ]]; then
-            if [[ "$plain" == "true" ]]; then
+            if [[ "$STREAM_MAX_LINES" -gt 0 && "$_stream_count" -ge "$STREAM_MAX_LINES" ]]; then
+              [[ "$_stream_count" -eq "$STREAM_MAX_LINES" ]] && \
+                printf '{"event":"capped","at":%d,"file":"%s"}\n' "$STREAM_MAX_LINES" "$(json_escape "$SEQ_FILE")"
+            elif [[ "$plain" == "true" ]]; then
               printf '%s\n' "$sline"
             else
               json_stream_line "stdout" "$sline"
             fi
           else
-            if [[ "$plain" == "true" ]]; then
+            if [[ "$STREAM_MAX_LINES" -gt 0 && "$_stream_count" -ge "$STREAM_MAX_LINES" ]]; then
+              [[ "$_stream_count" -eq "$STREAM_MAX_LINES" ]] && \
+                printf '{"event":"capped","at":%d,"file":"%s"}\n' "$STREAM_MAX_LINES" "$(json_escape "$SEQ_FILE")"
+            elif [[ "$plain" == "true" ]]; then
               printf '[stderr] %s\n' "$sline"
             else
               json_stream_line "stderr" "$sline"
             fi
           fi
+          ((_stream_count++)) || true
         done < <(tail -n +"$((seq_lines + 1))" "$SEQ_FILE" 2> /dev/null)
         seq_lines="$current_seq"
         had_output=true
@@ -1142,11 +1359,15 @@ poll_job_stream() {
           local lines_to_emit
           lines_to_emit=$(tail -n +"$((out_lines + 1))" "$STDOUT_FILE" 2> /dev/null)
           while IFS= read -r line; do
-            if [[ "$plain" == "true" ]]; then
+            if [[ "$STREAM_MAX_LINES" -gt 0 && "$_stream_count" -ge "$STREAM_MAX_LINES" ]]; then
+              [[ "$_stream_count" -eq "$STREAM_MAX_LINES" ]] && \
+                printf '{"event":"capped","at":%d,"file":"legacy"}\n' "$STREAM_MAX_LINES"
+            elif [[ "$plain" == "true" ]]; then
               printf '%s\n' "$line"
             else
               json_stream_line "stdout" "$line"
             fi
+            ((_stream_count++)) || true
           done <<< "$lines_to_emit"
           out_lines="$current_out"
           had_output=true
@@ -1159,11 +1380,15 @@ poll_job_stream() {
           local lines_to_emit
           lines_to_emit=$(tail -n +"$((err_lines + 1))" "$STDERR_FILE" 2> /dev/null)
           while IFS= read -r line; do
-            if [[ "$plain" == "true" ]]; then
+            if [[ "$STREAM_MAX_LINES" -gt 0 && "$_stream_count" -ge "$STREAM_MAX_LINES" ]]; then
+              [[ "$_stream_count" -eq "$STREAM_MAX_LINES" ]] && \
+                printf '{"event":"capped","at":%d,"file":"legacy"}\n' "$STREAM_MAX_LINES"
+            elif [[ "$plain" == "true" ]]; then
               printf '[stderr] %s\n' "$line"
             else
               json_stream_line "stderr" "$line"
             fi
+            ((_stream_count++)) || true
           done <<< "$lines_to_emit"
           err_lines="$current_err"
           had_output=true
@@ -1590,6 +1815,8 @@ OPTIONS:
                           Only command stdout goes to actuator stdout. No JSON/plain
                           on stdout or stderr. Metadata saved to job file only
                           (accessible via actuator -p <job_id>)
+  -i, --interactive       Interactive mode: skip output capture (no FIFOs) so PTY-dependent commands
+                          (ssh, vim, etc.) get a real terminal. stdout/stderr not captured in result.
   -q, --quiet             Suppress command output from terminal and metadata
   --verbose               Increase verbosity (repeat for more: level 1=command, 2=timing, 3=raw output)
   --init                  Output shell function for eval (enables cd through actuator)
@@ -1605,6 +1832,10 @@ EXAMPLES:
   # With timeout (30 seconds)
   actuator -t 30 "sleep 60"
   actuator -t 30 --- sleep 60
+
+  # Interactive mode (PTY-dependent commands: ssh, vim, etc.)
+  actuator -i --- ssh user@host
+  actuator -i "ssh -L 8080:localhost:8080 user@host"
 
   # Stream real-time status
   actuator -s --- make build
@@ -1669,10 +1900,16 @@ EXAMPLES:
   actuator --cleanup
 
 ENVIRONMENT:
-  ACTUATOR_JOBS_DIR             Job storage directory (default: /tmp/actuator-jobs)
-  ACTUATOR_STATUS_INTERVAL      Status update interval in seconds (default: 5)
-  ACTUATOR_POLL_INTERVAL        Streaming poll interval in seconds (default: 10)
+  ACTUATOR_JOBS_DIR              Job storage directory (default: /tmp/actuator-jobs)
+  ACTUATOR_STATUS_INTERVAL       Status update interval in seconds (default: 5)
+  ACTUATOR_POLL_INTERVAL         Streaming poll interval in seconds (default: 10)
   ACTUATOR_OUTPUT_SIZE_THRESHOLD Output offload threshold in bytes (default: 23000)
+  ACTUATOR_STDERR_SIZE_THRESHOLD Stderr offload threshold in bytes (default: 5000)
+  ACTUATOR_STREAM_LINES          Max lines to emit during streaming (default: 0=unlimited)
+  ACTUATOR_STREAM_TIMESTAMPS     Add timestamps to stream events (default: false)
+  ACTUATOR_SEQ_VERBOSE_ONLY      Suppress SEQ field unless --verbose set (default: false)
+  ACTUATOR_TRACK_TOKENS          Append token estimates to .token_log (default: false)
+  ACTUATOR_COMPRESS_OUTPUT       Compress command output using tool-aware parsers (default: false)
 
 OUTPUT:
   All output is JSON-structured for AI consumption.
@@ -1801,7 +2038,7 @@ require_arg() {
 
 main() {
   local command="" mode="sync" timeout="$DEFAULT_TIMEOUT"
-  local stream="false" plain="false" use_tty="false" quiet="false" write_mode="false" raw_mode="false" seq_mode="false" meta_mode="false"
+  local stream="false" plain="false" use_tty="false" quiet="false" write_mode="false" raw_mode="false" seq_mode="false" meta_mode="false" interactive_mode="false"
   local poll_id="" terminate_id="" terminate_signal="TERM" list_jobs_flag="false" terminate_all_flag="false"
   local custom_job_id="" list_limit="" job_id_width="$DEFAULT_JOB_ID_WIDTH" list_filter="" list_status=""
 
@@ -1898,6 +2135,10 @@ main() {
         ;;
       --verbose)
         ((VERBOSE_LEVEL++)) || true
+        shift
+        ;;
+      -i | --interactive)
+        interactive_mode="true"
         shift
         ;;
       -v | --version)
@@ -2019,6 +2260,24 @@ main() {
       printf '{"status":"error","error":"No command specified. Use -h for help."}\n' >&2
     fi
     exit 1
+  fi
+
+  # Interactive mode: direct exec without FIFO interception.
+  # Required for PTY-dependent commands (ssh, vim, etc.) where isatty() on stdout/stderr must return true.
+  # No output capture — stdout/stderr flow directly to the terminal. Result JSON has empty stdout/stderr fields.
+  if [[ "$interactive_mode" == "true" ]]; then
+    local start_time exit_code=0
+    start_time=$(date +%s)
+    bash -c "$command" || exit_code=$?
+    local end_time status
+    end_time=$(date +%s)
+    if [[ "$exit_code" -ne 0 ]]; then
+      status="failed"
+    else
+      status="completed"
+    fi
+    emit_result "false" "$plain" "$status" "$exit_code" "$command" "" "" "$start_time" "$end_time" "" "" "$EXEC_SEQUENCE" "$EXEC_CWD"
+    exit "$exit_code"
   fi
 
   # Execute

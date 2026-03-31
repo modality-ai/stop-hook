@@ -55,6 +55,38 @@ if [[ "$seq_val" == *$'\t'* ]]; then fail "seq → tags leaked"; else pass "seq 
 out=$(ACTUATOR_JOBS_DIR=$D "$ACTUATOR" --poll no_such_job 2>&1)
 check "missing job → error" '"error":"Job not found"' "$out"
 
+# -- interactive mode --
+out=$(ACTUATOR_JOBS_DIR=$D "$ACTUATOR" -i "echo interactive_hello" 2>&1)
+check "interactive → completed" '"status":"completed"' "$out"
+check "interactive → stdout empty in JSON" '"stdout":""' "$out"
+out=$(ACTUATOR_JOBS_DIR=$D "$ACTUATOR" -i "exit 42" 2>&1)
+check "interactive → exit code propagated" '"exit_code":42' "$out"
+check "interactive → failed status" '"status":"failed"' "$out"
+
+# -- stream line cap --
+# sleep between lines ensures output arrives during the polling loop (not the post-exit flush)
+cap_out=$(ACTUATOR_JOBS_DIR=$D ACTUATOR_STREAM_LINES=3 "$ACTUATOR" -s 'for i in 1 2 3 4 5; do echo "line$i"; sleep 0.15; done' 2>&1)
+cap_event_count=$(echo "$cap_out" | grep -c '"event":"stdout"' || echo 0)
+if [[ "$cap_event_count" -le 3 ]]; then pass "stream cap → stdout events capped at 3"
+else fail "stream cap → expected ≤3 stdout events, got $cap_event_count"; fi
+check "stream cap → capped event emitted" '"event":"capped"' "$cap_out"
+
+# -- stream timestamps --
+ts_out=$(ACTUATOR_JOBS_DIR=$D ACTUATOR_STREAM_TIMESTAMPS=false "$ACTUATOR" -s 'echo ts_test' 2>&1)
+if [[ "$ts_out" != *'"timestamp"'* ]] || [[ "$ts_out" == *'"event":"stdout"'*'"timestamp"'* ]]; then
+  if echo "$ts_out" | grep '"event":"stdout"' | grep -q '"timestamp"'; then
+    fail "stream timestamps=false → timestamp present in stdout event"
+  else
+    pass "stream timestamps=false → no timestamp in stdout event"
+  fi
+fi
+ts_out=$(ACTUATOR_JOBS_DIR=$D ACTUATOR_STREAM_TIMESTAMPS=true "$ACTUATOR" -s 'echo ts_test' 2>&1)
+if echo "$ts_out" | grep '"event":"stdout"' | grep -q '"timestamp"'; then
+  pass "stream timestamps=true → timestamp present in stdout event"
+else
+  fail "stream timestamps=true → timestamp missing from stdout event"
+fi
+
 # -- kill_tree: sync timeout kills child processes --
 MARKER="/tmp/actuator-kill-test-$$"
 rm -f "$MARKER"
