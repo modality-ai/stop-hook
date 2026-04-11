@@ -15,7 +15,7 @@ PROMPT=$(awk '/^---$/{i++; next} i>=2' "$STATE")
 [[ "$ITER" =~ ^[0-9]+$ && "$MAX" =~ ^[0-9]+$ ]] || { rm -f "$STATE"; exit 0; }
 
 # Check max iterations
-(( ITER >= MAX && MAX > 0 )) && { echo "Max iterations reached."; rm -f "$STATE"; exit 0; }
+(( ITER >= MAX && MAX > 0 )) && { rm -f "$STATE"; echo "Max iterations reached."; exit 0; }
 
 # Check completion promise in transcript
 INPUT=$(cat)
@@ -23,7 +23,7 @@ if [[ -n "$PROMISE" && "$PROMISE" != "null" ]]; then
   TRANSCRIPT=$(echo "$INPUT" | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
   if [[ -f "$TRANSCRIPT" ]]; then
     FOUND=$(tail -10 "$TRANSCRIPT" 2>/dev/null | grep --color=never -o '<promise>[^<]*</promise>' | tail -5 | sed 's/<[^>]*>//g' || true)
-    echo "$FOUND" | grep -qxF "$PROMISE" && { echo "Completed: $PROMISE"; rm -f "$STATE"; exit 0; }
+    echo "$FOUND" | grep -qxF "$PROMISE" && { rm -f "$STATE"; echo "Completed: $PROMISE"; exit 0; }
   fi
 fi
 
