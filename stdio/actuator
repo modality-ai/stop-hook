@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.5.0"
+readonly VERSION="2.5.1"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
