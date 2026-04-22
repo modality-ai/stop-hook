@@ -78,7 +78,7 @@ offload_message() {
   if [[ -f "$file_path" ]]; then
     line_count=$(wc -l < "$file_path" 2>/dev/null || echo 0)
     error_count=$(grep -ciE '(error|fatal|exception|traceback|panic|failed)' \
-      "$file_path" 2>/dev/null || echo 0)
+      "$file_path" 2>/dev/null) || error_count=0
   fi
 
   case "${VERBOSE_LEVEL:-0}" in
@@ -140,7 +140,7 @@ _compress_lint() {
   local errors=0 warnings=0 files=0
   errors=$(printf '%s' "$out" | grep -oE '[0-9]+ error' | grep -oE '[0-9]+' | paste -sd+ | bc 2>/dev/null || echo 0)
   warnings=$(printf '%s' "$out" | grep -oE '[0-9]+ warning' | grep -oE '[0-9]+' | paste -sd+ | bc 2>/dev/null || echo 0)
-  files=$(printf '%s' "$out" | grep -cE '^[^[:space:]].*\.(ts|js|tsx|jsx):' 2>/dev/null || echo 0)
+  files=$(printf '%s' "$out" | grep -cE '^[^[:space:]].*\.(ts|js|tsx|jsx):' 2>/dev/null) || files=0
   case "$mode" in
     0) printf '[x]%s [!]%s %sF' "${errors:-0}" "${warnings:-0}" "${files:-0}" ;;
     1) printf '[x]%s errors [!]%s warnings in %s files\n%s' \
@@ -153,10 +153,10 @@ _compress_lint() {
 _compress_git_status() {
   local out="$1" mode="${2:-0}"
   local modified added deleted untracked
-  modified=$(printf '%s' "$out" | grep -cE '^.M|^M' 2>/dev/null || echo 0)
-  added=$(printf '%s' "$out" | grep -cE '^A|^.A' 2>/dev/null || echo 0)
-  deleted=$(printf '%s' "$out" | grep -cE '^.D|^D' 2>/dev/null || echo 0)
-  untracked=$(printf '%s' "$out" | grep -cF '??' 2>/dev/null || echo 0)
+  modified=$(printf '%s' "$out" | grep -cE '^.M|^M' 2>/dev/null) || modified=0
+  added=$(printf '%s' "$out" | grep -cE '^A|^.A' 2>/dev/null) || added=0
+  deleted=$(printf '%s' "$out" | grep -cE '^.D|^D' 2>/dev/null) || deleted=0
+  untracked=$(printf '%s' "$out" | grep -cF '??' 2>/dev/null) || untracked=0
   case "$mode" in
     0) printf 'M:%s A:%s D:%s ?:%s' \
          "${modified:-0}" "${added:-0}" "${deleted:-0}" "${untracked:-0}" ;;
@@ -184,8 +184,8 @@ _compress_pkg_install() {
 _compress_build() {
   local out="$1" mode="${2:-0}"
   local errors warnings duration status="ok"
-  errors=$(printf '%s' "$out" | grep -ciE '^error|: error\[' 2>/dev/null || echo 0)
-  warnings=$(printf '%s' "$out" | grep -ciE '^warning|: warning\[' 2>/dev/null || echo 0)
+  errors=$(printf '%s' "$out" | grep -ciE '^error|: error\[' 2>/dev/null) || errors=0
+  warnings=$(printf '%s' "$out" | grep -ciE '^warning|: warning\[' 2>/dev/null) || warnings=0
   duration=$(printf '%s' "$out" | grep -oE '[0-9]+(\.[0-9]+)?(ms|s)' | tail -1)
   [[ "${errors:-0}" -gt 0 ]] && status="[x]"
   case "$mode" in
