@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.5.1"
+readonly VERSION="2.5.2"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -138,8 +138,8 @@ _compress_test() {
 _compress_lint() {
   local out="$1" mode="${2:-0}"
   local errors=0 warnings=0 files=0
-  errors=$(printf '%s' "$out" | grep -oE '[0-9]+ error' | grep -oE '[0-9]+' | paste -sd+ | bc 2>/dev/null || echo 0)
-  warnings=$(printf '%s' "$out" | grep -oE '[0-9]+ warning' | grep -oE '[0-9]+' | paste -sd+ | bc 2>/dev/null || echo 0)
+  errors=$(printf '%s' "$out" | grep -oE '[0-9]+ error' | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}' || echo 0)
+  warnings=$(printf '%s' "$out" | grep -oE '[0-9]+ warning' | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}' || echo 0)
   files=$(printf '%s' "$out" | grep -cE '^[^[:space:]].*\.(ts|js|tsx|jsx):' 2>/dev/null) || files=0
   case "$mode" in
     0) printf '[x]%s [!]%s %sF' "${errors:-0}" "${warnings:-0}" "${files:-0}" ;;
