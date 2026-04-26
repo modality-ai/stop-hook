@@ -21,3 +21,5 @@
 | `ACTUATOR_SEQ_VERBOSE_ONLY` | `false` | Suppress SEQ field unless `--verbose` set |
 | `ACTUATOR_TRACK_TOKENS` | `false` | Append token estimates to `.token_log` |
 | `ACTUATOR_COMPRESS_OUTPUT` | `false` | Compress command output using tool-aware parsers |
+| `ACTUATOR_CLEANUP_THRESHOLD` | `1000` | Auto-evict oldest finished jobs when total exceeds this on `--list` (0 = disabled) |
+| `ACTUATOR_EVICT_COUNT` | `500` | Number of oldest finished jobs to remove per auto-eviction |

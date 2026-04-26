@@ -4,7 +4,7 @@
 # =============================================================================
 set -euo pipefail
 
-readonly VERSION="2.5.2"
+readonly VERSION="2.6.0"
 readonly JOBS_DIR="${ACTUATOR_JOBS_DIR:-/tmp/actuator-jobs}"
 readonly SEQUENCE_FILE="${JOBS_DIR}/.sequence"
 readonly DEFAULT_TIMEOUT=0
@@ -23,6 +23,8 @@ readonly SEQ_VERBOSE_ONLY="${ACTUATOR_SEQ_VERBOSE_ONLY:-false}"
 readonly TRACK_TOKENS="${ACTUATOR_TRACK_TOKENS:-false}"
 readonly COMPRESS_OUTPUT="${ACTUATOR_COMPRESS_OUTPUT:-false}"
 readonly DEFAULT_JOB_ID_WIDTH="${ACTUATOR_JOB_ID_WIDTH:-30}"
+readonly CLEANUP_THRESHOLD="${ACTUATOR_CLEANUP_THRESHOLD:-1000}"  # Auto-evict when job count exceeds this (0 = disabled)
+readonly EVICT_COUNT="${ACTUATOR_EVICT_COUNT:-500}"               # Number of oldest finished jobs to remove per eviction
 
 # Global execution sequence (set in main before any command execution)
 EXEC_SEQUENCE=0
@@ -1633,8 +1635,47 @@ list_jobs_plain_fast() {
   ' "$@"
 }
 
+auto_evict_jobs() {
+  [[ "$CLEANUP_THRESHOLD" -le 0 ]] && return 0
+  local job_files=()
+  shopt -s nullglob
+  for f in "${JOBS_DIR}"/*.job; do
+    job_files+=("$f")
+  done
+  shopt -u nullglob
+  local total=${#job_files[@]}
+  [[ "$total" -le "$CLEANUP_THRESHOLD" ]] && return 0
+
+  # Sort oldest-first by mtime, evict only finished/dead jobs
+  local _sorted
+  _sorted=$(for _f in "${job_files[@]}"; do
+    printf '%s\t%s\n' "$(stat -f%m "$_f" 2>/dev/null || stat -c%Y "$_f" 2>/dev/null || echo 0)" "$_f"
+  done | sort -t$'\t' -k1,1n | cut -f2-)
+  [[ -z "$_sorted" ]] && return 0
+
+  local evicted=0
+  while IFS= read -r job_file; do
+    [[ "$evicted" -ge "$EVICT_COUNT" ]] && break
+    [[ -f "$job_file" ]] || continue
+    local JOB_ID="" PID="" STATUS=""
+    # shellcheck disable=SC1090
+    source "$job_file" || continue
+    local is_finished=false
+    if [[ "$STATUS" != "running" ]]; then
+      is_finished=true
+    elif [[ -z "$PID" || "$PID" == "0" ]] || ! kill -0 "$PID" 2>/dev/null; then
+      is_finished=true
+    fi
+    if [[ "$is_finished" == "true" ]]; then
+      rm -f "$job_file" "${JOBS_DIR}/${JOB_ID}.stdout" "${JOBS_DIR}/${JOB_ID}.stderr" "${JOBS_DIR}/${JOB_ID}.seq"
+      evicted=$((evicted + 1))
+    fi
+  done <<< "$_sorted"
+}
+
 list_jobs() {
   init_jobs_dir
+  auto_evict_jobs
   local plain="${1:-false}" limit="${2:-0}" id_width="${3:-$DEFAULT_JOB_ID_WIDTH}" filter="${4:-}" status_filter="${5:-}"
 
   # Collect job files
@@ -1804,6 +1845,10 @@ OPTIONS:
   -n, --limit <N>         Limit job list to N most recent entries (use with -l)
   -L, --id-width <N>      Job ID column width in plain list output (default: 30)
   --cleanup               Remove completed job artifacts
+
+ENVIRONMENT:
+  ACTUATOR_CLEANUP_THRESHOLD=<N>  Auto-evict when job count exceeds N during --list (default: 1000)
+  ACTUATOR_EVICT_COUNT=<N>        Number of oldest finished jobs to remove per auto-eviction (default: 500)
   --stdin                 Read command from stdin (for shell metacharacters)
   --plain                 Output plain text instead of JSON
   -w, --write             Write mode: pass command stdout to actuator stdout,
