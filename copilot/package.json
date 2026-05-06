@@ -26,8 +26,11 @@
     "build:src": "bun build src/index.ts --outfile dist/index.mjs --target node",
     "build": "bun run build:clean && bun run build:types && bun run build:src",
     "dev": "bunx concurrently 'bun --watch tsc  -p ./' 'bun build:src -- --watch --sourcemap=inline'",
-    "test": "npm run build",
+    "test": "npm run build && bun test",
     "prepublishOnly": "npm t"
   },
-  "files": ["package.json", "README.md", "dist"]
+  "files": ["package.json", "README.md", "dist"],
+  "dependencies": {
+    "hono": "^4.12.18"
+  }
 }
