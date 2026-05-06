@@ -14,6 +14,19 @@ interface SessionEntry {
   queue: Promise<void>;
 }
 
+type BlobAttachment = {
+  type: "blob";
+  data: string;
+  mimeType: string;
+  displayName?: string;
+};
+
+interface PromptInput {
+  prompt: string;
+  attachments?: BlobAttachment[];
+  error?: string;
+}
+
 const sessions = new Map<string, SessionEntry>();
 const sessionCreating = new Map<string, Promise<SessionEntry>>();
 
@@ -85,6 +98,64 @@ function estimateInputTokens(body: any): number {
   return Math.round(chars / 4);
 }
 
+function parseDataImageUrl(url: string): BlobAttachment | null {
+  const match = url.match(/^data:([^;,]+);base64,(.+)$/s);
+  if (!match) return null;
+  const mimeType = match[1];
+  if (!mimeType.startsWith("image/")) return null;
+  return {
+    type: "blob",
+    mimeType,
+    data: match[2],
+  };
+}
+
+function extractPromptInput(message: any): PromptInput {
+  const content = message?.content;
+  if (typeof content === "string") return { prompt: content };
+  if (!Array.isArray(content)) return { prompt: "" };
+
+  const textParts: string[] = [];
+  const attachments: BlobAttachment[] = [];
+
+  for (const block of content) {
+    if (block.type === "text") {
+      textParts.push(block.text ?? "");
+      continue;
+    }
+
+    if (block.type === "image_url") {
+      const url = typeof block.image_url === "string" ? block.image_url : block.image_url?.url;
+      if (typeof url !== "string") return { prompt: "", error: "Invalid image_url content" };
+      const attachment = parseDataImageUrl(url);
+      if (!attachment) return { prompt: "", error: "Only base64 data image_url content is supported" };
+      attachments.push(attachment);
+      continue;
+    }
+
+    if (block.type === "image") {
+      const src = block.source;
+      if (src?.type !== "base64" || typeof src.data !== "string") {
+        return { prompt: "", error: "Only base64 image content is supported" };
+      }
+      const mimeType = src.media_type ?? "application/octet-stream";
+      if (!mimeType.startsWith("image/")) {
+        return { prompt: "", error: "Only base64 image content is supported" };
+      }
+      attachments.push({
+        type: "blob",
+        data: src.data,
+        mimeType,
+      });
+    }
+  }
+
+  return {
+    prompt: textParts.join("\n"),
+    ...(attachments.length && { attachments }),
+  };
+}
+
 // ─────────────────────────────────────────────────────────────
 // SSE helpers
 // ─────────────────────────────────────────────────────────────
@@ -124,6 +195,7 @@ function sseOpenAIFinish(id: string, model: string): Uint8Array {
 function sendAndStream(
   entry: SessionEntry,
   prompt: string,
+  attachments: BlobAttachment[] | undefined,
   completionId: string,
   model: string
 ): ReadableStream<Uint8Array> {
@@ -152,7 +224,7 @@ function sendAndStream(
         }
       });
 
-      entry.session.send({ prompt }).catch(reject);
+      entry.session.send(attachments?.length ? { prompt, attachments } : { prompt }).catch(reject);
     });
 
   entry.queue = entry.queue
@@ -169,7 +241,8 @@ function sendAndStream(
 
 async function sendAndCollect(
   entry: SessionEntry,
-  prompt: string
+  prompt: string,
+  attachments?: BlobAttachment[]
 ): Promise<string> {
   let fullContent = "";
 
@@ -189,7 +262,7 @@ async function sendAndCollect(
         }
       });
 
-      entry.session.send({ prompt }).catch(reject);
+      entry.session.send(attachments?.length ? { prompt, attachments } : { prompt }).catch(reject);
     });
 
   const turn = entry.queue.then(work);
@@ -248,17 +321,13 @@ app.post("/v1/chat/completions", async (c) => {
   // Extract last user message only (session owns its own context)
   const messages: any[] = body.messages ?? [];
   const lastUser = [...messages].reverse().find((m) => m.role === "user");
-  const prompt =
-    typeof lastUser?.content === "string"
-      ? lastUser.content
-      : Array.isArray(lastUser?.content)
-        ? lastUser.content
-            .filter((b: any) => b.type === "text")
-            .map((b: any) => b.text)
-            .join("\n")
-        : "";
+  const { prompt, attachments, error } = extractPromptInput(lastUser);
 
-  if (!prompt) {
+  if (error) {
+    return c.json({ error: { message: error } }, 400);
+  }
+
+  if (!prompt && !attachments?.length) {
     return c.json({ error: { message: "No user message found" } }, 400);
   }
 
@@ -266,7 +335,7 @@ app.post("/v1/chat/completions", async (c) => {
     const entry = await getOrCreateEntry(sessionKey);
 
     if (body.stream) {
-      const stream = sendAndStream(entry, prompt, completionId, model);
+      const stream = sendAndStream(entry, prompt, attachments, completionId, model);
       return new Response(stream, {
         status: 200,
         headers: {
@@ -277,7 +346,7 @@ app.post("/v1/chat/completions", async (c) => {
       });
     }
 
-    const content = await sendAndCollect(entry, prompt);
+    const content = await sendAndCollect(entry, prompt, attachments);
     return c.json({
       id: completionId,
       object: "chat.completion",
