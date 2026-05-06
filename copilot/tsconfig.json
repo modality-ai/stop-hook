@@ -1,9 +1,9 @@
 {
   "compilerOptions": {
-    "module": "none",
+    "module": "preserve",
     "target": "ESNext",
     "lib": ["ES2022"],
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "esModuleInterop": true,
     "sourceMap": false,
     "rootDir": "src",

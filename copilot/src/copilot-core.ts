@@ -642,9 +642,9 @@ export const initSession = async (
       const denyTools: string[] = options["denyTools"] ?? [];
       if (denyTools.includes(request?.kind)) {
         logger.log(`🚫 Permission denied for tool: ${request?.kind}`);
-        return { kind: "denied-by-rules" as const, rules: [] };
+        return { kind: "reject" as const };
       }
-      return { kind: "approved" as const };
+      return { kind: "approve-once" as const };
     },
     hooks: {
       onPreToolUse: async (input: any): Promise<PreToolUseHookOutput> => {
