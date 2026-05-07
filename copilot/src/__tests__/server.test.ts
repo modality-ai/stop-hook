@@ -202,6 +202,46 @@ describe("server.ts", () => {
       expect(text).toContain("[DONE]");
     });
 
+    // ── tool_result round-trip ───────────────────────────────────────────────
+    test("formats tool_result as [Tool result for name]: content", async () => {
+      let capturedPrompt = "";
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "session.idle", data: {} }), 0);
+        return () => {};
+      });
+      mockSend.mockImplementation(async (args: any) => { capturedPrompt = args?.prompt ?? ""; });
+
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        messages: [
+          { role: "user", content: "do it" },
+          { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "calculator", input: {} }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "42" }] },
+        ],
+      }, { "x-session-id": "tool-result-test" }));
+
+      expect(capturedPrompt).toBe("[Tool result for calculator]: 42\ndo it");
+    });
+
+    test("passes denyAllTools and tool schema prefix when tools[] provided", async () => {
+      mockInitSession.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "session.idle", data: {} }), 0);
+        return () => {};
+      });
+
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        messages: [{ role: "user", content: "use a tool" }],
+        tools: [{ name: "search", description: "web search", input_schema: { type: "object" } }],
+      }, { "x-session-id": "deny-all-tools-test" }));
+
+      const [prompt, opts] = mockInitSession.mock.calls[0];
+      expect(opts).toEqual({ denyAllTools: true });
+      expect(prompt).toContain("search");
+      expect(prompt).toContain("tool_use");
+    });
+
     test("extracts last user message from messages array", async () => {
       let capturedPrompt = "";
       mockOn.mockImplementation((handler: any) => {

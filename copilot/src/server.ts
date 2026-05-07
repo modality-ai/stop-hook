@@ -30,20 +30,41 @@ interface PromptInput {
 const sessions = new Map<string, SessionEntry>();
 const sessionCreating = new Map<string, Promise<SessionEntry>>();
 
-async function getOrCreateEntry(sessionKey: string): Promise<SessionEntry> {
+// Build system-prompt prefix that instructs the model to emit tool calls as inline
+// JSON text instead of invoking SDK tools. Matches DEFAULT_SYSTEM_PREFIX convention
+// in claude/handler.ts so streamProcessor.ts can parse them unchanged.
+function buildToolSystemPrefix(tools: any[]): string {
+  if (!tools.length) return "";
+  const schema = tools.map(({ name, description, input_schema }: any) => ({
+    name,
+    description,
+    input_schema,
+  }));
+  return [
+    'When calling a tool, output ONLY this JSON and stop: {"tool_use":{"name":"<name>","input":<args>}}',
+    "Never add surrounding text when calling a tool.",
+    `Available tools: ${JSON.stringify(schema)}`,
+  ].join("\n");
+}
+
+async function getOrCreateEntry(sessionKey: string, tools?: any[]): Promise<SessionEntry> {
   const existing = sessions.get(sessionKey);
   if (existing) return existing;
 
   // Deduplicate concurrent creation for the same key
   let creating = sessionCreating.get(sessionKey);
   if (!creating) {
-    creating = ensureClientStarted().then(() => initSession("", {})).then((session) => {
-      const entry: SessionEntry = { session, queue: Promise.resolve() };
-      sessions.set(sessionKey, entry);
-      sessionCreating.delete(sessionKey);
-      logger.log(`🆕 Server session created: ${sessionKey}`);
-      return entry;
-    });
+    const toolPrefix = tools?.length ? buildToolSystemPrefix(tools) : "";
+    const sessionOpts = tools?.length ? { denyAllTools: true } : {};
+    creating = ensureClientStarted()
+      .then(() => initSession(toolPrefix, sessionOpts))
+      .then((session) => {
+        const entry: SessionEntry = { session, queue: Promise.resolve() };
+        sessions.set(sessionKey, entry);
+        sessionCreating.delete(sessionKey);
+        logger.log(`🆕 Server session created: ${sessionKey}${tools?.length ? ` (${tools.length} tools injected)` : ""}`);
+        return entry;
+      });
     sessionCreating.set(sessionKey, creating);
   }
   return creating;
@@ -154,6 +175,53 @@ function extractPromptInput(message: any): PromptInput {
     prompt: textParts.join("\n"),
     ...(attachments.length && { attachments }),
   };
+}
+
+// Resolve the tool name for a tool_use_id by scanning prior assistant messages.
+function resolveToolName(messages: any[], toolUseId: string): string {
+  for (const msg of messages) {
+    if (msg.role !== "assistant") continue;
+    for (const block of Array.isArray(msg.content) ? msg.content : []) {
+      if (block.type === "tool_use" && block.id === toolUseId) return block.name ?? toolUseId;
+    }
+  }
+  return toolUseId;
+}
+
+// Extract the prompt for the Copilot session from the full message history.
+// Handles the tool-use round-trip: tool_result messages are formatted as
+// "[Tool result for {name}]: {content}" so the stateful session can continue.
+function extractLastTurn(messages: any[]): PromptInput {
+  const toolResultLines: string[] = [];
+
+  // Walk messages in reverse, collecting consecutive tool_result turns
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role !== "user") continue;
+    const blocks: any[] = Array.isArray(msg.content) ? msg.content : [];
+    const isPureToolResult = blocks.length > 0 && blocks.every((b: any) => b.type === "tool_result");
+    if (!isPureToolResult) {
+      // This is the real user message — extract it and prepend any tool results
+      const base = extractPromptInput(msg);
+      if (!toolResultLines.length) return base;
+      const combined = [...toolResultLines, ...(base.prompt ? [base.prompt] : [])].join("\n");
+      return { prompt: combined, attachments: base.attachments };
+    }
+    // Format tool_result blocks
+    for (const block of blocks) {
+      const name = resolveToolName(messages, block.tool_use_id);
+      const content =
+        typeof block.content === "string"
+          ? block.content
+          : Array.isArray(block.content)
+            ? block.content.map((c: any) => c.text ?? "").join("\n")
+            : "";
+      toolResultLines.unshift(`[Tool result for ${name}]: ${content}`);
+    }
+  }
+
+  // Only tool results, no prior user message
+  return { prompt: toolResultLines.join("\n") };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -318,10 +386,10 @@ app.post("/v1/chat/completions", async (c) => {
   const model = body.model ?? "gpt-4.1";
   const completionId = `chatcmpl-${Date.now().toString(36)}`;
 
-  // Extract last user message only (session owns its own context)
+  // Extract the latest turn — resolves tool_result blocks into formatted text so
+  // the stateful Copilot session can continue after client-side tool execution.
   const messages: any[] = body.messages ?? [];
-  const lastUser = [...messages].reverse().find((m) => m.role === "user");
-  const { prompt, attachments, error } = extractPromptInput(lastUser);
+  const { prompt, attachments, error } = extractLastTurn(messages);
 
   if (error) {
     return c.json({ error: { message: error } }, 400);
@@ -332,7 +400,7 @@ app.post("/v1/chat/completions", async (c) => {
   }
 
   try {
-    const entry = await getOrCreateEntry(sessionKey);
+    const entry = await getOrCreateEntry(sessionKey, body.tools);
 
     if (body.stream) {
       const stream = sendAndStream(entry, prompt, attachments, completionId, model);

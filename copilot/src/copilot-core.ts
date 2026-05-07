@@ -639,6 +639,10 @@ export const initSession = async (
       backgroundCompactionThreshold: 0.65,
     },
     onPermissionRequest: async (request: any) => {
+      if (options["denyAllTools"]) {
+        logger.log(`🚫 Server mode: permission blocked for: ${request?.kind}`);
+        return { kind: "reject" as const };
+      }
       const denyTools: string[] = options["denyTools"] ?? [];
       if (denyTools.includes(request?.kind)) {
         logger.log(`🚫 Permission denied for tool: ${request?.kind}`);
@@ -649,6 +653,13 @@ export const initSession = async (
     hooks: {
       onPreToolUse: async (input: any): Promise<PreToolUseHookOutput> => {
         const { toolName, timestamp, toolArgs } = input || {};
+        if (options["denyAllTools"]) {
+          logger.log(`🚫 Server mode: tool execution blocked for: ${toolName}`);
+          return {
+            permissionDecision: "deny",
+            permissionDecisionReason: "Tool execution is handled by the client in server mode.",
+          };
+        }
         const denyTools: string[] = options["denyTools"] ?? [];
         if (denyTools.includes(toolName)) {
           logger.log(`🚫 Pre-tool denied: ${toolName}`);
