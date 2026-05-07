@@ -18,6 +18,7 @@ mock.module("../copilot-core", () => ({
   logger: { log: () => {}, error: () => {} },
   getState: () => ({}),
   whichCli: () => null,
+  setClientCwd: mock(() => {}),
   COPILOT_LOOP_DIR: "/tmp/copilot-loop",
 }));
 
@@ -154,7 +155,7 @@ describe("server.ts", () => {
     test("uses x-session-id header to key sessions", async () => {
       mockInitSession.mockClear();
       mockOn.mockImplementation((handler: any) => {
-        setTimeout(() => handler({ type: "session.idle", data: {} }), 0);
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
         return () => {};
       });
 
@@ -180,7 +181,7 @@ describe("server.ts", () => {
         setTimeout(() => {
           handler({ type: "assistant.message_delta", data: { deltaContent: "Hello" } });
           handler({ type: "assistant.message_delta", data: { deltaContent: " world" } });
-          handler({ type: "session.idle", data: {} });
+          handler({ type: "assistant.turn_end", data: {} });
         }, 0);
         return () => {};
       });
@@ -206,7 +207,7 @@ describe("server.ts", () => {
     test("formats tool_result as [Tool result for name]: content", async () => {
       let capturedPrompt = "";
       mockOn.mockImplementation((handler: any) => {
-        setTimeout(() => handler({ type: "session.idle", data: {} }), 0);
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
         return () => {};
       });
       mockSend.mockImplementation(async (args: any) => { capturedPrompt = args?.prompt ?? ""; });
@@ -220,13 +221,13 @@ describe("server.ts", () => {
         ],
       }, { "x-session-id": "tool-result-test" }));
 
-      expect(capturedPrompt).toBe("[Tool result for calculator]: 42\ndo it");
+      expect(capturedPrompt).toBe("[Tool result for calculator]: 42");
     });
 
     test("passes denyAllTools and tool schema prefix when tools[] provided", async () => {
       mockInitSession.mockClear();
       mockOn.mockImplementation((handler: any) => {
-        setTimeout(() => handler({ type: "session.idle", data: {} }), 0);
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
         return () => {};
       });
 
@@ -237,15 +238,17 @@ describe("server.ts", () => {
       }, { "x-session-id": "deny-all-tools-test" }));
 
       const [prompt, opts] = mockInitSession.mock.calls[0];
-      expect(opts).toEqual({ denyAllTools: true });
+      expect(opts).toEqual({ denyAllTools: true, systemPromptMode: "replace" });
       expect(prompt).toContain("search");
       expect(prompt).toContain("tool_use");
+      expect(prompt).toContain("You MUST call one listed tool");
+      expect(prompt).toContain("instead of asking a clarification question");
     });
 
     test("extracts last user message from messages array", async () => {
       let capturedPrompt = "";
       mockOn.mockImplementation((handler: any) => {
-        setTimeout(() => handler({ type: "session.idle", data: {} }), 0);
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
         return () => {};
       });
       mockSend.mockImplementation(async (args: any) => {

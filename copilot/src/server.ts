@@ -1,6 +1,14 @@
 import { Hono } from "hono";
-import { client, initSession, logger } from "./copilot-core";
+import { mkdirSync } from "fs";
+import { client, initSession, logger, setClientCwd, COPILOT_LOOP_DIR } from "./copilot-core";
 import type { CopilotSession } from "@github/copilot-sdk";
+
+// Server mode runs the Copilot binary from an isolated cwd so it never picks
+// up the project's hooks/ directory (which would otherwise fire sessionStart
+// on every turn — see hooks/agent-loop.json). Must run before client.start().
+const SERVER_MODE_CWD = `${COPILOT_LOOP_DIR}/server-mode-cwd`;
+mkdirSync(SERVER_MODE_CWD, { recursive: true });
+setClientCwd(SERVER_MODE_CWD);
 
 // ─────────────────────────────────────────────────────────────
 // Session registry: x-session-id → CopilotSession
@@ -33,39 +41,119 @@ const sessionCreating = new Map<string, Promise<SessionEntry>>();
 // Build system-prompt prefix that instructs the model to emit tool calls as inline
 // JSON text instead of invoking SDK tools. Matches DEFAULT_SYSTEM_PREFIX convention
 // in claude/handler.ts so streamProcessor.ts can parse them unchanged.
-function buildToolSystemPrefix(tools: any[]): string {
-  if (!tools.length) return "";
-  const schema = tools.map(({ name, description, input_schema }: any) => ({
+type NormalizedTool = {
+  name: string;
+  description: string;
+  input_schema: any;
+};
+
+// Accept both Anthropic shape ({ name, description, input_schema }) and OpenAI
+// shape ({ type: "function", function: { name, description, parameters } }).
+// The upstream proxy may translate Anthropic → OpenAI before reaching us.
+function normalizeTool(tool: any): NormalizedTool | null {
+  if (!tool || typeof tool !== "object") return null;
+  const fn = tool.function ?? {};
+  const name = tool.name ?? fn.name;
+  if (typeof name !== "string" || !name) return null;
+  return {
     name,
-    description,
-    input_schema,
-  }));
+    description: tool.description ?? fn.description ?? "",
+    input_schema: tool.input_schema ?? fn.parameters ?? {},
+  };
+}
+
+function formatToolEntry(tool: NormalizedTool, idx: number): string {
+  const props = tool.input_schema?.properties ?? {};
+  const required: string[] = tool.input_schema?.required ?? [];
+  const fieldLines = Object.entries(props).map(([key, val]: [string, any]) => {
+    const flag = required.includes(key) ? " (required)" : "";
+    const t = val?.type ?? "any";
+    const desc = val?.description ? ` — ${val.description}` : "";
+    return `      - ${key}: ${t}${flag}${desc}`;
+  });
+  const fieldsBlock = fieldLines.length ? `\n    fields:\n${fieldLines.join("\n")}` : "";
+  return `  ${idx + 1}. name: ${tool.name}\n    description: ${tool.description}${fieldsBlock}`;
+}
+
+function sampleValue(propSchema: any): any {
+  const t = propSchema?.type;
+  if (t === "string") return propSchema?.enum?.[0] ?? "...";
+  if (t === "number" || t === "integer") return 0;
+  if (t === "boolean") return true;
+  if (t === "array") return [];
+  if (t === "object") return {};
+  return "...";
+}
+
+function buildExampleCall(tool: NormalizedTool): string {
+  const props = tool.input_schema?.properties ?? {};
+  const required: string[] = tool.input_schema?.required ?? [];
+  const sample: Record<string, any> = {};
+  for (const key of required) sample[key] = sampleValue(props[key]);
+  return JSON.stringify({ tool_use: { name: tool.name, input: sample } });
+}
+
+function buildToolSystemPrefix(tools: any[]): string {
+  const normalized = tools.map(normalizeTool).filter((t): t is NormalizedTool => t !== null);
+  if (!normalized.length) return "";
+  const list = normalized.map(formatToolEntry).join("\n");
+  const example = buildExampleCall(normalized[0]);
   return [
-    'When calling a tool, output ONLY this JSON and stop: {"tool_use":{"name":"<name>","input":<args>}}',
-    "Never add surrounding text when calling a tool.",
-    `Available tools: ${JSON.stringify(schema)}`,
+    "You are a tool-using assistant. The user's client owns tool execution.",
+    "Per-turn decision flow:",
+    "1. If the user's latest input is a tool result (a line starting with \"[Tool result for <NAME>]: ...\"), the previous tool call has ALREADY succeeded. Reply with a short natural-language answer that uses that result. Do NOT re-emit a tool_use for the same tool.",
+    "2. Otherwise, scan the Available tools list and pick the tool whose description best fits the new request. You MUST call one listed tool; if the request is ambiguous, choose the closest matching tool instead of asking a clarification question.",
+    "When you call a tool, output ONLY a single JSON literal in this shape and nothing else (no prose, no code fences, no extra keys):",
+    '{"tool_use":{"name":"<copy a name verbatim from Available tools>","input":<object whose keys match that tool\'s fields>}}',
+    "Concrete shape example (this references a real entry from the list below; replace name + input with whichever tool actually matches the user's request):",
+    example,
+    "Critical rules:",
+    "- The \"name\" value MUST be copied character-for-character from one of the Available tools entries. Do NOT write placeholder text like \"undefined\" or \"<name>\".",
+    "- Include only fields listed under that tool. Required fields MUST be present.",
+    "- Tool names may be long (e.g. mcp__Foo___Bar). Use the FULL exact string.",
+    "- Never call the same tool more than once for a single user turn unless the user explicitly asks for it again. After a tool result arrives, finish with a text reply.",
+    "Available tools:",
+    list,
   ].join("\n");
 }
 
+// Fingerprint the tool set so requests with different tools key into different
+// upstream sessions, even when the caller reuses the same x-session-id (or has
+// none and falls into __default__). Without this, the first request seen for a
+// session id wins and locks the system prompt for that session's lifetime.
+function toolFingerprint(tools?: any[]): string {
+  if (!tools?.length) return "none";
+  const names = tools
+    .map((t) => t?.name ?? t?.function?.name ?? "")
+    .filter(Boolean)
+    .sort()
+    .join("|");
+  if (!names) return "none";
+  return Bun.hash(names).toString(36);
+}
+
 async function getOrCreateEntry(sessionKey: string, tools?: any[]): Promise<SessionEntry> {
-  const existing = sessions.get(sessionKey);
+  const fullKey = `${sessionKey}::${toolFingerprint(tools)}`;
+  const existing = sessions.get(fullKey);
   if (existing) return existing;
 
   // Deduplicate concurrent creation for the same key
-  let creating = sessionCreating.get(sessionKey);
+  let creating = sessionCreating.get(fullKey);
   if (!creating) {
     const toolPrefix = tools?.length ? buildToolSystemPrefix(tools) : "";
-    const sessionOpts = tools?.length ? { denyAllTools: true } : {};
+    const sessionOpts = tools?.length
+      ? { denyAllTools: true, systemPromptMode: "replace" as const }
+      : {};
     creating = ensureClientStarted()
       .then(() => initSession(toolPrefix, sessionOpts))
       .then((session) => {
         const entry: SessionEntry = { session, queue: Promise.resolve() };
-        sessions.set(sessionKey, entry);
-        sessionCreating.delete(sessionKey);
-        logger.log(`🆕 Server session created: ${sessionKey}${tools?.length ? ` (${tools.length} tools injected)` : ""}`);
+        sessions.set(fullKey, entry);
+        sessionCreating.delete(fullKey);
+        logger.log(`🆕 Server session created: ${fullKey}${tools?.length ? ` (${tools.length} tools injected)` : ""}`);
         return entry;
       });
-    sessionCreating.set(sessionKey, creating);
+    sessionCreating.set(fullKey, creating);
   }
   return creating;
 }
@@ -177,51 +265,83 @@ function extractPromptInput(message: any): PromptInput {
   };
 }
 
-// Resolve the tool name for a tool_use_id by scanning prior assistant messages.
-function resolveToolName(messages: any[], toolUseId: string): string {
+// Resolve the tool name for a tool_use_id / tool_call_id by scanning prior
+// assistant messages. Handles both Anthropic shape (assistant.content[] with
+// type: "tool_use") and OpenAI shape (assistant.tool_calls[] with id+function.name).
+function resolveToolName(messages: any[], toolCallId: string): string {
   for (const msg of messages) {
     if (msg.role !== "assistant") continue;
-    for (const block of Array.isArray(msg.content) ? msg.content : []) {
-      if (block.type === "tool_use" && block.id === toolUseId) return block.name ?? toolUseId;
+    if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block?.type === "tool_use" && block.id === toolCallId) return block.name ?? toolCallId;
+      }
+    }
+    if (Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls) {
+        if (tc?.id === toolCallId) return tc.function?.name ?? tc.name ?? toolCallId;
+      }
     }
   }
-  return toolUseId;
+  return toolCallId;
 }
 
-// Extract the prompt for the Copilot session from the full message history.
-// Handles the tool-use round-trip: tool_result messages are formatted as
-// "[Tool result for {name}]: {content}" so the stateful session can continue.
-function extractLastTurn(messages: any[]): PromptInput {
-  const toolResultLines: string[] = [];
+function formatToolResultContent(content: any): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map((c: any) => c?.text ?? "").join("\n");
+  return "";
+}
 
-  // Walk messages in reverse, collecting consecutive tool_result turns
+// Extract the latest user-side content to forward into the stateful Copilot
+// session. Earlier history is already in the session — re-sending it makes the
+// model treat the original request as fresh and re-call tools in a loop.
+// Handles both formats arriving at this server:
+//   - Anthropic-shaped: tool_result blocks live inside a user message.
+//     `{ role: "user", content: [{ type: "tool_result", tool_use_id, content }] }`
+//   - OpenAI-shaped: each tool_result is its own `{ role: "tool", tool_call_id, content }`.
+//     The mcp-qdrant proxy converts Anthropic → OpenAI before reaching us.
+function extractLastTurn(messages: any[]): PromptInput {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
-    if (msg.role !== "user") continue;
+
+    // OpenAI tool messages: walk back through consecutive role="tool" entries
+    // and emit each one as a "[Tool result for ...]: ..." line.
+    if (msg?.role === "tool") {
+      const toolResultLines: string[] = [];
+      let j = i;
+      while (j >= 0 && messages[j]?.role === "tool") {
+        const m = messages[j];
+        const name = resolveToolName(messages, m.tool_call_id);
+        toolResultLines.unshift(`[Tool result for ${name}]: ${formatToolResultContent(m.content)}`);
+        j--;
+      }
+      return { prompt: toolResultLines.join("\n") };
+    }
+
+    if (msg?.role !== "user") continue;
+
     const blocks: any[] = Array.isArray(msg.content) ? msg.content : [];
-    const isPureToolResult = blocks.length > 0 && blocks.every((b: any) => b.type === "tool_result");
-    if (!isPureToolResult) {
-      // This is the real user message — extract it and prepend any tool results
-      const base = extractPromptInput(msg);
-      if (!toolResultLines.length) return base;
-      const combined = [...toolResultLines, ...(base.prompt ? [base.prompt] : [])].join("\n");
-      return { prompt: combined, attachments: base.attachments };
+    const toolResultBlocks = blocks.filter((b: any) => b?.type === "tool_result");
+    const otherBlocks = blocks.filter((b: any) => b?.type !== "tool_result");
+
+    if (!toolResultBlocks.length) {
+      return extractPromptInput(msg);
     }
-    // Format tool_result blocks
-    for (const block of blocks) {
+
+    const toolResultLines = toolResultBlocks.map((block: any) => {
       const name = resolveToolName(messages, block.tool_use_id);
-      const content =
-        typeof block.content === "string"
-          ? block.content
-          : Array.isArray(block.content)
-            ? block.content.map((c: any) => c.text ?? "").join("\n")
-            : "";
-      toolResultLines.unshift(`[Tool result for ${name}]: ${content}`);
+      return `[Tool result for ${name}]: ${formatToolResultContent(block.content)}`;
+    });
+
+    if (!otherBlocks.length) {
+      return { prompt: toolResultLines.join("\n") };
     }
+
+    const base = extractPromptInput({ ...msg, content: otherBlocks });
+    const combined = [...toolResultLines, ...(base.prompt ? [base.prompt] : [])].join("\n");
+    return { prompt: combined, attachments: base.attachments };
   }
 
-  // Only tool results, no prior user message
-  return { prompt: toolResultLines.join("\n") };
+  return { prompt: "" };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -269,6 +389,12 @@ function sendAndStream(
 ): ReadableStream<Uint8Array> {
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
   const writer = writable.getWriter();
+  // Fire-and-forget writes that swallow rejections. Without this, an aborted
+  // consumer turns every delta into an unhandled rejection ("error: undefined")
+  // logged by Bun per event.
+  const safeWrite = (chunk: Uint8Array) => {
+    writer.write(chunk).catch(() => {});
+  };
 
   // Chain onto session queue so concurrent requests are serialised
   const work = () =>
@@ -276,10 +402,10 @@ function sendAndStream(
       const unsub = entry.session.on((event: any) => {
         try {
           if (event.type === "assistant.message_delta") {
-            writer.write(sseOpenAIDelta(completionId, model, event.data.deltaContent ?? ""));
-          } else if (event.type === "assistant.turn_end" || event.type === "session.idle") {
-            writer.write(sseOpenAIFinish(completionId, model));
-            writer.write(encoder.encode("data: [DONE]\n\n"));
+            safeWrite(sseOpenAIDelta(completionId, model, event.data.deltaContent ?? ""));
+          } else if (event.type === "assistant.turn_end") {
+            safeWrite(sseOpenAIFinish(completionId, model));
+            safeWrite(encoder.encode("data: [DONE]\n\n"));
             unsub();
             resolve();
           } else if (event.type === "session.error") {
@@ -298,7 +424,7 @@ function sendAndStream(
   entry.queue = entry.queue
     .then(work)
     .catch((err: any) => {
-      logger.error(`Server stream error: ${err.message}`);
+      logger.error(`Server stream error: ${err?.message ?? err}`);
     })
     .finally(() => {
       writer.close().catch(() => {});
@@ -321,7 +447,10 @@ async function sendAndCollect(
           fullContent += event.data.deltaContent ?? "";
         } else if (event.type === "assistant.message") {
           fullContent = event.data.content ?? fullContent;
-        } else if (event.type === "assistant.turn_end" || event.type === "session.idle") {
+        } else if (event.type === "assistant.turn_end") {
+          // Only assistant.turn_end is reliable — session.idle can fire from a
+          // prior turn or while the SDK is between operations, which would
+          // resolve us before the model produces output.
           unsub();
           resolve();
         } else if (event.type === "session.error") {
@@ -439,6 +568,7 @@ app.post("/v1/chat/completions", async (c) => {
 });
 
 export default {
-  port: 3000,
+  port: 8318,
   fetch: app.fetch,
+  idleTimeout: 255
 };

@@ -246,11 +246,38 @@ export const setupHealthCheck = (client: CopilotClient, abortController: AbortCo
 };
 
 // ─────────────────────────────────────────────────────────────
-// Copilot client
+// Copilot client (lazy — server mode wants a different cwd to
+// keep Copilot CLI from auto-loading project hooks/agent-loop.json)
 // ─────────────────────────────────────────────────────────────
-export const client = new CopilotClient({  // exported for setupSignalHandlers in index.ts
-  cliPath: whichCli("copilot") || undefined,
+let _client: CopilotClient | null = null;
+let _clientCwd: string | undefined;
+
+export const setClientCwd = (cwd: string): void => {
+  if (_client) {
+    logger.log(`⚠️  setClientCwd called after client construction — ignored: ${cwd}`);
+    return;
+  }
+  _clientCwd = cwd;
+};
+
+const ensureClient = (): CopilotClient => {
+  if (_client) return _client;
+  _client = new CopilotClient({
+    cliPath: whichCli("copilot") || undefined,
+    ...(_clientCwd ? { cwd: _clientCwd } : {}),
+  });
+  return _client;
+};
+
+// Proxy the client so callers (`client.start()`, etc.) work unchanged while
+// allowing setClientCwd to influence the cwd used when the binary spawns.
+export const client = new Proxy({} as CopilotClient, {
+  get(_, prop) {
+    const value = (ensureClient() as any)[prop];
+    return typeof value === "function" ? value.bind(_client) : value;
+  },
 });
+
 const hasActuator = whichCli("actuator") != null;
 
 // ─────────────────────────────────────────────────────────────
@@ -582,8 +609,10 @@ const setupSessionEventListener = (session: CopilotSession, options: any) => {
         case "session.background_tasks_changed":
         case "session.mcp_servers_loaded":
         case "session.mcp_server_status_changed":
+        case "session.skills_loaded":
         case "permission.requested":
         case "permission.completed":
+        case "assistant.message_start":
           break;
 
         default:
@@ -625,7 +654,7 @@ export const initSession = async (
   );
   logger.log(`   📌 systemPromptMode: ${systemPromptMode}`);
   logger.log(`   📌 Session ID: ${state.gSessionId} | Loop ID: ${state.loopId}`);
-  const sessionOptions = {
+  const sessionOptions: any = {
     model,
     mcpServers,
     streaming: true,
@@ -638,6 +667,13 @@ export const initSession = async (
       // https://github.com/github/copilot-sdk/blob/main/nodejs/src/types.ts#L584
       backgroundCompactionThreshold: 0.65,
     },
+    // Server mode: client owns tool execution. Hide SDK-managed tools from the
+    // model so it cannot pick built-ins (bash/edit/...) — picking one would be
+    // permission-rejected and the turn would end with empty text. With no
+    // tools available, the model emits the injected inline-JSON tool_use as
+    // plain text, which mcp-qdrant claude/streamProcessor parses upstream.
+    // (server.ts also calls setClientCwd to keep cwd hooks out of the picture.)
+    ...(options.denyAllTools ? { availableTools: [] } : {}),
     onPermissionRequest: async (request: any) => {
       if (options["denyAllTools"]) {
         logger.log(`🚫 Server mode: permission blocked for: ${request?.kind}`);
