@@ -263,6 +263,46 @@ describe("server.ts", () => {
       expect(capturedPrompt).toBe("[Tool result for calculator]: 42");
     });
 
+    test("filters bare quota probe without starting Copilot session", async () => {
+      mockInitSession.mockClear();
+      mockSend.mockClear();
+
+      const res = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        messages: [{ role: "user", content: "quota" }],
+      }, { "x-session-id": "quota-probe-test" }));
+
+      const data = await res.json() as any;
+      expect(res.status).toBe(200);
+      expect(data.choices[0].message.content).toBe("");
+      expect(data.choices[0].finish_reason).toBe("stop");
+      expect(mockInitSession).not.toHaveBeenCalled();
+      expect(mockSend).not.toHaveBeenCalled();
+    });
+
+    test("falls through to model when tool-reminder present but only built-in tools (no MCP tools)", async () => {
+      mockInitSession.mockClear();
+      mockSend.mockClear();
+
+      const res = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        messages: [{
+          role: "user",
+          content: [{ type: "text", text: "<system-reminder>\nThe following skills are available for this session.\n</system-reminder>\nSARAH" }],
+        }],
+        tools: [
+          { name: "Agent", description: "Launch agent", input_schema: { type: "object" } },
+          { name: "Bash", description: "Run shell command", input_schema: { type: "object" } },
+        ],
+      }, { "x-session-id": "missing-tools-fallthrough-test" }));
+
+      const data = await res.json() as any;
+      expect(res.status).toBe(200);
+      // Falls through to the model — session is created and send is called (no hang)
+      expect(mockInitSession).toHaveBeenCalled();
+      expect(mockSend).toHaveBeenCalled();
+    });
+
     test("passes denyAllTools and tool schema prefix when tools[] provided", async () => {
       mockInitSession.mockClear();
       mockOn.mockImplementation((handler: any) => {
@@ -273,15 +313,15 @@ describe("server.ts", () => {
       await fetchApp(post("/v1/chat/completions", {
         model: "gpt-4.1", stream: false,
         messages: [{ role: "user", content: "use a tool" }],
-        tools: [{ name: "search", description: "web search", input_schema: { type: "object" } }],
+        tools: [{ name: "mcp__WebSearch___search", description: "web search", input_schema: { type: "object" } }],
       }, { "x-session-id": "deny-all-tools-test" }));
 
       const [prompt, opts] = mockInitSession.mock.calls[0];
       expect(opts).toEqual({ denyAllTools: true, systemPromptMode: "replace" });
-      expect(prompt).toContain("search");
+      expect(prompt).toContain("mcp__WebSearch___search");
       expect(prompt).toContain("tool_use");
-      expect(prompt).toContain("You MUST call one listed tool");
-      expect(prompt).toContain("instead of asking a clarification question");
+      expect(prompt).toContain("clearly maps to one of the Available tools, call that tool");
+      expect(prompt).toContain("does NOT match any available tool, answer in plain text");
       expect(prompt).toContain("Never shorten MCP tool names");
     });
 
@@ -302,8 +342,10 @@ describe("server.ts", () => {
       }, { "x-session-id": "canonical-tool-test" }));
 
       const data = await res.json() as any;
-      expect(data.choices[0].message.content).toContain('"name":"mcp__Counter___Counter__Deploy"');
-      expect(data.choices[0].message.content).not.toContain('"name":"_Counter__Deploy"');
+      expect(data.choices[0].message.content).toBeNull();
+      expect(data.choices[0].message.tool_calls[0].function.name).toBe("mcp__Counter___Counter__Deploy");
+      expect(data.choices[0].message.tool_calls[0].function.arguments).toBe('{"callSign":"SARAH"}');
+      expect(data.choices[0].finish_reason).toBe("tool_calls");
     });
 
     test("canonicalizes shortened MCP tool names split across streamed deltas", async () => {
@@ -324,8 +366,11 @@ describe("server.ts", () => {
       }, { "x-session-id": "canonical-stream-tool-test" }));
 
       const text = await res.text();
-      expect(text).toContain('\\"name\\":\\"mcp__Counter___Counter__Deploy\\"');
-      expect(text).not.toContain('\\"name\\":\\"_Counter__Deploy\\"');
+      // β fix: emit OpenAI tool_calls SSE delta instead of raw text content.
+      expect(text).toContain('"tool_calls":[{"index":0,"id":');
+      expect(text).toContain('"function":{"name":"mcp__Counter___Counter__Deploy","arguments":"{\\"callSign\\":\\"SARAH\\"}"}');
+      expect(text).toContain('"finish_reason":"tool_calls"');
+      expect(text).not.toContain('"name":"_Counter__Deploy"');
     });
 
     test("reuses remembered tools to canonicalize later turns without tools[]", async () => {
@@ -356,8 +401,117 @@ describe("server.ts", () => {
       }, { "x-session-id": "remembered-tools-test" }));
 
       const data = await res.json() as any;
-      expect(data.choices[0].message.content).toContain('"name":"mcp__Counter___Counter__Deploy"');
-      expect(data.choices[0].message.content).not.toContain('"name":"_Counter__Deploy"');
+      expect(data.choices[0].message.content).toBeNull();
+      expect(data.choices[0].message.tool_calls[0].function.name).toBe("mcp__Counter___Counter__Deploy");
+      expect(data.choices[0].finish_reason).toBe("tool_calls");
+    });
+
+    test("filters out Claude Code router tools that aren't MCP tools", async () => {
+      mockInitSession.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        messages: [{ role: "user", content: "quota" }],
+        tools: [
+          { name: "Skill", description: "Invoke a skill", input_schema: { type: "object" } },
+          { name: "Agent", description: "Launch an agent", input_schema: { type: "object" } },
+          { name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } },
+        ],
+      }, { "x-session-id": "filter-non-mcp-test" }));
+
+      const [prompt] = mockInitSession.mock.calls[0];
+      // MCP tool present, router built-ins filtered out
+      expect(prompt).toContain("mcp__Counter___Counter__Deploy");
+      expect(prompt).not.toContain("name: Skill");
+      expect(prompt).not.toContain("name: Agent");
+    });
+
+    test("when only non-MCP tools provided, treats as no-tools (no system prefix)", async () => {
+      mockInitSession.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        messages: [{ role: "user", content: "quota" }],
+        tools: [
+          { name: "Skill", description: "Invoke a skill", input_schema: { type: "object" } },
+          { name: "Agent", description: "Launch an agent", input_schema: { type: "object" } },
+        ],
+      }, { "x-session-id": "all-non-mcp-test" }));
+
+      const [prompt, opts] = mockInitSession.mock.calls[0];
+      // All filtered → empty tools[] → no denyAllTools, no tool_use system prefix
+      expect(opts).toEqual({});
+      expect(prompt).toBe("");
+    });
+
+    test("merges partial MCP tool lists with remembered session tools", async () => {
+      mockInitSession.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        messages: [{ role: "user", content: "prime tools" }],
+        tools: [{ name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } }],
+      }, { "x-session-id": "merge-tools-test" }));
+
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        messages: [{ role: "user", content: "quota" }],
+        tools: [{ name: "mcp__Billing___Usage", description: "billing quota usage", input_schema: { type: "object" } }],
+      }, { "x-session-id": "merge-tools-test" }));
+
+      const [prompt] = mockInitSession.mock.calls[1];
+      expect(prompt).toContain("mcp__Counter___Counter__Deploy");
+      expect(prompt).toContain("mcp__Billing___Usage");
+    });
+
+    test("server-wide registry canonicalizes short names across different sessions", async () => {
+      // Session A registers Counter MCP tool. Session B (different session-id) sends
+      // a request with a different tool list — short name must still canonicalize.
+      mockInitSession.mockClear();
+      let callCount = 0;
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          callCount++;
+          if (callCount === 1) {
+            handler({ type: "assistant.turn_end", data: {} });
+          } else {
+            handler({ type: "assistant.message", data: { content: '{"tool_use":{"name":"_Counter__Deploy","input":{"callSign":"SARAH"}}}' } });
+            handler({ type: "assistant.turn_end", data: {} });
+          }
+        }, 0);
+        return () => {};
+      });
+
+      // Session A: register the canonical Counter name.
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        messages: [{ role: "user", content: "register" }],
+        tools: [{ name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } }],
+      }, { "x-session-id": "global-registry-A" }));
+
+      // Session B: completely different session, body.tools omits Counter — only built-ins.
+      const res = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        messages: [{ role: "user", content: "SARAH" }],
+        tools: [{ name: "Agent", description: "Launch agent", input_schema: { type: "object" } }],
+      }, { "x-session-id": "global-registry-B" }));
+
+      const data = await res.json() as any;
+      expect(data.choices[0].message.content).toBeNull();
+      expect(data.choices[0].message.tool_calls[0].function.name).toBe("mcp__Counter___Counter__Deploy");
+      expect(data.choices[0].finish_reason).toBe("tool_calls");
     });
 
     test("prepends request system text to the forwarded prompt", async () => {
