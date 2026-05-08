@@ -27,6 +27,9 @@ interface SessionEntry {
   // Fingerprint of the tool set this session was initialised with.
   // Used to detect when effectiveTools changed so the session can be replaced.
   toolFingerprint: string;
+  // Copilot model this session was initialised with. Switching model on an
+  // existing session is not supported by the SDK — must replace the session.
+  model: string;
 }
 
 type BlobAttachment = {
@@ -256,18 +259,22 @@ function toolFingerprint(tools?: any[]): string {
   return Bun.hash(names).toString(36);
 }
 
-async function getOrCreateEntry(sessionKey: string, tools?: any[]): Promise<SessionEntry> {
+async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: string): Promise<SessionEntry> {
   const fp = toolFingerprint(tools);
+  const requestedModel = model ?? "gpt-4.1";
   const existing = sessions.get(sessionKey);
 
-  // Reuse session when the tool set hasn't changed.
-  if (existing && existing.toolFingerprint === fp) return existing;
+  // Reuse session only when both tool set AND model haven't changed.
+  if (existing && existing.toolFingerprint === fp && existing.model === requestedModel) return existing;
 
-  // Tools changed — drop the existing session and any in-flight creation so
+  // Tools or model changed — drop the existing session and any in-flight creation so
   // the new creation wins. Only do this on an actual reset, not on first creation,
   // so concurrent first-time requests share one creation promise (no double init).
   if (existing) {
-    logger.log(`🔄 Session reset for ${sessionKey}: tools changed (${existing.toolFingerprint} → ${fp})`);
+    const reason = existing.model !== requestedModel
+      ? `model changed (${existing.model} → ${requestedModel})`
+      : `tools changed (${existing.toolFingerprint} → ${fp})`;
+    logger.log(`🔄 Session reset for ${sessionKey}: ${reason}`);
     sessions.delete(sessionKey);
     sessionCreating.delete(sessionKey);
   }
@@ -276,15 +283,26 @@ async function getOrCreateEntry(sessionKey: string, tools?: any[]): Promise<Sess
   let creating = sessionCreating.get(sessionKey);
   if (!creating) {
     const toolPrefix = tools?.length ? buildToolSystemPrefix(tools) : "";
-    const sessionOpts = tools?.length
-      ? { denyAllTools: true, systemPromptMode: "replace" as const }
-      : {};
+    // Always run in server mode: the client owns tool execution. Without denyAllTools,
+    // the Copilot SDK exposes its built-in tools (bash/edit/read/...) to the model;
+    // the model picks one, tries to execute it locally, and we never see a tool call
+    // returned to the client. systemPromptMode "replace" only applies when we have a
+    // tool prefix to inject — otherwise leave the SDK's default system prompt.
+    // Pass model through so the session uses the client-requested model, not the SDK default.
+    const sessionOpts: { denyAllTools: true; systemPromptMode?: "replace"; model: string } = tools?.length
+      ? { denyAllTools: true, systemPromptMode: "replace", model: requestedModel }
+      : { denyAllTools: true, model: requestedModel };
     creating = ensureClientStarted()
       .then(() => initSession(toolPrefix, sessionOpts))
       .then((session) => {
-        const entry: SessionEntry = { session, queue: Promise.resolve(), toolFingerprint: fp };
+        const entry: SessionEntry = {
+          session,
+          queue: Promise.resolve(),
+          toolFingerprint: fp,
+          model: requestedModel,
+        };
         sessions.set(sessionKey, entry);
-        logger.log(`🆕 Session created: ${sessionKey} fp=${fp}${tools?.length ? ` (${tools.length} tools)` : " (no tools)"}`);
+        logger.log(`🆕 Session created: ${sessionKey} model=${requestedModel} fp=${fp}${tools?.length ? ` (${tools.length} tools)` : " (no tools)"}`);
         return entry;
       })
       .finally(() => {
@@ -837,7 +855,7 @@ async function completionsHandler(c: Context) {
       }
     }
 
-    const entry = await getOrCreateEntry(sessionKey, effectiveTools);
+    const entry = await getOrCreateEntry(sessionKey, effectiveTools, model);
     const effectivePrompt = withSystemPrompt(prompt, body.system);
 
     if (body.stream) {

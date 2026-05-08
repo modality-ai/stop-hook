@@ -317,7 +317,7 @@ describe("server.ts", () => {
       }, { "x-session-id": "deny-all-tools-test" }));
 
       const [prompt, opts] = mockInitSession.mock.calls[0];
-      expect(opts).toEqual({ denyAllTools: true, systemPromptMode: "replace" });
+      expect(opts).toEqual({ denyAllTools: true, systemPromptMode: "replace", model: "gpt-4.1" });
       expect(prompt).toContain("mcp__WebSearch___search");
       expect(prompt).toContain("tool_use");
       expect(prompt).toContain("clearly maps to one of the Available tools, call that tool");
@@ -447,8 +447,9 @@ describe("server.ts", () => {
       }, { "x-session-id": "all-non-mcp-test" }));
 
       const [prompt, opts] = mockInitSession.mock.calls[0];
-      // All filtered → empty tools[] → no denyAllTools, no tool_use system prefix
-      expect(opts).toEqual({});
+      // All filtered → empty tools[] → no tool_use system prefix, but denyAllTools
+      // is still set so the SDK doesn't expose its built-in tools to the model.
+      expect(opts).toEqual({ denyAllTools: true, model: "gpt-4.1" });
       expect(prompt).toBe("");
     });
 
