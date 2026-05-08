@@ -237,7 +237,8 @@ describe("server.ts", () => {
       expect(res.headers.get("content-type")).toContain("text/event-stream");
 
       const text = await res.text();
-      expect(text).toContain('"content":"Hello world"');
+      expect(text).toContain('"content":"Hello"');
+      expect(text).toContain('"content":" world"');
       expect(text).toContain('"finish_reason":"stop"');
       expect(text).toContain("[DONE]");
     });
@@ -320,8 +321,8 @@ describe("server.ts", () => {
       expect(opts).toEqual({ denyAllTools: true, systemPromptMode: "replace", model: "gpt-4.1" });
       expect(prompt).toContain("mcp__WebSearch___search");
       expect(prompt).toContain("tool_use");
-      expect(prompt).toContain("clearly maps to one of the Available tools, call that tool");
-      expect(prompt).toContain("does NOT match any available tool, answer in plain text");
+      expect(prompt).toContain("ALWAYS call that tool");
+      expect(prompt).toContain("no available tool matches, answer in plain text");
       expect(prompt).toContain("Never shorten MCP tool names");
     });
 
@@ -578,7 +579,7 @@ describe("server.ts", () => {
       let sendCount = 0;
       mockSend.mockImplementation(async (_args?: any) => {
         sendCount++;
-        if (sendCount === 1) throw new Error("send blew up");
+        if (sendCount === 2) throw new Error("send blew up"); // sendCount=1 is /clear on session init
       });
       mockOn.mockImplementation((handler: any) => {
         setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);

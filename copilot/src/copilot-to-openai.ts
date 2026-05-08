@@ -49,6 +49,11 @@ const sessions = new Map<string, SessionEntry>();
 const sessionCreating = new Map<string, Promise<SessionEntry>>();
 const sessionTools = new Map<string, any[]>();
 
+// Server-wide fallback: last MCP tool set seen across ALL sessions.
+// Used when a session has no remembered tools (e.g. first turn of a new session
+// where Claude Code omitted tools from the request body).
+let globalMcpTools: any[] | undefined;
+
 // Build system-prompt prefix that instructs the model to emit tool calls as inline
 // JSON text instead of invoking SDK tools. Matches DEFAULT_SYSTEM_PREFIX convention
 // in claude/handler.ts so streamProcessor.ts can parse them unchanged.
@@ -170,7 +175,15 @@ function mergeTools(existing?: any[], incoming?: any[]): any[] | undefined {
 
 function rememberSessionTools(sessionKey: string, tools?: any[]): void {
   const merged = mergeTools(sessionTools.get(sessionKey), tools);
-  if (merged?.length) sessionTools.set(sessionKey, merged);
+  if (merged?.length) {
+    sessionTools.set(sessionKey, merged);
+    // Update server-wide fallback whenever we see a non-empty MCP tool set.
+    const mcpOnly = merged.filter((t: any) => {
+      const name = t?.name ?? t?.function?.name ?? "";
+      return name.includes("___");
+    });
+    if (mcpOnly.length) globalMcpTools = merged;
+  }
 }
 
 function toolsForSession(sessionKey: string, tools?: any[]): any[] | undefined {
@@ -227,13 +240,14 @@ function buildToolSystemPrefix(tools: any[]): string {
     "You are a tool-using assistant. The user's client owns tool execution.",
     "Per-turn decision flow:",
     "1. If the user's latest input is a tool result (a line starting with \"[Tool result for <NAME>]: ...\"), the previous tool call has ALREADY succeeded. Reply with a short natural-language answer that uses that result. Do NOT re-emit a tool_use for the same tool.",
-    "2. If the user's request clearly maps to one of the Available tools, call that tool. Output ONLY the JSON tool_use literal below — no prose, no code fences, no extra keys.",
-    "3. If the request does NOT match any available tool, answer in plain text. Do not force a tool call when none fits.",
+    "2. If the user's request is a task, action, or question that one of the Available tools can fulfill — ALWAYS call that tool. Do not answer in plain text when a tool exists for the job. Output ONLY the JSON tool_use literal — no prose, no code fences, no extra keys.",
+    "3. If the request is conversational (greetings, chit-chat) OR no available tool matches, answer in plain text.",
     "When a tool call IS needed, output ONLY this JSON literal shape:",
     '{"tool_use":{"name":"<copy a name verbatim from Available tools>","input":<object whose keys match that tool\'s fields>}}',
     "Concrete shape example (this references a real entry from the list below; replace name + input with whichever tool actually matches the user's request):",
     example,
     "Critical rules:",
+    "- When a tool matches the request, calling it is mandatory — do not substitute a plain-text answer.",
     "- The \"name\" value MUST be copied character-for-character from one of the Available tools entries. Do NOT write placeholder text like \"undefined\" or \"<name>\".",
     "- Include only fields listed under that tool. Required fields MUST be present.",
     "- Tool names may be long (e.g. mcp__Foo___Bar). Use the FULL exact string.",
@@ -303,6 +317,11 @@ async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: strin
         };
         sessions.set(sessionKey, entry);
         logger.log(`🆕 Session created: ${sessionKey} model=${requestedModel} fp=${fp}${tools?.length ? ` (${tools.length} tools)` : " (no tools)"}`);
+        // Enqueue /clear async so the session starts with a clean context.
+        // Real requests queue behind it via entry.queue — no blocking at the call site.
+        entry.queue = entry.queue
+          .then(() => runTurn(entry, "/clear"))
+          .then(() => { logger.log(`🧹 /clear done: ${sessionKey}`); }, () => {});
         return entry;
       })
       .finally(() => {
@@ -707,20 +726,75 @@ function sendAndStream(
     writer.write(chunk).catch(() => {});
   };
 
+  async function drive() {
+    let fullContent = "";
+    // "pending": haven't committed to text or tool yet (response starts with { or `)
+    // "text": streaming live as text deltas
+    // "tool": buffering — will emit tool_call at turn_end
+    let mode: "pending" | "text" | "tool" = "pending";
+    let emittedChars = 0;
+
+    await new Promise<void>((resolve, reject) => {
+      const unsub = entry.session.on((event: any) => {
+        try {
+          if (event.type === "assistant.message_delta") {
+            const delta = event.data.deltaContent ?? "";
+            fullContent += delta;
+
+            if (mode === "pending") {
+              const trimmed = fullContent.trimStart();
+              if (trimmed.includes('"tool_use"')) {
+                mode = "tool";
+              } else if (!trimmed.startsWith("{") && !trimmed.startsWith("`") && trimmed.length > 0) {
+                // Clearly not a tool_use JSON — start streaming live
+                mode = "text";
+                safeWrite(sseOpenAIDelta(completionId, model, fullContent));
+                emittedChars = fullContent.length;
+              }
+              // starts with { or ` but no "tool_use" yet — stay pending
+            } else if (mode === "text") {
+              safeWrite(sseOpenAIDelta(completionId, model, delta));
+              emittedChars += delta.length;
+            }
+            // mode === "tool": buffer silently, emit at turn_end
+          } else if (event.type === "assistant.message") {
+            fullContent = event.data.content ?? fullContent;
+          } else if (event.type === "assistant.turn_end") {
+            unsub();
+            resolve();
+          } else if (event.type === "session.error") {
+            unsub();
+            reject(new Error(event.data.message));
+          }
+        } catch (e) {
+          unsub();
+          reject(e);
+        }
+      });
+
+      entry.session.send(attachments?.length ? { prompt, attachments } : { prompt })
+        .catch((err) => { unsub(); reject(err); });
+    });
+
+    // For text/pending modes, transforms are no-ops (no "tool_use" in content).
+    // For tool mode, canonicalize + tidy before extracting the call.
+    const content = canonicalizeToolUseText(tidyToolUseJson(fullContent), tools);
+    const tu = extractInlineToolUse(content);
+
+    if (tu) {
+      safeWrite(sseOpenAIToolCallDelta(completionId, model, newToolCallId(), tu.name, tu.arguments));
+      safeWrite(sseOpenAIFinish(completionId, model, "tool_calls"));
+    } else {
+      // Emit any content not yet streamed (covers pending→resolved and short responses)
+      const remainder = content.slice(emittedChars);
+      if (remainder) safeWrite(sseOpenAIDelta(completionId, model, remainder));
+      safeWrite(sseOpenAIFinish(completionId, model));
+    }
+    safeWrite(encoder.encode("data: [DONE]\n\n"));
+  }
+
   entry.queue = entry.queue
-    .then(() => runTurn(entry, prompt, attachments))
-    .then((fullContent) => {
-      const content = canonicalizeToolUseText(tidyToolUseJson(fullContent), tools);
-      const tu = extractInlineToolUse(content);
-      if (tu) {
-        safeWrite(sseOpenAIToolCallDelta(completionId, model, newToolCallId(), tu.name, tu.arguments));
-        safeWrite(sseOpenAIFinish(completionId, model, "tool_calls"));
-      } else {
-        if (content) safeWrite(sseOpenAIDelta(completionId, model, content));
-        safeWrite(sseOpenAIFinish(completionId, model));
-      }
-      safeWrite(encoder.encode("data: [DONE]\n\n"));
-    })
+    .then(drive)
     .catch((err: any) => {
       logger.error(`Server stream error: ${err?.message ?? err}`);
     })
@@ -752,12 +826,15 @@ async function modelsHandler(c: Context) {
     const models = await getModels();
     return c.json({
       object: "list",
-      data: models.map((m: any) => ({
-        id: m.id,
-        object: "model",
-        owned_by: "github-copilot",
-        ...(m.billing?.multiplier != null && { billing_multiplier: m.billing.multiplier }),
-      })),
+      data: models.map((m: any) => {
+        const pricing = m.billing?.multiplier;
+        return {
+          id: m.id,
+          object: "model",
+          owned_by: "github-copilot",
+          ...(pricing != null && { pricing: `${pricing}x` }),
+        };
+      }),
     });
   } catch (err: any) {
     return c.json({ error: { message: err.message } }, 503);
@@ -785,6 +862,11 @@ async function completionsHandler(c: Context) {
   const rawTools = Array.isArray(body.tools) ? body.tools : undefined;
   const hadRawTools = !!rawTools?.length;
   const rawToolNames = (rawTools ?? []).slice(0, 8).map((t: any) => toolName(t) || "?");
+  const rawMcpToolCount = (rawTools ?? []).filter((t: any) => toolName(t).includes("___")).length;
+  const rawNonMcpToolNames = (rawTools ?? [])
+    .map((t: any) => toolName(t) || "?")
+    .filter((name: string) => !name.includes("___"))
+    .slice(0, 8);
 
   // Strip non-MCP tools at the boundary so the rest of the pipeline (system
   // prompt builder, alias map, tool_calls extractor) only ever sees real MCP
@@ -808,7 +890,7 @@ async function completionsHandler(c: Context) {
   const lastUserPreview = typeof lastUser?.content === "string"
     ? lastUser.content.slice(0, 80)
     : JSON.stringify(lastUser?.content ?? "").slice(0, 80);
-  logger.log(`🔍 completions: model=${body.model ?? "<default>"} msgs=${msgs.length} rawTools=${rawTools?.length ?? 0} [${rawToolNames.join(",")}] filteredTools=${body.tools?.length ?? 0} [${filteredToolNames.join(",")}] | sys=${sysLen} | lastUser="${lastUserPreview}"`);
+  logger.log(`🔍 completions: model=${body.model ?? "<default>"} msgs=${msgs.length} rawTools=${rawTools?.length ?? 0} rawMcp=${rawMcpToolCount} [${rawToolNames.join(",")}] filteredTools=${body.tools?.length ?? 0} [${filteredToolNames.join(",")}] | nonMcpDropped=[${rawNonMcpToolNames.join(",")}] | sys=${sysLen} | lastUser="${lastUserPreview}"`);
 
   // [diag-deep] When suspicious (no tools AND no system AND short last-user),
   // dump the full request body so we can pin down the upstream sender.
@@ -836,7 +918,18 @@ async function completionsHandler(c: Context) {
 
   try {
     rememberSessionTools(sessionKey, body.tools);
-    const effectiveTools = toolsForSession(sessionKey, body.tools);
+    const sessionEffective = toolsForSession(sessionKey, body.tools);
+    // Fall back to the server-wide last-seen MCP tool set only when the client sent
+    // NO tools at all (hadRawTools=false). When the client explicitly sent tools but
+    // they were all non-MCP (hadRawTools=true, sessionEffective empty), respect that
+    // signal — the client is actively suppressing MCP tools for this turn.
+    const effectiveTools = sessionEffective?.length
+      ? sessionEffective
+      : (!hadRawTools && globalMcpTools?.length ? globalMcpTools : sessionEffective);
+    logger.log(
+      `🔧 tools: incomingMcp=${body.tools?.length ?? 0} remembered=${sessionTools.get(sessionKey)?.length ?? 0} ` +
+        `effective=${effectiveTools?.length ?? 0} globalFallback=${!sessionEffective?.length && !hadRawTools && !!globalMcpTools} promptHasToolReminder=${containsToolReminder(prompt)}`
+    );
     if (isBareQuotaProbe(prompt, hadRawTools, sysLen) && !effectiveTools?.length) {
       logger.log("🔍 filtered bare quota probe");
       return c.json(emptyCompletion(completionId, model, body));
