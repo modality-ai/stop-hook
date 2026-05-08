@@ -176,6 +176,46 @@ describe("server.ts", () => {
       expect(mockInitSession.mock.calls.length).toBe(2);
     });
 
+    test("rotates anonymous sessions for new conversations", async () => {
+      mockInitSession.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+
+      await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-4.1", messages: [{ role: "user", content: "first cli" }], stream: false }
+      ));
+      await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-4.1", messages: [{ role: "user", content: "second cli" }], stream: false }
+      ));
+
+      expect(mockInitSession.mock.calls.length).toBe(2);
+    });
+
+    test("keeps anonymous session for tool result continuations", async () => {
+      mockInitSession.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        messages: [{ role: "user", content: "do it" }],
+      }));
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        messages: [
+          { role: "user", content: "do it" },
+          { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "calculator", input: {} }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "42" }] },
+        ],
+      }));
+
+      expect(mockInitSession.mock.calls.length).toBe(1);
+    });
+
     test("streams SSE with correct OpenAI chunk format", async () => {
       mockOn.mockImplementation((handler: any) => {
         setTimeout(() => {
@@ -197,8 +237,7 @@ describe("server.ts", () => {
       expect(res.headers.get("content-type")).toContain("text/event-stream");
 
       const text = await res.text();
-      expect(text).toContain('"content":"Hello"');
-      expect(text).toContain('"content":" world"');
+      expect(text).toContain('"content":"Hello world"');
       expect(text).toContain('"finish_reason":"stop"');
       expect(text).toContain("[DONE]");
     });
@@ -243,6 +282,168 @@ describe("server.ts", () => {
       expect(prompt).toContain("tool_use");
       expect(prompt).toContain("You MUST call one listed tool");
       expect(prompt).toContain("instead of asking a clarification question");
+      expect(prompt).toContain("Never shorten MCP tool names");
+    });
+
+    test("canonicalizes shortened MCP tool names in collected JSON", async () => {
+      mockInitSession.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          handler({ type: "assistant.message", data: { content: '{"tool_use":{"name":"_Counter__Deploy","input":{"callSign":"SARAH"}}}' } });
+          handler({ type: "assistant.turn_end", data: {} });
+        }, 0);
+        return () => {};
+      });
+
+      const res = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        messages: [{ role: "user", content: "SARAH" }],
+        tools: [{ name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } }],
+      }, { "x-session-id": "canonical-tool-test" }));
+
+      const data = await res.json() as any;
+      expect(data.choices[0].message.content).toContain('"name":"mcp__Counter___Counter__Deploy"');
+      expect(data.choices[0].message.content).not.toContain('"name":"_Counter__Deploy"');
+    });
+
+    test("canonicalizes shortened MCP tool names split across streamed deltas", async () => {
+      mockInitSession.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          handler({ type: "assistant.message_delta", data: { deltaContent: '{"tool_use":{"name":"_Counter' } });
+          handler({ type: "assistant.message_delta", data: { deltaContent: '__Deploy","input":{"callSign":"SARAH"}}}' } });
+          handler({ type: "assistant.turn_end", data: {} });
+        }, 0);
+        return () => {};
+      });
+
+      const res = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: true,
+        messages: [{ role: "user", content: "SARAH" }],
+        tools: [{ name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } }],
+      }, { "x-session-id": "canonical-stream-tool-test" }));
+
+      const text = await res.text();
+      expect(text).toContain('\\"name\\":\\"mcp__Counter___Counter__Deploy\\"');
+      expect(text).not.toContain('\\"name\\":\\"_Counter__Deploy\\"');
+    });
+
+    test("reuses remembered tools to canonicalize later turns without tools[]", async () => {
+      mockInitSession.mockClear();
+      let callCount = 0;
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          callCount++;
+          if (callCount === 1) {
+            handler({ type: "assistant.turn_end", data: {} });
+          } else {
+            handler({ type: "assistant.message", data: { content: '{"tool_use":{"name":"_Counter__Deploy","input":{"callSign":"SARAH"}}}' } });
+            handler({ type: "assistant.turn_end", data: {} });
+          }
+        }, 0);
+        return () => {};
+      });
+
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        messages: [{ role: "user", content: "prime" }],
+        tools: [{ name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } }],
+      }, { "x-session-id": "remembered-tools-test" }));
+
+      const res = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        messages: [{ role: "user", content: "SARAH" }],
+      }, { "x-session-id": "remembered-tools-test" }));
+
+      const data = await res.json() as any;
+      expect(data.choices[0].message.content).toContain('"name":"mcp__Counter___Counter__Deploy"');
+      expect(data.choices[0].message.content).not.toContain('"name":"_Counter__Deploy"');
+    });
+
+    test("prepends request system text to the forwarded prompt", async () => {
+      let capturedPrompt = "";
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+      mockSend.mockImplementation(async (args: any) => { capturedPrompt = args?.prompt ?? ""; });
+
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-4.1", stream: false,
+        system: "When user says quota, choose the billing usage tool instead of asking clarification.",
+        messages: [{ role: "user", content: "quota" }],
+        tools: [{ name: "mcp__Billing___Usage", description: "billing quota usage", input_schema: { type: "object" } }],
+      }, { "x-session-id": "system-quota-test" }));
+
+      expect(capturedPrompt).toContain("When user says quota");
+      expect(capturedPrompt).toContain("quota");
+    });
+
+    test("recovers from session creation failure on next request", async () => {
+      // First call to initSession throws — second call must succeed because the
+      // creating-slot is freed via .finally() (not just on resolve).
+      mockInitSession.mockClear();
+      let firstCall = true;
+      mockInitSession.mockImplementation(async (_prompt: string, _opts: any) => {
+        if (firstCall) {
+          firstCall = false;
+          throw new Error("upstream init failed");
+        }
+        return { send: mockSend, on: mockOn } as any;
+      });
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+
+      const failed = await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-4.1", messages: [{ role: "user", content: "first" }], stream: false },
+        { "x-session-id": "recover-test" }
+      ));
+      expect(failed.status).toBe(500);
+
+      const recovered = await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-4.1", messages: [{ role: "user", content: "second" }], stream: false },
+        { "x-session-id": "recover-test" }
+      ));
+      expect(recovered.status).toBe(200);
+      expect(mockInitSession.mock.calls.length).toBe(2);
+
+      // Reset for other tests
+      mockInitSession.mockImplementation(async (_prompt: string, _opts: any) => ({
+        send: mockSend,
+        on: mockOn,
+      }));
+    });
+
+    test("unsubscribes listener when send fails so next request runs cleanly", async () => {
+      // If the send-error path leaks the listener, the next request's event
+      // stream would be polluted by the stale handler. Verify next turn works.
+      mockSend.mockClear();
+      let sendCount = 0;
+      mockSend.mockImplementation(async (_args?: any) => {
+        sendCount++;
+        if (sendCount === 1) throw new Error("send blew up");
+      });
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+
+      const failed = await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-4.1", messages: [{ role: "user", content: "boom" }], stream: false },
+        { "x-session-id": "send-fail-test" }
+      ));
+      expect(failed.status).toBe(500);
+
+      const ok = await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-4.1", messages: [{ role: "user", content: "again" }], stream: false },
+        { "x-session-id": "send-fail-test" }
+      ));
+      expect(ok.status).toBe(200);
+
+      // Reset for other tests
+      mockSend.mockImplementation(async (_args?: any) => {});
     });
 
     test("extracts last user message from messages array", async () => {

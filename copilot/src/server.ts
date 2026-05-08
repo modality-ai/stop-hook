@@ -14,7 +14,7 @@ setClientCwd(SERVER_MODE_CWD);
 // Session registry: x-session-id → CopilotSession
 // Each session is used by one request at a time (mutex queue).
 // ─────────────────────────────────────────────────────────────
-const DEFAULT_SESSION_KEY = "__default__";
+let anonymousSessionKey = `__anonymous__-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
 interface SessionEntry {
   session: CopilotSession;
@@ -37,6 +37,7 @@ interface PromptInput {
 
 const sessions = new Map<string, SessionEntry>();
 const sessionCreating = new Map<string, Promise<SessionEntry>>();
+const sessionTools = new Map<string, any[]>();
 
 // Build system-prompt prefix that instructs the model to emit tool calls as inline
 // JSON text instead of invoking SDK tools. Matches DEFAULT_SYSTEM_PREFIX convention
@@ -55,8 +56,9 @@ function normalizeTool(tool: any): NormalizedTool | null {
   const fn = tool.function ?? {};
   const name = tool.name ?? fn.name;
   if (typeof name !== "string" || !name) return null;
+  const canonicalName = typeof tool.name === "string" && tool.name.includes("___") ? tool.name : name;
   return {
-    name,
+    name: canonicalName,
     description: tool.description ?? fn.description ?? "",
     input_schema: tool.input_schema ?? fn.parameters ?? {},
   };
@@ -93,8 +95,45 @@ function buildExampleCall(tool: NormalizedTool): string {
   return JSON.stringify({ tool_use: { name: tool.name, input: sample } });
 }
 
+function normalizeTools(tools?: any[]): NormalizedTool[] {
+  return (tools ?? []).map(normalizeTool).filter((t): t is NormalizedTool => t !== null);
+}
+
+function buildToolAliasMap(tools?: any[]): Map<string, string> {
+  const aliases = new Map<string, string>();
+  for (const tool of normalizeTools(tools)) {
+    aliases.set(tool.name, tool.name);
+    const lastSep = tool.name.lastIndexOf("___");
+    if (lastSep !== -1) {
+      const suffix = tool.name.slice(lastSep + 3);
+      aliases.set(suffix, tool.name);
+      aliases.set(`_${suffix}`, tool.name);
+    }
+    const firstSep = tool.name.indexOf("__");
+    if (firstSep !== -1) aliases.set(tool.name.slice(firstSep + 2), tool.name);
+  }
+  return aliases;
+}
+
+function rememberSessionTools(sessionKey: string, tools?: any[]): void {
+  if (tools?.length) sessionTools.set(sessionKey, tools);
+}
+
+function toolsForSession(sessionKey: string, tools?: any[]): any[] | undefined {
+  return tools?.length ? tools : sessionTools.get(sessionKey);
+}
+
+function canonicalizeToolUseText(text: string, tools?: any[]): string {
+  const aliases = buildToolAliasMap(tools);
+  if (!aliases.size || !text.includes('"tool_use"')) return text;
+  return text.replace(/"name"\s*:\s*"([^"]+)"/g, (match, rawName) => {
+    const canonicalName = aliases.get(rawName) ?? aliases.get(rawName.replace(/^_+/, ""));
+    return canonicalName ? `"name":"${canonicalName}"` : match;
+  });
+}
+
 function buildToolSystemPrefix(tools: any[]): string {
-  const normalized = tools.map(normalizeTool).filter((t): t is NormalizedTool => t !== null);
+  const normalized = normalizeTools(tools);
   if (!normalized.length) return "";
   const list = normalized.map(formatToolEntry).join("\n");
   const example = buildExampleCall(normalized[0]);
@@ -111,6 +150,7 @@ function buildToolSystemPrefix(tools: any[]): string {
     "- The \"name\" value MUST be copied character-for-character from one of the Available tools entries. Do NOT write placeholder text like \"undefined\" or \"<name>\".",
     "- Include only fields listed under that tool. Required fields MUST be present.",
     "- Tool names may be long (e.g. mcp__Foo___Bar). Use the FULL exact string.",
+    "- Never shorten MCP tool names. For example, if the Available tools entry is mcp__Counter___Counter__Deploy, emit that full name, not _Counter__Deploy or Counter__Deploy.",
     "- Never call the same tool more than once for a single user turn unless the user explicitly asks for it again. After a tool result arrives, finish with a text reply.",
     "Available tools:",
     list,
@@ -149,9 +189,13 @@ async function getOrCreateEntry(sessionKey: string, tools?: any[]): Promise<Sess
       .then((session) => {
         const entry: SessionEntry = { session, queue: Promise.resolve() };
         sessions.set(fullKey, entry);
-        sessionCreating.delete(fullKey);
         logger.log(`🆕 Server session created: ${fullKey}${tools?.length ? ` (${tools.length} tools injected)` : ""}`);
         return entry;
+      })
+      .finally(() => {
+        // Drop the in-flight slot whether creation resolved or rejected — a
+        // sticky rejected promise would poison every later request for this key.
+        sessionCreating.delete(fullKey);
       });
     sessionCreating.set(fullKey, creating);
   }
@@ -180,6 +224,17 @@ async function getModels(): Promise<any[]> {
 // ─────────────────────────────────────────────────────────────
 // Token estimation — mirrors handler.ts estimateBodyInputTokens
 // ─────────────────────────────────────────────────────────────
+function extractSystemText(system: any): string {
+  if (typeof system === "string") return system;
+  if (!Array.isArray(system)) return "";
+  return system.map((block: any) => block?.text ?? "").filter(Boolean).join("\n");
+}
+
+function withSystemPrompt(prompt: string, system: any): string {
+  const systemText = extractSystemText(system).trim();
+  return systemText ? `${systemText}\n\n${prompt}` : prompt;
+}
+
 function estimateInputTokens(body: any): number {
   let chars = 0;
   const sys = body.system;
@@ -299,6 +354,18 @@ function formatToolResultContent(content: any): string {
 //     `{ role: "user", content: [{ type: "tool_result", tool_use_id, content }] }`
 //   - OpenAI-shaped: each tool_result is its own `{ role: "tool", tool_call_id, content }`.
 //     The mcp-qdrant proxy converts Anthropic → OpenAI before reaching us.
+function isNewConversation(messages: any[]): boolean {
+  return (messages ?? []).filter((msg: any) => msg?.role !== "system").length === 1;
+}
+
+function resolveSessionKey(headerSessionId: string | undefined, messages: any[]): string {
+  if (headerSessionId) return headerSessionId;
+  if (isNewConversation(messages)) {
+    anonymousSessionKey = `__anonymous__-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  }
+  return anonymousSessionKey;
+}
+
 function extractLastTurn(messages: any[]): PromptInput {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
@@ -385,7 +452,8 @@ function sendAndStream(
   prompt: string,
   attachments: BlobAttachment[] | undefined,
   completionId: string,
-  model: string
+  model: string,
+  tools?: any[]
 ): ReadableStream<Uint8Array> {
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
   const writer = writable.getWriter();
@@ -399,11 +467,16 @@ function sendAndStream(
   // Chain onto session queue so concurrent requests are serialised
   const work = () =>
     new Promise<void>((resolve, reject) => {
+      let fullContent = "";
       const unsub = entry.session.on((event: any) => {
         try {
           if (event.type === "assistant.message_delta") {
-            safeWrite(sseOpenAIDelta(completionId, model, event.data.deltaContent ?? ""));
+            fullContent += event.data.deltaContent ?? "";
+          } else if (event.type === "assistant.message") {
+            fullContent = event.data.content ?? fullContent;
           } else if (event.type === "assistant.turn_end") {
+            const content = canonicalizeToolUseText(fullContent, tools);
+            if (content) safeWrite(sseOpenAIDelta(completionId, model, content));
             safeWrite(sseOpenAIFinish(completionId, model));
             safeWrite(encoder.encode("data: [DONE]\n\n"));
             unsub();
@@ -418,7 +491,10 @@ function sendAndStream(
         }
       });
 
-      entry.session.send(attachments?.length ? { prompt, attachments } : { prompt }).catch(reject);
+      entry.session.send(attachments?.length ? { prompt, attachments } : { prompt }).catch((err) => {
+        unsub();
+        reject(err);
+      });
     });
 
   entry.queue = entry.queue
@@ -436,7 +512,8 @@ function sendAndStream(
 async function sendAndCollect(
   entry: SessionEntry,
   prompt: string,
-  attachments?: BlobAttachment[]
+  attachments?: BlobAttachment[],
+  tools?: any[]
 ): Promise<string> {
   let fullContent = "";
 
@@ -459,13 +536,16 @@ async function sendAndCollect(
         }
       });
 
-      entry.session.send(attachments?.length ? { prompt, attachments } : { prompt }).catch(reject);
+      entry.session.send(attachments?.length ? { prompt, attachments } : { prompt }).catch((err) => {
+        unsub();
+        reject(err);
+      });
     });
 
   const turn = entry.queue.then(work);
   entry.queue = turn.catch(() => {});
   await turn;
-  return fullContent;
+  return canonicalizeToolUseText(fullContent, tools);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -511,13 +591,13 @@ app.post("/v1/chat/completions", async (c) => {
     return c.json({ error: { message: "Invalid JSON" } }, 400);
   }
 
-  const sessionKey = c.req.header("x-session-id") ?? DEFAULT_SESSION_KEY;
   const model = body.model ?? "gpt-4.1";
   const completionId = `chatcmpl-${Date.now().toString(36)}`;
 
   // Extract the latest turn — resolves tool_result blocks into formatted text so
   // the stateful Copilot session can continue after client-side tool execution.
   const messages: any[] = body.messages ?? [];
+  const sessionKey = resolveSessionKey(c.req.header("x-session-id"), messages);
   const { prompt, attachments, error } = extractLastTurn(messages);
 
   if (error) {
@@ -529,10 +609,13 @@ app.post("/v1/chat/completions", async (c) => {
   }
 
   try {
-    const entry = await getOrCreateEntry(sessionKey, body.tools);
+    rememberSessionTools(sessionKey, body.tools);
+    const effectiveTools = toolsForSession(sessionKey, body.tools);
+    const entry = await getOrCreateEntry(sessionKey, effectiveTools);
+    const effectivePrompt = withSystemPrompt(prompt, body.system);
 
     if (body.stream) {
-      const stream = sendAndStream(entry, prompt, attachments, completionId, model);
+      const stream = sendAndStream(entry, effectivePrompt, attachments, completionId, model, effectiveTools);
       return new Response(stream, {
         status: 200,
         headers: {
@@ -543,7 +626,7 @@ app.post("/v1/chat/completions", async (c) => {
       });
     }
 
-    const content = await sendAndCollect(entry, prompt, attachments);
+    const content = await sendAndCollect(entry, effectivePrompt, attachments, effectiveTools);
     return c.json({
       id: completionId,
       object: "chat.completion",
