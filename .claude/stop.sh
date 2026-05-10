@@ -12,10 +12,10 @@ PROMISE=$(awk -F': ' '/^completion_promise:/{gsub(/"/, "", $2); print $2}' "$STA
 PROMPT=$(awk '/^---$/{i++; next} i>=2' "$STATE")
 
 # Validate numeric values
-[[ "$ITER" =~ ^[0-9]+$ && "$MAX" =~ ^[0-9]+$ ]] || { rm -f "$STATE"; exit 0; }
+[[ "$ITER" =~ ^[0-9]+$ && "$MAX" =~ ^[0-9]+$ ]] || { [[ -f "$STATE" ]] && rm "$STATE"; exit 0; }
 
 # Check max iterations
-(( ITER >= MAX && MAX > 0 )) && { rm -f "$STATE"; echo "Max iterations reached."; exit 0; }
+(( ITER >= MAX && MAX > 0 )) && { [[ -f "$STATE" ]] && rm "$STATE"; echo "Max iterations reached."; exit 0; }
 
 # Check completion promise in transcript
 INPUT=$(cat)
@@ -23,13 +23,13 @@ if [[ -n "$PROMISE" && "$PROMISE" != "null" ]]; then
   TRANSCRIPT=$(echo "$INPUT" | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
   if [[ -f "$TRANSCRIPT" ]]; then
     FOUND=$(tail -200 "$TRANSCRIPT" 2>/dev/null | sed 's#\\/#/#g' | GREP_OPTIONS= command grep -o '<promise>[^<]*</promise>' | tail -20 | sed 's/<[^>]*>//g' || true)
-    echo "$FOUND" | GREP_OPTIONS= command grep -qxF "$PROMISE" && { rm -f "$STATE"; echo "Completed: $PROMISE"; exit 0; }
+    echo "$FOUND" | GREP_OPTIONS= command grep -qxF "$PROMISE" && { [[ -f "$STATE" ]] && rm "$STATE"; echo "Completed: $PROMISE"; exit 0; }
   fi
 fi
 
 # Continue loop: increment and output
 NEXT=$((ITER + 1))
-sed -i.bak "s/^iteration: .*/iteration: $NEXT/" "$STATE" && rm -f "$STATE.bak"
+sed -i.bak "s/^iteration: .*/iteration: $NEXT/" "$STATE" && [[ -f "$STATE.bak" ]] && rm "$STATE.bak"
 
 AGENT_PROMPT="You're execute on PDCA (Plan-Do-Check-Act) LOOP ($NEXT/$MAX) to achieve mission. When you get perfect fit, output '<promise>$PROMISE</promise>' in your final line."
 AGENT_PROMPT+=" If persona persistence was lost, redeploy the previously active Hero from the session context without extra confirm."
