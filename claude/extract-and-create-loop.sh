@@ -21,6 +21,7 @@ fi
 # handles escape sequences and doubly-encoded string payloads
 # (e.g. tool_response.content[].text containing JSON). O(N) end-to-end.
 # Emits NUL-terminated KEY<SOH>VALUE records consumed by the loop below.
+METHOD=""
 PROJECT_DIR=""
 PROMPT=""
 MAX_ITERATIONS=""
@@ -30,6 +31,7 @@ while IFS= read -r -d $'\3' record; do
   key="${record%%	*}"
   value="${record#*	}"
   case "$key" in
+    METHOD) METHOD="$value" ;;
     PROJECT_DIR) PROJECT_DIR="$value" ;;
     PROMPT) PROMPT="$value" ;;
     MAX_ITERATIONS) MAX_ITERATIONS="$value" ;;
@@ -112,7 +114,8 @@ function set_value(key, val, type, depth) {
     else if (key == "project_dir"    && project_dir    == "") project_dir    = val
     else if (key == "transcript_cwd" && transcript_cwd == "") transcript_cwd = val
   }
-  if      (key == "prompt"             && prompt   == "" && type == "string") prompt   = val
+  if      (key == "method"             && method   == "" && type == "string") method   = val
+  else if (key == "prompt"             && prompt   == "" && type == "string") prompt   = val
   else if (key == "max_iterations"     && max_iter == "" && type == "number") max_iter = val
   else if (key == "iterations"         && max_iter == "" && type == "number") max_iter = val
   else if (key == "completion_promise" && promise  == "" && type == "string") promise  = val
@@ -123,12 +126,20 @@ END {
        (workspace != "")   ? workspace   : \
        (project_dir != "") ? project_dir : \
        (transcript_cwd != "") ? transcript_cwd : ""
+  printf "METHOD\t%s\003",            method
   printf "PROJECT_DIR\t%s\003",        pd
   printf "PROMPT\t%s\003",             prompt
   printf "MAX_ITERATIONS\t%s\003",     max_iter
   printf "COMPLETION_PROMISE\t%s\003", promise
 }
 ')
+
+if [[ "$METHOD" != "*agent-loop" ]]; then
+  if [[ -n "${DEBUG_HOOKS:-}" ]]; then
+    echo "[$(date)] Not an agent-loop call (method=$METHOD)" >> /tmp/hooks-debug.log
+  fi
+  exit 0
+fi
 
 if [[ -z "$PROJECT_DIR" || ! -d "$PROJECT_DIR" ]]; then
   PROJECT_DIR="$PWD"
