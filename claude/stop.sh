@@ -2,7 +2,7 @@
 # Agent Loop Stop Hook - Blocks exit when agent-loop is active
 set -euo pipefail
 
-STATE=".claude/agent-loop.local.md"
+STATE="${CLAUDE_PROJECT_DIR:-.}/.claude/agent-loop.local.md"
 [[ -f "$STATE" ]] || exit 0
 
 # Parse state file

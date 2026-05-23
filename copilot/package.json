@@ -24,6 +24,7 @@
     "copilot-loop": "./dist/cli.mjs"
   },
   "scripts": {
+    "start": "bun ./src/server.ts",
     "build:clean": "find ./dist -name '*.*' | xargs rm -rf",
     "build:types": "bun tsc -p ./",
     "build:cli": "bun build src/cli.ts --outfile dist/cli.mjs --target node",

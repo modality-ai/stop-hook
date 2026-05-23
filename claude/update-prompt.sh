@@ -2,7 +2,7 @@
 # Agent Loop Prompt Update Hook - Updates state file with new user prompt
 set -euo pipefail
 
-STATE=".claude/agent-loop.local.md"
+STATE="${CLAUDE_PROJECT_DIR:-.}/.claude/agent-loop.local.md"
 [[ -f "$STATE" ]] || exit 0
 
 # Cache grep -P capability check (avoid repeated checks in function)

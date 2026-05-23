@@ -321,8 +321,8 @@ describe("server.ts", () => {
       expect(opts).toEqual({ denyAllTools: true, systemPromptMode: "replace", model: "gpt-4.1" });
       expect(prompt).toContain("mcp__WebSearch___search");
       expect(prompt).toContain("tool_use");
-      expect(prompt).toContain("ALWAYS call that tool");
-      expect(prompt).toContain("no available tool matches, answer in plain text");
+      expect(prompt).toContain("ALWAYS emit FORM A");
+      expect(prompt).toContain("no available tool matches, emit FORM B");
       expect(prompt).toContain("Never shorten MCP tool names");
     });
 
@@ -454,7 +454,7 @@ describe("server.ts", () => {
       expect(prompt).toBe("");
     });
 
-    test("merges partial MCP tool lists with remembered session tools", async () => {
+    test("reuses session across requests with different tool lists (preserves conversation context)", async () => {
       mockInitSession.mockClear();
       mockOn.mockImplementation((handler: any) => {
         setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
@@ -473,9 +473,13 @@ describe("server.ts", () => {
         tools: [{ name: "mcp__Billing___Usage", description: "billing quota usage", input_schema: { type: "object" } }],
       }, { "x-session-id": "merge-tools-test" }));
 
-      const [prompt] = mockInitSession.mock.calls[1];
+      // Session is reused — initSession was called ONCE total, not per-request.
+      // This preserves the model's conversation memory across turns. The first
+      // request's tool set is the one baked into the session prompt; later
+      // additions don't trigger a re-init (which would clobber context).
+      expect(mockInitSession).toHaveBeenCalledTimes(1);
+      const [prompt] = mockInitSession.mock.calls[0];
       expect(prompt).toContain("mcp__Counter___Counter__Deploy");
-      expect(prompt).toContain("mcp__Billing___Usage");
     });
 
     test("server-wide registry canonicalizes short names across different sessions", async () => {
