@@ -10,6 +10,7 @@ import {
 import { appendFile } from "fs/promises";
 import { execSync } from "child_process";
 import { getSessionId } from "./SweAgentInteraction";
+import { DEFAULT_MODEL, DEFAULT_REASON_MODEL } from "./config";
 
 // ─────────────────────────────────────────────────────────────
 // Types
@@ -640,7 +641,7 @@ export const initSession = async (
   if (null == options.model) {
     delete options.model;
   }
-  const defaultModel = options.reasoningEffort ? "gpt-5-mini" : "gpt-4.1";
+  const defaultModel = options.reasoningEffort ? DEFAULT_REASON_MODEL : DEFAULT_MODEL;
   const {
     model = defaultModel,
     reasoningEffort,

@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from "fs";
 import { client, initSession, logger, setClientCwd, COPILOT_LOOP_DIR } from "./copilot-core";
+import { DEFAULT_MODEL } from "./config";
 import type { CopilotSession } from "@github/copilot-sdk";
 import type { Context, Hono } from "hono";
 
@@ -356,7 +357,7 @@ function toolFingerprint(tools?: any[]): string {
 
 async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: string): Promise<SessionEntry> {
   const fp = toolFingerprint(tools);
-  const requestedModel = model ?? "gpt-4.1";
+  const requestedModel = model ?? DEFAULT_MODEL;
   const existing = sessions.get(sessionKey);
 
   // Reuse session whenever it exists for the same model. The system prompt
@@ -1119,7 +1120,7 @@ async function completionsHandler(c: Context) {
   if (rawTools) body.tools = filterMcpTools(rawTools);
   const filteredToolNames = (body.tools ?? []).slice(0, 8).map((t: any) => toolName(t) || "?");
 
-  const model = body.model ?? "gpt-4.1";
+  const model = body.model ?? DEFAULT_MODEL;
   const completionId = `chatcmpl-${Date.now().toString(36)}`;
 
   // [diag] Inspect what the upstream proxy is actually sending. Remove once
