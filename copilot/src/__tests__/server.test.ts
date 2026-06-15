@@ -1,11 +1,21 @@
 import { describe, test, expect, mock, beforeEach } from "bun:test";
+import { formatTokenPrice } from "../copilot-to-openai";
 
 // ─── Mock copilot-core before importing server ────────────────────────────────
 const mockSend = mock(async (_args?: any) => {});
 const mockOn = mock((_handler: any) => (() => {}) as () => void);
 const mockListModels = mock(async () => [
+  {
+    id: "claude-sonnet-4.6",
+    name: "Claude Sonnet 4.6",
+    billing: { tokenPrices: { inputPrice: 300, outputPrice: 1500, cachePrice: 30, batchSize: 1000000 } },
+  },
   { id: "gpt-4.1", name: "GPT-4.1" },
-  { id: "gpt-4o", name: "GPT-4o" },
+  {
+    id: "gpt-5-mini",
+    name: "GPT-5 Mini",
+    billing: { tokenPrices: { inputPrice: 25, outputPrice: 200, cachePrice: 0, batchSize: 1000000 } },
+  },
 ]);
 const mockInitSession = mock(async (_prompt: string, _opts: any) => ({
   send: mockSend,
@@ -55,10 +65,10 @@ describe("server.ts", () => {
       expect(res.status).toBe(200);
       const data = await res.json() as any;
       expect(data.object).toBe("list");
-      expect(data.data).toHaveLength(2);
-      expect(data.data[0].id).toBe("gpt-4.1");
-      expect(data.data[0].object).toBe("model");
-      expect(data.data[0].owned_by).toBe("github-copilot");
+      expect(data.data).toHaveLength(3);
+      const gpt41 = data.data.find((m: any) => m.id === "gpt-4.1");
+      expect(gpt41.object).toBe("model");
+      expect(gpt41.owned_by).toBe("github-copilot");
     });
 
     test("caches model list — only calls listModels once across requests", async () => {
@@ -67,6 +77,52 @@ describe("server.ts", () => {
       await fetchApp(makeReq("/v1/models"));
       // Should be 0 (already cached from earlier test) or 1 (first call in this test run)
       expect(mockListModels.mock.calls.length).toBeLessThanOrEqual(1);
+    });
+
+    test("includes pricing for model with billing.tokenPrices", async () => {
+      const res = await fetchApp(makeReq("/v1/models"));
+      const data = await res.json() as any;
+      const sonnet = data.data.find((m: any) => m.id === "claude-sonnet-4.6");
+      expect(sonnet.pricing).toEqual({ input: "$3.00/M", output: "$15.00/M", cache: "$0.30/M" });
+    });
+
+    test("omits pricing for model without billing", async () => {
+      const res = await fetchApp(makeReq("/v1/models"));
+      const data = await res.json() as any;
+      const gpt41 = data.data.find((m: any) => m.id === "gpt-4.1");
+      expect(gpt41.pricing).toBeUndefined();
+    });
+
+    test("omits cache from pricing when cachePrice is zero", async () => {
+      const res = await fetchApp(makeReq("/v1/models"));
+      const data = await res.json() as any;
+      const mini = data.data.find((m: any) => m.id === "gpt-5-mini");
+      expect(mini.pricing.input).toBe("$0.25/M");
+      expect(mini.pricing.output).toBe("$2.00/M");
+      expect(mini.pricing.cache).toBeUndefined();
+    });
+  });
+
+  // ─── formatTokenPrice ───────────────────────────────────────────────────────
+  describe("formatTokenPrice", () => {
+    test("formats standard price (300 cents/M → $3.00/M)", () => {
+      expect(formatTokenPrice(300)).toBe("$3.00/M");
+    });
+
+    test("formats output price (1500 cents/M → $15.00/M)", () => {
+      expect(formatTokenPrice(1500)).toBe("$15.00/M");
+    });
+
+    test("formats cache price (30 cents/M → $0.30/M)", () => {
+      expect(formatTokenPrice(30)).toBe("$0.30/M");
+    });
+
+    test("formats zero price (0 → $0.00/M)", () => {
+      expect(formatTokenPrice(0)).toBe("$0.00/M");
+    });
+
+    test("formats sub-dollar price (75 cents/M → $0.75/M)", () => {
+      expect(formatTokenPrice(75)).toBe("$0.75/M");
     });
   });
 

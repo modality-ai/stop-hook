@@ -1,4 +1,4 @@
-import { CopilotClient, type CopilotSession } from "@github/copilot-sdk";
+import { CopilotClient, RuntimeConnection, type CopilotSession } from "@github/copilot-sdk";
 import {
   appendFileSync,
   readFileSync,
@@ -262,9 +262,10 @@ export const setClientCwd = (cwd: string): void => {
 
 const ensureClient = (): CopilotClient => {
   if (_client) return _client;
+  const cliPath = whichCli("copilot") || undefined;
   _client = new CopilotClient({
-    cliPath: whichCli("copilot") || undefined,
-    ...(_clientCwd ? { cwd: _clientCwd } : {}),
+    connection: RuntimeConnection.forStdio({ path: cliPath }),
+    ...(_clientCwd ? { workingDirectory: _clientCwd } : {}),
   });
   return _client;
 };

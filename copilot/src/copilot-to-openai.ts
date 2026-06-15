@@ -1050,18 +1050,29 @@ async function sendAndCollect(
 // Route handlers
 // ─────────────────────────────────────────────────────────────
 
+export function formatTokenPrice(cents: number): string {
+  return `$${(cents / 100).toFixed(2)}/M`;
+}
+
 async function modelsHandler(c: Context) {
   try {
     const models = await getModels();
     return c.json({
       object: "list",
       data: models.map((m: any) => {
-        const pricing = m.billing?.multiplier;
+        const tp = m.billing?.tokenPrices;
+        const pricing = tp?.inputPrice != null
+          ? {
+              input: formatTokenPrice(tp.inputPrice),
+              output: formatTokenPrice(tp.outputPrice),
+              ...(tp.cachePrice ? { cache: formatTokenPrice(tp.cachePrice) } : {}),
+            }
+          : undefined;
         return {
           id: m.id,
           object: "model",
           owned_by: "github-copilot",
-          ...(pricing != null && { pricing: `${pricing}x` }),
+          ...(pricing && { pricing }),
         };
       }),
     });
