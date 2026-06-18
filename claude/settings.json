@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/permission-hook.sh mcp__*___Counter__*"
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/permission-hook.sh\" mcp__*___Counter__*"
           }
         ]
       }
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/extract-and-create-loop.sh"
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/extract-and-create-loop.sh\""
           }
         ]
       }
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/stop.sh"
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/stop.sh\""
           }
         ]
       }
@@ -49,7 +49,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/update-prompt.sh"
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/update-prompt.sh\""
           }
         ]
       }
