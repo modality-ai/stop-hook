@@ -243,7 +243,7 @@ const aiThinking = async (
 const aiCommand = async (prompt: any, aiOption: AIOptions) => {
   const { systemPrompt, mode, currentIteration }: AIOptions = aiOption;
   const abortController = new AbortController();
-  const session = await initSession(systemPrompt, promptConfig);
+  const { session } = await initSession(systemPrompt, promptConfig);
   currentSession = session;
   const stopHealthCheck = setupHealthCheck(client, abortController);
 

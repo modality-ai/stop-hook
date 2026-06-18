@@ -4,13 +4,14 @@ import { formatTokenPrice } from "../copilot-to-openai";
 // ─── Mock copilot-core before importing server ────────────────────────────────
 const mockSend = mock(async (_args?: any) => {});
 const mockOn = mock((_handler: any) => (() => {}) as () => void);
+const mockSetModel = mock(async (_model: string, _opts?: any) => {});
 const mockListModels = mock(async () => [
   {
     id: "claude-sonnet-4.6",
     name: "Claude Sonnet 4.6",
     billing: { tokenPrices: { inputPrice: 300, outputPrice: 1500, cachePrice: 30, batchSize: 1000000 } },
   },
-  { id: "gpt-4.1", name: "GPT-4.1" },
+  { id: "test-no-billing", name: "Test No-Billing Fixture" },
   {
     id: "gpt-5-mini",
     name: "GPT-5 Mini",
@@ -18,8 +19,12 @@ const mockListModels = mock(async () => [
   },
 ]);
 const mockInitSession = mock(async (_prompt: string, _opts: any) => ({
-  send: mockSend,
-  on: mockOn,
+  session: {
+    send: mockSend,
+    on: mockOn,
+    setModel: mockSetModel,
+  },
+  resumed: false,
 }));
 
 mock.module("../copilot-core", () => ({
@@ -66,9 +71,9 @@ describe("server.ts", () => {
       const data = await res.json() as any;
       expect(data.object).toBe("list");
       expect(data.data).toHaveLength(3);
-      const gpt41 = data.data.find((m: any) => m.id === "gpt-4.1");
-      expect(gpt41.object).toBe("model");
-      expect(gpt41.owned_by).toBe("github-copilot");
+      const noBilling = data.data.find((m: any) => m.id === "test-no-billing");
+      expect(noBilling.object).toBe("model");
+      expect(noBilling.owned_by).toBe("github-copilot");
     });
 
     test("caches model list — only calls listModels once across requests", async () => {
@@ -89,8 +94,8 @@ describe("server.ts", () => {
     test("omits pricing for model without billing", async () => {
       const res = await fetchApp(makeReq("/v1/models"));
       const data = await res.json() as any;
-      const gpt41 = data.data.find((m: any) => m.id === "gpt-4.1");
-      expect(gpt41.pricing).toBeUndefined();
+      const noBilling = data.data.find((m: any) => m.id === "test-no-billing");
+      expect(noBilling.pricing).toBeUndefined();
     });
 
     test("omits cache from pricing when cachePrice is zero", async () => {
@@ -188,7 +193,7 @@ describe("server.ts", () => {
     test("returns 400 when no user message present", async () => {
       const res = await fetchApp(
         post("/v1/chat/completions", {
-          model: "gpt-4.1",
+          model: "gpt-5-mini",
           messages: [{ role: "system", content: "You are helpful." }],
         })
       );
@@ -216,15 +221,15 @@ describe("server.ts", () => {
       });
 
       await fetchApp(post("/v1/chat/completions",
-        { model: "gpt-4.1", messages: [{ role: "user", content: "Hi" }], stream: false },
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "Hi" }], stream: false },
         { "x-session-id": "key-test-A" }
       ));
       await fetchApp(post("/v1/chat/completions",
-        { model: "gpt-4.1", messages: [{ role: "user", content: "Hello" }], stream: false },
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "Hello" }], stream: false },
         { "x-session-id": "key-test-A" }
       ));
       await fetchApp(post("/v1/chat/completions",
-        { model: "gpt-4.1", messages: [{ role: "user", content: "Hey" }], stream: false },
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "Hey" }], stream: false },
         { "x-session-id": "key-test-B" }
       ));
 
@@ -240,10 +245,10 @@ describe("server.ts", () => {
       });
 
       await fetchApp(post("/v1/chat/completions",
-        { model: "gpt-4.1", messages: [{ role: "user", content: "first cli" }], stream: false }
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "first cli" }], stream: false }
       ));
       await fetchApp(post("/v1/chat/completions",
-        { model: "gpt-4.1", messages: [{ role: "user", content: "second cli" }], stream: false }
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "second cli" }], stream: false }
       ));
 
       expect(mockInitSession.mock.calls.length).toBe(2);
@@ -257,11 +262,11 @@ describe("server.ts", () => {
       });
 
       await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         messages: [{ role: "user", content: "do it" }],
       }));
       await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         messages: [
           { role: "user", content: "do it" },
           { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "calculator", input: {} }] },
@@ -284,7 +289,7 @@ describe("server.ts", () => {
 
       const res = await fetchApp(
         post("/v1/chat/completions",
-          { model: "gpt-4.1", messages: [{ role: "user", content: "Say hi" }], stream: true },
+          { model: "gpt-5-mini", messages: [{ role: "user", content: "Say hi" }], stream: true },
           { "x-session-id": "stream-test" }
         )
       );
@@ -309,7 +314,7 @@ describe("server.ts", () => {
       mockSend.mockImplementation(async (args: any) => { capturedPrompt = args?.prompt ?? ""; });
 
       await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         messages: [
           { role: "user", content: "do it" },
           { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "calculator", input: {} }] },
@@ -325,7 +330,7 @@ describe("server.ts", () => {
       mockSend.mockClear();
 
       const res = await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         messages: [{ role: "user", content: "quota" }],
       }, { "x-session-id": "quota-probe-test" }));
 
@@ -342,7 +347,7 @@ describe("server.ts", () => {
       mockSend.mockClear();
 
       const res = await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         messages: [{
           role: "user",
           content: [{ type: "text", text: "<system-reminder>\nThe following skills are available for this session.\n</system-reminder>\nSARAH" }],
@@ -368,13 +373,13 @@ describe("server.ts", () => {
       });
 
       await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         messages: [{ role: "user", content: "use a tool" }],
         tools: [{ name: "mcp__WebSearch___search", description: "web search", input_schema: { type: "object" } }],
       }, { "x-session-id": "deny-all-tools-test" }));
 
       const [prompt, opts] = mockInitSession.mock.calls[0];
-      expect(opts).toEqual({ denyAllTools: true, systemPromptMode: "replace", model: "gpt-4.1" });
+      expect(opts).toEqual({ denyAllTools: true, systemPromptMode: "replace", model: "gpt-5-mini", sessionId: "deny-all-tools-test" });
       expect(prompt).toContain("mcp__WebSearch___search");
       expect(prompt).toContain("tool_use");
       expect(prompt).toContain("ALWAYS emit FORM A");
@@ -393,7 +398,7 @@ describe("server.ts", () => {
       });
 
       const res = await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         messages: [{ role: "user", content: "SARAH" }],
         tools: [{ name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } }],
       }, { "x-session-id": "canonical-tool-test" }));
@@ -417,7 +422,7 @@ describe("server.ts", () => {
       });
 
       const res = await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: true,
+        model: "gpt-5-mini", stream: true,
         messages: [{ role: "user", content: "SARAH" }],
         tools: [{ name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } }],
       }, { "x-session-id": "canonical-stream-tool-test" }));
@@ -447,13 +452,13 @@ describe("server.ts", () => {
       });
 
       await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         messages: [{ role: "user", content: "prime" }],
         tools: [{ name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } }],
       }, { "x-session-id": "remembered-tools-test" }));
 
       const res = await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         messages: [{ role: "user", content: "SARAH" }],
       }, { "x-session-id": "remembered-tools-test" }));
 
@@ -471,7 +476,7 @@ describe("server.ts", () => {
       });
 
       await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         messages: [{ role: "user", content: "quota" }],
         tools: [
           { name: "Skill", description: "Invoke a skill", input_schema: { type: "object" } },
@@ -495,7 +500,7 @@ describe("server.ts", () => {
       });
 
       await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         messages: [{ role: "user", content: "quota" }],
         tools: [
           { name: "Skill", description: "Invoke a skill", input_schema: { type: "object" } },
@@ -506,7 +511,7 @@ describe("server.ts", () => {
       const [prompt, opts] = mockInitSession.mock.calls[0];
       // All filtered → empty tools[] → no tool_use system prefix, but denyAllTools
       // is still set so the SDK doesn't expose its built-in tools to the model.
-      expect(opts).toEqual({ denyAllTools: true, model: "gpt-4.1" });
+      expect(opts).toEqual({ denyAllTools: true, model: "gpt-5-mini", sessionId: "all-non-mcp-test" });
       expect(prompt).toBe("");
     });
 
@@ -518,13 +523,13 @@ describe("server.ts", () => {
       });
 
       await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         messages: [{ role: "user", content: "prime tools" }],
         tools: [{ name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } }],
       }, { "x-session-id": "merge-tools-test" }));
 
       await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         messages: [{ role: "user", content: "quota" }],
         tools: [{ name: "mcp__Billing___Usage", description: "billing quota usage", input_schema: { type: "object" } }],
       }, { "x-session-id": "merge-tools-test" }));
@@ -558,14 +563,14 @@ describe("server.ts", () => {
 
       // Session A: register the canonical Counter name.
       await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         messages: [{ role: "user", content: "register" }],
         tools: [{ name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } }],
       }, { "x-session-id": "global-registry-A" }));
 
       // Session B: completely different session, body.tools omits Counter — only built-ins.
       const res = await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         messages: [{ role: "user", content: "SARAH" }],
         tools: [{ name: "Agent", description: "Launch agent", input_schema: { type: "object" } }],
       }, { "x-session-id": "global-registry-B" }));
@@ -585,7 +590,7 @@ describe("server.ts", () => {
       mockSend.mockImplementation(async (args: any) => { capturedPrompt = args?.prompt ?? ""; });
 
       await fetchApp(post("/v1/chat/completions", {
-        model: "gpt-4.1", stream: false,
+        model: "gpt-5-mini", stream: false,
         system: "When user says quota, choose the billing usage tool instead of asking clarification.",
         messages: [{ role: "user", content: "quota" }],
         tools: [{ name: "mcp__Billing___Usage", description: "billing quota usage", input_schema: { type: "object" } }],
@@ -605,7 +610,7 @@ describe("server.ts", () => {
           firstCall = false;
           throw new Error("upstream init failed");
         }
-        return { send: mockSend, on: mockOn } as any;
+        return { session: { send: mockSend, on: mockOn, setModel: mockSetModel }, resumed: false } as any;
       });
       mockOn.mockImplementation((handler: any) => {
         setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
@@ -613,13 +618,13 @@ describe("server.ts", () => {
       });
 
       const failed = await fetchApp(post("/v1/chat/completions",
-        { model: "gpt-4.1", messages: [{ role: "user", content: "first" }], stream: false },
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "first" }], stream: false },
         { "x-session-id": "recover-test" }
       ));
       expect(failed.status).toBe(500);
 
       const recovered = await fetchApp(post("/v1/chat/completions",
-        { model: "gpt-4.1", messages: [{ role: "user", content: "second" }], stream: false },
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "second" }], stream: false },
         { "x-session-id": "recover-test" }
       ));
       expect(recovered.status).toBe(200);
@@ -627,8 +632,8 @@ describe("server.ts", () => {
 
       // Reset for other tests
       mockInitSession.mockImplementation(async (_prompt: string, _opts: any) => ({
-        send: mockSend,
-        on: mockOn,
+        session: { send: mockSend, on: mockOn, setModel: mockSetModel },
+        resumed: false,
       }));
     });
 
@@ -647,13 +652,13 @@ describe("server.ts", () => {
       });
 
       const failed = await fetchApp(post("/v1/chat/completions",
-        { model: "gpt-4.1", messages: [{ role: "user", content: "boom" }], stream: false },
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "boom" }], stream: false },
         { "x-session-id": "send-fail-test" }
       ));
       expect(failed.status).toBe(500);
 
       const ok = await fetchApp(post("/v1/chat/completions",
-        { model: "gpt-4.1", messages: [{ role: "user", content: "again" }], stream: false },
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "again" }], stream: false },
         { "x-session-id": "send-fail-test" }
       ));
       expect(ok.status).toBe(200);
@@ -674,7 +679,7 @@ describe("server.ts", () => {
 
       await fetchApp(
         post("/v1/chat/completions", {
-          model: "gpt-4.1",
+          model: "gpt-5-mini",
           stream: false,
           messages: [
             { role: "user", content: "first message" },
@@ -685,6 +690,181 @@ describe("server.ts", () => {
       );
 
       expect(capturedPrompt).toBe("last message");
+    });
+
+    test("model switch: second request with different model calls session.setModel (preserves conversation)", async () => {
+      // The Copilot SDK supports session.setModel(model) for mid-conversation
+      // switches — history preserved. Matches the official copilot CLI's /model
+      // command. The proxy reuses the existing session entry and enqueues a
+      // setModel call so the next send goes to the new model.
+      mockInitSession.mockClear();
+      mockSetModel.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+
+      await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "first" }], stream: false },
+        { "x-session-id": "model-switch-test" }
+      ));
+      await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-5.5", messages: [{ role: "user", content: "second" }], stream: false },
+        { "x-session-id": "model-switch-test" }
+      ));
+
+      // Only ONE initSession — the second request reused the existing entry.
+      expect(mockInitSession.mock.calls.length).toBe(1);
+      // setModel was called once, with the new model.
+      expect(mockSetModel.mock.calls.length).toBe(1);
+      expect(mockSetModel.mock.calls[0][0]).toBe("gpt-5.5");
+    });
+
+    test("model switch: setModel failure does NOT update entry.model — next attempt retries", async () => {
+      // If setModel throws (e.g. SDK rejects the requested model), the proxy
+      // must NOT lie to itself by marking entry.model as switched. The
+      // conversation continues on the OLD model (whatever the SDK still has),
+      // and the next request asking for the same target model must re-enqueue
+      // a fresh setModel attempt — proving the failure didn't update state.
+      mockInitSession.mockClear();
+      mockSetModel.mockClear();
+      mockSetModel.mockImplementation(async () => {
+        throw new Error("setModel exploded");
+      });
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+
+      // Turn 1: fresh session, model=A
+      await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "first" }], stream: false },
+        { "x-session-id": "setmodel-fail-test" }
+      ));
+      // Turn 2: switch to B — setModel throws, entry.model must stay A
+      const r2 = await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-5.5", messages: [{ role: "user", content: "second" }], stream: false },
+        { "x-session-id": "setmodel-fail-test" }
+      ));
+      // Turn 3: ask for B again — because entry.model is still A (the failed
+      // attempt didn't update it), the proxy must re-enqueue setModel(B).
+      await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-5.5", messages: [{ role: "user", content: "third" }], stream: false },
+        { "x-session-id": "setmodel-fail-test" }
+      ));
+
+      // Failures don't break the request — send still runs on the old model.
+      expect(r2.status).toBe(200);
+      // setModel called TWICE: once for turn 2, once for turn 3. If entry.model
+      // had been incorrectly updated to B after the first failure, turn 3 would
+      // have skipped setModel and this would be 1.
+      expect(mockSetModel.mock.calls.length).toBe(2);
+      expect(mockSetModel.mock.calls[0][0]).toBe("gpt-5.5");
+      expect(mockSetModel.mock.calls[1][0]).toBe("gpt-5.5");
+
+      // Reset for other tests
+      mockSetModel.mockImplementation(async () => {});
+    });
+
+    test("model switch: no setModel call when both requests use the same model", async () => {
+      // Sanity: setModel should ONLY fire on actual model differences. A normal
+      // multi-turn conversation with a single model must never call setModel.
+      mockInitSession.mockClear();
+      mockSetModel.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+
+      await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "first" }], stream: false },
+        { "x-session-id": "no-switch-test" }
+      ));
+      await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "second" }], stream: false },
+        { "x-session-id": "no-switch-test" }
+      ));
+
+      expect(mockInitSession.mock.calls.length).toBe(1);
+      expect(mockSetModel.mock.calls.length).toBe(0);
+    });
+
+    test("/clear is NOT sent when initSession reports resumed: true", async () => {
+      // On resume, the conversation memory must be preserved. If /clear fires
+      // after a resume, the very thing we resumed is wiped — defeating the
+      // entire purpose of crash recovery.
+      mockInitSession.mockClear();
+      mockSend.mockClear();
+      const sendCalls: any[] = [];
+      mockSend.mockImplementation(async (args: any) => {
+        sendCalls.push(args);
+      });
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+      // Tell the proxy this session was RESUMED — /clear must not enqueue.
+      mockInitSession.mockImplementationOnce(async () => ({
+        session: { send: mockSend, on: mockOn, setModel: mockSetModel },
+        resumed: true,
+      }));
+
+      await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "hello again" }], stream: false },
+        { "x-session-id": "resume-test" }
+      ));
+
+      // No /clear prompt in the send calls — only the user's actual message.
+      const clearPrompts = sendCalls.filter((c) => c?.prompt === "/clear");
+      expect(clearPrompts.length).toBe(0);
+
+      // Reset for other tests
+      mockInitSession.mockImplementation(async (_prompt: string, _opts: any) => ({
+        session: { send: mockSend, on: mockOn, setModel: mockSetModel },
+        resumed: false,
+      }));
+    });
+
+    test("session.error invalidates the in-memory entry so the next request re-initializes", async () => {
+      // Self-healing: a session.error during a turn drops the in-memory entry.
+      // The next request for the same sessionKey must trigger a NEW initSession
+      // call (which the resume path inside initSession can then use to rehydrate
+      // from on-disk state, or fall back to fresh create).
+      mockInitSession.mockClear();
+      mockOn.mockClear();
+      // Each new session triggers TWO runTurn calls before the user's first
+      // request runs: /clear (the cleanup turn) + the user turn. We want the
+      // user turn (not /clear) to receive the session.error so that the
+      // self-heal path fires on a real user-visible failure.
+      // Turn 1 = /clear → success; Turn 2 = user request → session.error;
+      // Turn 3 = recovery user request → success.
+      let turnNum = 0;
+      mockOn.mockImplementation((handler: any) => {
+        turnNum++;
+        if (turnNum === 2) {
+          setTimeout(() => handler({ type: "session.error", data: { message: "upstream died" } }), 0);
+        } else {
+          setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        }
+        return () => {};
+      });
+
+      // First request — triggers session.error
+      const failed = await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "first" }], stream: false },
+        { "x-session-id": "self-heal-test" }
+      ));
+      expect(failed.status).toBe(500);
+
+      // Second request on the SAME sessionKey — must re-init, not reuse the
+      // (now invalidated) entry.
+      const recovered = await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "second" }], stream: false },
+        { "x-session-id": "self-heal-test" }
+      ));
+      expect(recovered.status).toBe(200);
+      // TWO initSession calls — one for the failed turn, one for the recovery.
+      expect(mockInitSession.mock.calls.length).toBe(2);
     });
   });
 });

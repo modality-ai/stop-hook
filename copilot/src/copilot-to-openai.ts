@@ -31,6 +31,10 @@ interface SessionEntry {
   // Copilot model this session was initialised with. Switching model on an
   // existing session is not supported by the SDK — must replace the session.
   model: string;
+  // The proxy session key (header x-session-id or derived hash). Carried on the
+  // entry so per-turn error handlers can invalidate the right map entry without
+  // a reverse lookup, enabling self-healing resume on the next request.
+  sessionKey: string;
 }
 
 type BlobAttachment = {
@@ -360,20 +364,34 @@ async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: strin
   const requestedModel = model ?? DEFAULT_MODEL;
   const existing = sessions.get(sessionKey);
 
-  // Reuse session whenever it exists for the same model. The system prompt
-  // (which describes available tools) is fixed for the session's lifetime —
-  // resetting on every tool-list delta would destroy the conversation memory
-  // that multi-step workflows rely on. Claude CLI naturally varies the tools
-  // array across turns (skill catalog grows, deferred MCP tools land later),
-  // and that should NOT clobber an in-flight multi-turn task.
-  if (existing && existing.model === requestedModel) return existing;
-
-  // Only the model changing forces a reset — the SDK can't switch model on an
-  // existing session. Drop any in-flight creation so the new one wins.
+  // Model switch on existing session: the SDK supports session.setModel() —
+  // takes effect for the NEXT message, conversation history preserved (mirrors
+  // the official copilot CLI's /model command). Enqueue the switch onto the
+  // session's serialization queue so concurrent requests with different models
+  // don't race: each setModel runs atomically with the send that asked for it.
   if (existing) {
-    logger.log(`🔄 Session reset for ${sessionKey}: model changed (${existing.model} → ${requestedModel})`);
-    sessions.delete(sessionKey);
-    sessionCreating.delete(sessionKey);
+    if (existing.model !== requestedModel) {
+      const targetModel = requestedModel;
+      existing.queue = existing.queue.then(
+        async () => {
+          const prev = existing.model;
+          try {
+            await existing.session.setModel(targetModel);
+            existing.model = targetModel;
+            logger.log(`🔀 Model switched for ${sessionKey}: ${prev} → ${targetModel}`);
+          } catch (err: any) {
+            // Don't update entry.model — keep it pointing at the still-active
+            // model on the SDK side. Surface the failure so callers see why
+            // their /model command appears to have done nothing.
+            logger.log(
+              `⚠️ setModel failed for ${sessionKey} (${prev} → ${targetModel}): ${err?.message ?? err}`
+            );
+          }
+        },
+        (err) => logger.log(`⚠️ Prior queue error before setModel for ${sessionKey}: ${err?.message ?? err}`)
+      );
+    }
+    return existing;
   }
 
   // Deduplicate concurrent creation for the same key
@@ -386,25 +404,33 @@ async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: strin
     // returned to the client. systemPromptMode "replace" only applies when we have a
     // tool prefix to inject — otherwise leave the SDK's default system prompt.
     // Pass model through so the session uses the client-requested model, not the SDK default.
-    const sessionOpts: { denyAllTools: true; systemPromptMode?: "replace"; model: string } = tools?.length
-      ? { denyAllTools: true, systemPromptMode: "replace", model: requestedModel }
-      : { denyAllTools: true, model: requestedModel };
+    // Pass sessionId so the SDK's create/resume logic keys on the proxy's sessionKey —
+    // enabling crash recovery via client.getSessionMetadata + client.resumeSession.
+    const sessionOpts: { denyAllTools: true; systemPromptMode?: "replace"; model: string; sessionId: string } = tools?.length
+      ? { denyAllTools: true, systemPromptMode: "replace", model: requestedModel, sessionId: sessionKey }
+      : { denyAllTools: true, model: requestedModel, sessionId: sessionKey };
     creating = ensureClientStarted()
       .then(() => initSession(toolPrefix, sessionOpts))
-      .then((session) => {
+      .then(({ session, resumed }) => {
         const entry: SessionEntry = {
           session,
           queue: Promise.resolve(),
           toolFingerprint: fp,
           model: requestedModel,
+          sessionKey,
         };
         sessions.set(sessionKey, entry);
-        logger.log(`🆕 Session created: ${sessionKey} model=${requestedModel} fp=${fp}${tools?.length ? ` (${tools.length} tools)` : " (no tools)"}`);
-        // Enqueue /clear async so the session starts with a clean context.
-        // Real requests queue behind it via entry.queue — no blocking at the call site.
-        entry.queue = entry.queue
-          .then(() => runTurn(entry, "/clear"))
-          .then(() => { logger.log(`🧹 /clear done: ${sessionKey}`); }, () => {});
+        logger.log(
+          `🆕 Session ${resumed ? "resumed" : "created"}: ${sessionKey} model=${requestedModel} fp=${fp}` +
+            `${tools?.length ? ` (${tools.length} tools)` : " (no tools)"}`
+        );
+        // Enqueue /clear only on FRESH create. On resume we want to preserve the
+        // prior conversation history — that's the whole point of resume.
+        if (!resumed) {
+          entry.queue = entry.queue
+            .then(() => runTurn(entry, "/clear"))
+            .then(() => { logger.log(`🧹 /clear done: ${sessionKey}`); }, () => {});
+        }
         return entry;
       })
       .finally(() => {
@@ -555,9 +581,79 @@ function formatToolResultContent(content: any): string {
   return "";
 }
 
+// Counter *assemble (and other method results) return multiple concatenated JSON
+// objects. One of them is a flat registry of ALL heroes' methods, e.g.:
+//   {
+//     "help": "Display all available...",            // string description
+//     "code": "Implement features...",
+//     "get-codesymbol": { description, parameters }, // nested object (parameterized methods)
+//     "github": { description, parameters },
+//     "change": "_Counter__ExecuteMethod({method: '*change' })",  // call stub
+//     ...
+//   }
+// This registry causes the Copilot model to list every system method instead of
+// only the current hero's. Strip it so the model relies on the _Counter__Deploy
+// conversation history for the active hero's specific method list.
+//
+// Detection uses three structural invariants — no hardcoded method names needed:
+//   1. Large flat map: ≥10 top-level keys (registries are always large).
+//   2. Negative guard: NONE of the well-known non-registry Counter chunk keys are
+//      present (instructions / methodContent / tactical_notes / methodology / etc.).
+//   3. Positive signature: at least one value contains a Counter call stub
+//      ("_Counter__ExecuteMethod(" or "_Counter__Deploy"). These stubs are unique
+//      to the registry — no other Counter chunk emits them.
+const NON_REGISTRY_CHUNK_KEYS = new Set([
+  "instructions", "methodContent", "methodParams", "tactical_notes",
+  "methodology", "callSign", "agent_compatibility", "message", "currentTimeAtUTC",
+]);
+
+function isCounterMethodRegistry(obj: any): boolean {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+  const keys = Object.keys(obj);
+  if (keys.length < 10) return false;
+  if (keys.some((k) => NON_REGISTRY_CHUNK_KEYS.has(k))) return false;
+  return Object.values(obj).some((v) => {
+    if (typeof v === "string") return v.includes("_Counter__ExecuteMethod(") || v.includes("_Counter__Deploy");
+    if (v && typeof v === "object") return JSON.stringify(v).includes("_Counter__");
+    return false;
+  });
+}
+
+function slimCounterResult(raw: string): string {
+  const out: string[] = [];
+  let pos = 0;
+  while (pos < raw.length) {
+    const start = raw.indexOf("{", pos);
+    if (start === -1) { out.push(raw.slice(pos)); break; }
+    if (start > pos) out.push(raw.slice(pos, start));
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let i = start; i < raw.length; i++) {
+      const ch = raw[i];
+      if (esc) { esc = false; continue; }
+      if (inStr) { if (ch === "\\") esc = true; else if (ch === '"') inStr = false; continue; }
+      if (ch === '"') { inStr = true; }
+      else if (ch === "{") depth++;
+      else if (ch === "}") { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end === -1) { out.push(raw.slice(start)); break; }
+    const chunk = raw.slice(start, end + 1);
+    try {
+      if (!isCounterMethodRegistry(JSON.parse(chunk))) out.push(chunk);
+      // else: silently drop the flat registry chunk
+    } catch { out.push(chunk); }
+    pos = end + 1;
+  }
+  return out.join("");
+}
+
 function formatToolResultLine(messages: any[], toolId: string, content: any): string {
   const name = resolveToolName(messages, toolId);
-  return `[Tool result for ${name}]: ${formatToolResultContent(content)}`;
+  let formatted = formatToolResultContent(content);
+  // Slim Counter ExecuteMethod results: remove the all-methods registry chunk
+  // so the Copilot model presents only the current hero's methods (from the
+  // _Counter__Deploy conversation history) instead of the full system method list.
+  if (name.includes("ExecuteMethod")) formatted = slimCounterResult(formatted);
+  return `[Tool result for ${name}]: ${formatted}`;
 }
 
 // Walk back through consecutive role="tool" entries (OpenAI shape) ending at
@@ -746,8 +842,8 @@ function extractInlineToolUse(content: string): { name: string; arguments: strin
   return null;
 }
 
-// Narration rescue: gpt-4.1 inside the Copilot SDK frequently ignores the
-// "emit only tool_use JSON" rule on the SECOND+ turn of a multi-step workflow.
+// Narration rescue: GPT-class models inside the Copilot SDK frequently ignore
+// the "emit only tool_use JSON" rule on the SECOND+ turn of a multi-step workflow.
 // It produces text like "I will now run `use-stock rules --eval --json`"
 // instead of a tool_use call, and Claude CLI then gives up because no tool
 // call came back. When the model clearly stated intent + a runnable shell
@@ -791,6 +887,23 @@ function looksLikeShellCommand(s: string): boolean {
   // between clauses, multi-sentence text).
   if (/[.!?]\s+[A-Z]/.test(t)) return false;
   if (/\s—\s|\s–\s/.test(t)) return false;
+
+  // Reject definitive English prose markers — these never appear in shell commands.
+  if (/\be\.g\.,|\bi\.e\.,/.test(t)) return false;
+
+  // Reject when the tail has 5+ consecutive purely-alpha tokens: that's natural
+  // language prose, not shell args. Shell args mix flags (-x/--foo), paths
+  // (/dir/file.ts), extensions, etc. Example false positive caught here:
+  // "plus other tactical helpers shown in *assemble output" — "other tactical
+  // helpers shown in" is 5 consecutive alpha words.
+  {
+    const tailTokens = tail.split(/\s+/);
+    let alphaRun = 0;
+    for (const tok of tailTokens) {
+      alphaRun = /^[a-zA-Z]+$/.test(tok) ? alphaRun + 1 : 0;
+      if (alphaRun >= 5) return false;
+    }
+  }
 
   // The arg/flag immediately after the CLI name should be flag-shaped (-x,
   // --foo), a sub-command word, a path, or a JSON-ish/URL-ish token —
@@ -893,6 +1006,12 @@ function runTurn(
           unsub();
           resolve(fullContent);
         } else if (event.type === "session.error") {
+          // Self-healing: drop the in-memory entry so the next request for this
+          // sessionKey re-probes via getSessionMetadata → resumeSession (or fresh
+          // create if the on-disk state is also gone). Prevents one bad turn
+          // from poisoning the rest of the conversation.
+          if (sessions.get(entry.sessionKey) === entry) sessions.delete(entry.sessionKey);
+          logger.log(`🩹 Invalidated entry for ${entry.sessionKey} on session.error — next turn will auto-resume`);
           unsub();
           reject(new Error(event.data.message));
         }
@@ -986,6 +1105,10 @@ function sendAndStream(
             unsub();
             resolve();
           } else if (event.type === "session.error") {
+            // Self-healing: drop the in-memory entry so the next request for this
+            // sessionKey re-probes via getSessionMetadata → resumeSession.
+            if (sessions.get(entry.sessionKey) === entry) sessions.delete(entry.sessionKey);
+            logger.log(`🩹 Invalidated entry for ${entry.sessionKey} on session.error — next turn will auto-resume`);
             unsub();
             reject(new Error(event.data.message));
           }
@@ -1175,7 +1298,11 @@ async function completionsHandler(c: Context) {
       `🔧 tools: incomingMcp=${body.tools?.length ?? 0} remembered=${sessionTools.get(sessionKey)?.length ?? 0} ` +
         `effective=${effectiveTools?.length ?? 0} globalFallback=${!sessionEffective?.length && !hadRawTools && !!globalMcpTools} promptHasToolReminder=${containsToolReminder(prompt)}`
     );
-    if (isBareQuotaProbe(prompt, hadRawTools, sysLen) && !effectiveTools?.length) {
+    // Bare quota probe: always return empty — it's Claude Code's connectivity check,
+    // never a real message. Filter unconditionally regardless of effectiveTools;
+    // the original `&& !effectiveTools?.length` guard caused probes to slip through
+    // on turn 2+ after globalMcpTools was populated by a prior tool-bearing turn.
+    if (isBareQuotaProbe(prompt, hadRawTools, sysLen)) {
       logger.log("🔍 filtered bare quota probe");
       return c.json(emptyCompletion(completionId, model, body));
     }

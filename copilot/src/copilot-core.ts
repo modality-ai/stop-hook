@@ -637,7 +637,7 @@ export const initSession = async (
   systemPrompt: string,
   options: any = {},
   session?: CopilotSession
-): Promise<CopilotSession> => {
+): Promise<{ session: CopilotSession; resumed: boolean }> => {
   if (null == options.model) {
     delete options.model;
   }
@@ -877,20 +877,52 @@ export const initSession = async (
     },
   };
 
+  // Anonymous proxy keys rotate per call — they have nothing to resume AND we
+  // don't want each one creating its own on-disk session file (the SDK's
+  // session store would fill up with orphans). Funnel them all into the
+  // process-wide gSessionId, the same way CLI mode does, so they share one
+  // throwaway slot on disk instead of N.
+  const isAnonymousProxyKey =
+    typeof options.sessionId === "string" && options.sessionId.startsWith("__anonymous__");
+  const effectiveId: string =
+    options.sessionId && !isAnonymousProxyKey ? options.sessionId : state.gSessionId;
+  // Only attempt resume when the proxy actually keyed this request — never for
+  // anonymous keys and never for CLI mode's process-wide id (createSession +
+  // catch fallback covers CLI semantics).
+  const canResume = typeof options.sessionId === "string" && !isAnonymousProxyKey;
+  let resumed = false;
+
   try {
-    if (null == session) {
-      session = await client.createSession({
-        ...sessionOptions,
-        sessionId: state.gSessionId,
-      });
+    if (null != session) {
+      // Legacy CLI-mode path: caller already holds a session object.
+      session = await client.resumeSession(effectiveId, sessionOptions);
+      resumed = true;
+    } else if (canResume) {
+      // Proxy-mode resume: pre-check the on-disk metadata before deciding.
+      let meta: any;
+      try {
+        meta = await client.getSessionMetadata(effectiveId);
+      } catch (err: any) {
+        logger.log(`⚠️ getSessionMetadata failed for ${effectiveId}: ${err?.message ?? err}`);
+        meta = undefined;
+      }
+      if (meta) {
+        try {
+          session = await client.resumeSession(effectiveId, sessionOptions);
+          resumed = true;
+        } catch (err: any) {
+          logger.log(`⚠️ Resume failed for ${effectiveId}: ${err?.message ?? err} — creating fresh session`);
+        }
+      }
+      if (!session) {
+        session = await client.createSession({ ...sessionOptions, sessionId: effectiveId });
+      }
     } else {
-      session = await client.resumeSession(state.gSessionId, sessionOptions);
+      session = await client.createSession({ ...sessionOptions, sessionId: effectiveId });
     }
   } catch (error) {
-    session = await client.createSession({
-      ...sessionOptions,
-      sessionId: state.gSessionId,
-    });
+    session = await client.createSession({ ...sessionOptions, sessionId: effectiveId });
+    resumed = false;
   }
 
   let cachedModelIds = loadCachedModelIds();
@@ -917,5 +949,5 @@ export const initSession = async (
   writeFileSync(LAST_SESSION_FILE, `${state.gSessionId},${state.loopId}`);
 
   setupSessionEventListener(session, options);
-  return session;
+  return { session, resumed };
 };
