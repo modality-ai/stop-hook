@@ -98,6 +98,18 @@ check_contains "max iter → message"     "Max iterations reached" "$out"
   || fail "max iter → state file removed" "removed" "still exists"
 rm -rf "$D"
 
+# 7. Nested promise <promise>A <promise>B</promise></promise> → matches inner text (the regression case)
+D=$(mktemp -d)
+new_state "$D" "ATTEMPT_COMPLETION"
+T=$(make_transcript "$D" "<promise>ATTEMPT_COMPLETION <promise>All fixes applied and all tests pass</promise></promise>")
+rc=0; out=$(run_stop "$D" "$T") || rc=$?
+check_eq       "nested promise → exit 0"                       "0"                          "$rc"
+check_contains "nested promise → Completed"                    "Completed: ATTEMPT_COMPLETION" "$out"
+[[ ! -f "$D/.claude/agent-loop.local.md" ]] \
+  && pass "nested promise → state file removed" \
+  || fail "nested promise → state file removed" "removed" "still exists"
+rm -rf "$D"
+
 # 6. No state file → exits 0 immediately (no-op)
 D=$(mktemp -d)
 T=$(make_transcript "$D" "irrelevant")
