@@ -3,6 +3,11 @@
 set -euo pipefail
 
 STATE="${CLAUDE_PROJECT_DIR:-.}/.claude/agent-loop.local.md"
+
+if [[ -n "${DEBUG_HOOKS:-}" ]]; then
+  echo "[$(date)] stop.sh active. STATE=$STATE exists=$( [[ -f "$STATE" ]] && echo yes || echo no )" >> /tmp/hooks-debug.log
+fi
+
 [[ -f "$STATE" ]] || exit 0
 
 # Parse state file
@@ -15,7 +20,7 @@ PROMPT=$(awk '/^---$/{i++; next} i>=2' "$STATE")
 [[ "$ITER" =~ ^[0-9]+$ && "$MAX" =~ ^[0-9]+$ ]] || { [[ -f "$STATE" ]] && rm "$STATE"; exit 0; }
 
 # Check max iterations
-(( ITER >= MAX && MAX > 0 )) && { [[ -f "$STATE" ]] && rm "$STATE"; echo "Max iterations reached."; exit 0; }
+(( ITER >= MAX && MAX > 0 )) && { [[ -f "$STATE" ]] && rm "$STATE"; echo "Max iterations reached." >&2; exit 0; }
 
 # Check completion promise in transcript
 INPUT=$(cat)
@@ -24,7 +29,7 @@ if [[ -n "$PROMISE" && "$PROMISE" != "null" ]]; then
   if [[ -f "$TRANSCRIPT" ]]; then
     sleep 0.5  # allow Claude Code to flush final assistant message to JSONL before reading
     FOUND=$(tail -200 "$TRANSCRIPT" 2>/dev/null | sed 's#\\/#/#g' | GREP_OPTIONS= command grep -o '<promise>.*</promise>' | tail -20 | sed 's/<promise>//g; s/<\/promise>//g' || true)
-    echo "$FOUND" | GREP_OPTIONS= command grep -qF "$PROMISE" && { [[ -f "$STATE" ]] && rm "$STATE"; echo "Completed: $PROMISE"; exit 0; }
+    echo "$FOUND" | GREP_OPTIONS= command grep -qF "$PROMISE" && { [[ -f "$STATE" ]] && rm "$STATE"; echo "Completed: $PROMISE" >&2; exit 0; }
   fi
 fi
 
