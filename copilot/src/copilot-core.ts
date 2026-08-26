@@ -1,15 +1,9 @@
 import { CopilotClient, RuntimeConnection, type CopilotSession } from "@github/copilot-sdk";
-import {
-  appendFileSync,
-  readFileSync,
-  writeFileSync,
-  writeSync,
-  existsSync,
-  mkdirSync,
-} from "fs";
+import { readFileSync, writeSync, existsSync } from "fs";
 import { appendFile } from "fs/promises";
 import { execSync } from "child_process";
 import { getSessionId } from "./SweAgentInteraction";
+import { createLoopFs, tryMkdir } from "./loop-fs";
 import { DEFAULT_MODEL, DEFAULT_REASON_MODEL } from "./config";
 
 // ─────────────────────────────────────────────────────────────
@@ -32,7 +26,21 @@ export interface BashResult {
 // Paths & directories
 // ─────────────────────────────────────────────────────────────
 export const COPILOT_LOOP_DIR = "/tmp/copilot-loop";
-mkdirSync(COPILOT_LOOP_DIR, { recursive: true });
+
+// /tmp is not durable: the OS tmp-cleaner, a reboot, or a manual sweep can
+// remove COPILOT_LOOP_DIR out from under a long-running process. A single
+// import-time mkdir is therefore not enough — every writer goes through these
+// self-healing helpers. See loop-fs.ts for the retry semantics.
+const loopFs = createLoopFs(COPILOT_LOOP_DIR);
+
+const ensureLoopDir = loopFs.ensureDir;
+export const writeLoopFile = loopFs.writeFile;
+const appendLoopFile = loopFs.appendFile;
+
+// Create it once up front so the common case needs no retry. A failure here is
+// not fatal: every writer re-creates the directory on ENOENT, and a genuinely
+// unusable path surfaces at the write that needs it, with real context.
+ensureLoopDir();
 
 export const LAST_SESSION_FILE = `${COPILOT_LOOP_DIR}/last-session`;
 const MODELS_CACHE_FILE = `${COPILOT_LOOP_DIR}/models.json`;
@@ -91,8 +99,8 @@ const printColorDiff = (
   const tmpOld = `${COPILOT_LOOP_DIR}/.diff-old-${id}`;
   const tmpNew = `${COPILOT_LOOP_DIR}/.diff-new-${id}`;
   try {
-    writeFileSync(tmpOld, oldStr ?? "");
-    writeFileSync(tmpNew, newStr ?? "");
+    writeLoopFile(tmpOld, oldStr ?? "");
+    writeLoopFile(tmpNew, newStr ?? "");
     let rawDiff = "";
     try {
       execSync(
@@ -189,7 +197,7 @@ const loadCachedModelIds = (): string[] | null => {
 };
 
 const saveModelsCache = (models: any[]) => {
-  writeFileSync(MODELS_CACHE_FILE, JSON.stringify(models, null, 2));
+  writeLoopFile(MODELS_CACHE_FILE, JSON.stringify(models, null, 2));
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -203,7 +211,7 @@ export const logger = {
   store: (logType: string, message: string) => {
     logger.resetTimeout();
     const filePath = `${COPILOT_LOOP_DIR}/${state.loopId}-${logType}.txt`;
-    appendFileSync(filePath, `${message}\n`);
+    appendLoopFile(filePath, `${message}\n`);
   },
   log: (message?: any, ...args: any[]) => {
     logger.store("log", message);
@@ -259,6 +267,17 @@ export const setClientCwd = (cwd: string): void => {
     return;
   }
   _clientCwd = cwd;
+};
+
+// Same /tmp durability problem as COPILOT_LOOP_DIR: a vanished cwd makes every
+// subsequent session.create fail with "Directory does not exist or cannot be
+// accessed", so re-assert it rather than trusting the import-time mkdir.
+const ensureClientCwd = (): void => {
+  if (!_clientCwd) return;
+  const err = tryMkdir(_clientCwd);
+  if (err) {
+    logger.log(`⚠️  Failed to ensure client cwd ${_clientCwd}: ${err.message}`);
+  }
 };
 
 const ensureClient = (): CopilotClient => {
@@ -723,10 +742,13 @@ export const initSession = async (
           case "bash":
           case "shell":
             try {
-              appendFile(
-                `${COPILOT_LOOP_DIR}/command.log`,
-                `${timestamp} [${state.gSessionId}] ${command}\n`
-              ).catch(() => {});
+              const commandLogPath = `${COPILOT_LOOP_DIR}/command.log`;
+              const commandLogLine = `${timestamp} [${state.gSessionId}] ${command}\n`;
+              appendFile(commandLogPath, commandLogLine).catch(() => {
+                // Directory may have been reaped from /tmp — recreate and retry once.
+                ensureLoopDir();
+                appendFile(commandLogPath, commandLogLine).catch(() => {});
+              });
               if (hasActuator) {
                 const actuatorId =
                   gToolTimeMap[`${truncateMs(timestamp)}-${toolName}`];
@@ -828,12 +850,12 @@ export const initSession = async (
                 const commandArr = [];
                 if (result.stdout) {
                   const stdoutFile = `${relayFile}.stdout`;
-                  writeFileSync(stdoutFile, result.stdout);
+                  writeLoopFile(stdoutFile, result.stdout);
                   commandArr.push(`cat ${stdoutFile}; rm -f ${stdoutFile}`);
                 }
                 if (result.stderr) {
                   const stderrFile = `${relayFile}.stderr`;
-                  writeFileSync(stderrFile, result.stderr);
+                  writeLoopFile(stderrFile, result.stderr);
                   commandArr.push(
                     result.stdout
                       ? `dd >&2 2>/dev/null < ${stderrFile}; rm -f ${stderrFile}`
@@ -892,6 +914,8 @@ export const initSession = async (
   const canResume = typeof options.sessionId === "string" && !isAnonymousProxyKey;
   let resumed = false;
 
+  ensureClientCwd();
+
   try {
     if (null != session) {
       // Legacy CLI-mode path: caller already holds a session object.
@@ -946,7 +970,7 @@ export const initSession = async (
     process.exit(1);
   }
 
-  writeFileSync(LAST_SESSION_FILE, `${state.gSessionId},${state.loopId}`);
+  writeLoopFile(LAST_SESSION_FILE, `${state.gSessionId},${state.loopId}`);
 
   setupSessionEventListener(session, options);
   return { session, resumed };

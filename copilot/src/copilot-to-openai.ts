@@ -1,6 +1,18 @@
-import { mkdirSync, writeFileSync } from "fs";
-import { client, initSession, logger, setClientCwd, COPILOT_LOOP_DIR } from "./copilot-core";
+import { tryMkdir } from "./loop-fs";
+import {
+  client,
+  initSession,
+  logger,
+  setClientCwd,
+  writeLoopFile,
+  COPILOT_LOOP_DIR,
+} from "./copilot-core";
 import { DEFAULT_MODEL } from "./config";
+import {
+  extractInlineToolUse,
+  slimCounterResult,
+  tidyToolUseJsonDetailed,
+} from "./tool-use-text";
 import type { CopilotSession } from "@github/copilot-sdk";
 import type { Context, Hono } from "hono";
 
@@ -8,7 +20,9 @@ import type { Context, Hono } from "hono";
 // up the project's hooks/ directory (which would otherwise fire sessionStart
 // on every turn — see hooks/agent-loop.json). Must run before client.start().
 const SERVER_MODE_CWD = `${COPILOT_LOOP_DIR}/server-mode-cwd`;
-mkdirSync(SERVER_MODE_CWD, { recursive: true });
+// Best-effort at import: initSession re-asserts this directory before every
+// session.create, so a failure here is recoverable rather than fatal.
+tryMkdir(SERVER_MODE_CWD);
 setClientCwd(SERVER_MODE_CWD);
 
 // ─────────────────────────────────────────────────────────────
@@ -278,36 +292,24 @@ function canonicalizeToolUseText(text: string, tools?: any[]): string {
   });
 }
 
-// Tidy a `{"tool_use": ...}` literal that the model emitted with mismatched
-// braces/brackets (truncated tail). Strict no-op unless ALL of:
-//   1. text contains "tool_use"
-//   2. the candidate substring fails JSON.parse as-is
-//   3. brace-balancing produces a string that DOES parse
-// Otherwise returns the original input verbatim.
-function tidyToolUseJson(text: string): string {
-  if (!text || !text.includes('"tool_use"')) return text;
-  const fenced = text.match(/```(?:json)?\s*([\s\S]+?)```/);
-  const candidate = (fenced ? fenced[1] : text).trim();
-  const start = candidate.indexOf("{");
-  if (start === -1) return text;
-  const body = candidate.slice(start);
-  try { JSON.parse(body); return body === text ? text : body; } catch {}
+// Hit counters for the truncated-JSON repair path. Purely diagnostic: if
+// `repaired` stays 0 across real traffic, `repairTruncatedJson` is dead code
+// and the tidy step can collapse to fence-stripping.
+const repairStats = { repaired: 0, unrepairable: 0 };
 
-  let curly = 0, square = 0, inStr = false, esc = false;
-  for (const ch of body) {
-    if (esc) { esc = false; continue; }
-    if (inStr) { if (ch === "\\") esc = true; else if (ch === '"') inStr = false; continue; }
-    if (ch === '"') inStr = true;
-    else if (ch === "{") curly++;
-    else if (ch === "}") curly--;
-    else if (ch === "[") square++;
-    else if (ch === "]") square--;
+// Thin instrumented wrapper over the pure transform in tool-use-text.ts.
+// The decision logic lives there (and is unit-tested there); this only counts
+// and logs which branch ran.
+function tidyToolUseJson(text: string): string {
+  const { text: tidied, outcome } = tidyToolUseJsonDetailed(text);
+  if (outcome === "repaired") {
+    repairStats.repaired++;
+    logger.log(`🩺 tidyToolUseJson repaired truncated JSON (hit #${repairStats.repaired}, +${tidied.length - text.length} chars): ${text.slice(-120)}`);
+  } else if (outcome === "unrepairable") {
+    repairStats.unrepairable++;
+    logger.log(`🩺 tidyToolUseJson could NOT repair (miss #${repairStats.unrepairable}): ${text.slice(0, 160)}`);
   }
-  if (inStr || curly < 0 || square < 0) return text;
-  let repaired = body;
-  while (square-- > 0) repaired += "]";
-  while (curly-- > 0) repaired += "}";
-  try { JSON.parse(repaired); return repaired; } catch { return text; }
+  return tidied;
 }
 
 function buildToolSystemPrefix(tools: any[]): string {
@@ -581,71 +583,6 @@ function formatToolResultContent(content: any): string {
   return "";
 }
 
-// Counter *assemble (and other method results) return multiple concatenated JSON
-// objects. One of them is a flat registry of ALL heroes' methods, e.g.:
-//   {
-//     "help": "Display all available...",            // string description
-//     "code": "Implement features...",
-//     "get-codesymbol": { description, parameters }, // nested object (parameterized methods)
-//     "github": { description, parameters },
-//     "change": "_Counter__ExecuteMethod({method: '*change' })",  // call stub
-//     ...
-//   }
-// This registry causes the Copilot model to list every system method instead of
-// only the current hero's. Strip it so the model relies on the _Counter__Deploy
-// conversation history for the active hero's specific method list.
-//
-// Detection uses three structural invariants — no hardcoded method names needed:
-//   1. Large flat map: ≥10 top-level keys (registries are always large).
-//   2. Negative guard: NONE of the well-known non-registry Counter chunk keys are
-//      present (instructions / methodContent / tactical_notes / methodology / etc.).
-//   3. Positive signature: at least one value contains a Counter call stub
-//      ("_Counter__ExecuteMethod(" or "_Counter__Deploy"). These stubs are unique
-//      to the registry — no other Counter chunk emits them.
-const NON_REGISTRY_CHUNK_KEYS = new Set([
-  "instructions", "methodContent", "methodParams", "tactical_notes",
-  "methodology", "callSign", "agent_compatibility", "message", "currentTimeAtUTC",
-]);
-
-function isCounterMethodRegistry(obj: any): boolean {
-  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
-  const keys = Object.keys(obj);
-  if (keys.length < 10) return false;
-  if (keys.some((k) => NON_REGISTRY_CHUNK_KEYS.has(k))) return false;
-  return Object.values(obj).some((v) => {
-    if (typeof v === "string") return v.includes("_Counter__ExecuteMethod(") || v.includes("_Counter__Deploy");
-    if (v && typeof v === "object") return JSON.stringify(v).includes("_Counter__");
-    return false;
-  });
-}
-
-function slimCounterResult(raw: string): string {
-  const out: string[] = [];
-  let pos = 0;
-  while (pos < raw.length) {
-    const start = raw.indexOf("{", pos);
-    if (start === -1) { out.push(raw.slice(pos)); break; }
-    if (start > pos) out.push(raw.slice(pos, start));
-    let depth = 0, inStr = false, esc = false, end = -1;
-    for (let i = start; i < raw.length; i++) {
-      const ch = raw[i];
-      if (esc) { esc = false; continue; }
-      if (inStr) { if (ch === "\\") esc = true; else if (ch === '"') inStr = false; continue; }
-      if (ch === '"') { inStr = true; }
-      else if (ch === "{") depth++;
-      else if (ch === "}") { depth--; if (depth === 0) { end = i; break; } }
-    }
-    if (end === -1) { out.push(raw.slice(start)); break; }
-    const chunk = raw.slice(start, end + 1);
-    try {
-      if (!isCounterMethodRegistry(JSON.parse(chunk))) out.push(chunk);
-      // else: silently drop the flat registry chunk
-    } catch { out.push(chunk); }
-    pos = end + 1;
-  }
-  return out.join("");
-}
-
 function formatToolResultLine(messages: any[], toolId: string, content: any): string {
   const name = resolveToolName(messages, toolId);
   let formatted = formatToolResultContent(content);
@@ -821,25 +758,6 @@ function sseOpenAIToolCallDelta(
       }],
     })
   );
-}
-
-// Parse an inline `{"tool_use":{"name":"...","input":{...}}}` literal out of
-// already-tidied + canonicalized text. Returns null when content isn't a
-// tool_use literal — caller falls back to plain text emission.
-function extractInlineToolUse(content: string): { name: string; arguments: string } | null {
-  if (!content || !content.includes('"tool_use"')) return null;
-  const fenced = content.match(/```(?:json)?\s*([\s\S]+?)```/);
-  const body = (fenced ? fenced[1] : content).trim();
-  const start = body.indexOf("{");
-  if (start === -1) return null;
-  try {
-    const parsed = JSON.parse(body.slice(start));
-    const tu = parsed?.tool_use;
-    if (tu && typeof tu.name === "string" && tu.name) {
-      return { name: tu.name, arguments: JSON.stringify(tu.input ?? {}) };
-    }
-  } catch {}
-  return null;
 }
 
 // Narration rescue: GPT-class models inside the Copilot SDK frequently ignore
@@ -1265,8 +1183,8 @@ async function completionsHandler(c: Context) {
   const isSuspicious = (body.tools?.length ?? 0) === 0 && sysLen === 0 && (typeof lastUser?.content === "string") && lastUser.content.length < 30;
   if (isSuspicious) {
     try {
-      const dumpPath = `/tmp/copilot-loop/suspicious-${Date.now()}.json`;
-      writeFileSync(dumpPath, JSON.stringify(body, null, 2));
+      const dumpPath = `${COPILOT_LOOP_DIR}/suspicious-${Date.now()}.json`;
+      writeLoopFile(dumpPath, JSON.stringify(body, null, 2));
       logger.log(`🔍 dumped suspicious body to ${dumpPath}`);
     } catch (e: any) {
       logger.log(`🔍 dump failed: ${e?.message ?? e}`);
@@ -1312,8 +1230,8 @@ async function completionsHandler(c: Context) {
       // a tool prefix. The model responds in plain text so the caller isn't left
       // hanging on an empty completion. Dump kept for diagnostics only.
       try {
-        const dumpPath = `/tmp/copilot-loop/missing-tools-${Date.now()}.json`;
-        writeFileSync(dumpPath, JSON.stringify(body, null, 2));
+        const dumpPath = `${COPILOT_LOOP_DIR}/missing-tools-${Date.now()}.json`;
+        writeLoopFile(dumpPath, JSON.stringify(body, null, 2));
         logger.log(`🔍 no MCP tools for tool-reminder request — falling through (dumped to ${dumpPath})`);
       } catch (e: any) {
         logger.log(`🔍 missing-tools dump failed: ${e?.message ?? e}`);
