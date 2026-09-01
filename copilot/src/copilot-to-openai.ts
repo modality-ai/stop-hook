@@ -13,6 +13,7 @@ import {
   slimCounterResult,
   tidyToolUseJsonDetailed,
 } from "./tool-use-text";
+import { imageUrlToAttachment, type BlobAttachment } from "./image-attachment";
 import type { CopilotSession } from "@github/copilot-sdk";
 import type { Context, Hono } from "hono";
 
@@ -50,13 +51,6 @@ interface SessionEntry {
   // a reverse lookup, enabling self-healing resume on the next request.
   sessionKey: string;
 }
-
-type BlobAttachment = {
-  type: "blob";
-  data: string;
-  mimeType: string;
-  displayName?: string;
-};
 
 interface PromptInput {
   prompt: string;
@@ -507,15 +501,11 @@ function estimateInputTokens(body: any): number {
   return Math.round(chars / 4);
 }
 
-function parseDataImageUrl(url: string): BlobAttachment | null {
-  const match = url.match(/^data:([^;,]+);base64,(.+)$/s);
-  if (!match) return null;
-  const mimeType = match[1];
-  if (!mimeType.startsWith("image/")) return null;
-  return { type: "blob", mimeType, data: match[2] };
-}
+// The OpenAI Chat Completions `image_url` content part accepts an image in
+// three ways (per their vision docs): a fully-qualified HTTP(S) URL, a
+// Base64-encoded data URL, or a Files API file id. See ./image-attachment.
 
-function extractPromptInput(message: any): PromptInput {
+async function extractPromptInput(message: any): Promise<PromptInput> {
   const content = message?.content;
   if (typeof content === "string") return { prompt: content };
   if (!Array.isArray(content)) return { prompt: "" };
@@ -532,8 +522,8 @@ function extractPromptInput(message: any): PromptInput {
     if (block.type === "image_url") {
       const url = typeof block.image_url === "string" ? block.image_url : block.image_url?.url;
       if (typeof url !== "string") return { prompt: "", error: "Invalid image_url content" };
-      const attachment = parseDataImageUrl(url);
-      if (!attachment) return { prompt: "", error: "Only base64 data image_url content is supported" };
+      const attachment = await imageUrlToAttachment(url);
+      if (!attachment) return { prompt: "", error: "Unsupported image_url — expected a base64 data URL or an HTTP(S) image URL" };
       attachments.push(attachment);
       continue;
     }
@@ -673,7 +663,7 @@ function emptyCompletion(completionId: string, model: string, body: any) {
   };
 }
 
-function extractLastTurn(messages: any[]): PromptInput {
+async function extractLastTurn(messages: any[]): Promise<PromptInput> {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
 
@@ -687,7 +677,7 @@ function extractLastTurn(messages: any[]): PromptInput {
     const toolResultBlocks = blocks.filter((b: any) => b?.type === "tool_result");
     const otherBlocks = blocks.filter((b: any) => b?.type !== "tool_result");
 
-    if (!toolResultBlocks.length) return extractPromptInput(msg);
+    if (!toolResultBlocks.length) return await extractPromptInput(msg);
 
     const toolResultLines = toolResultBlocks.map((block: any) =>
       formatToolResultLine(messages, block.tool_use_id, block.content)
@@ -697,7 +687,7 @@ function extractLastTurn(messages: any[]): PromptInput {
       return { prompt: toolResultLines.join("\n") };
     }
 
-    const base = extractPromptInput({ ...msg, content: otherBlocks });
+    const base = await extractPromptInput({ ...msg, content: otherBlocks });
     const combined = [...toolResultLines, ...(base.prompt ? [base.prompt] : [])].join("\n");
     return { prompt: combined, attachments: base.attachments };
   }
@@ -1197,7 +1187,7 @@ async function completionsHandler(c: Context) {
   const headerSessionId = c.req.header("x-session-id");
   const sessionKey = resolveSessionKey(headerSessionId, messages);
   logger.log(`🔑 session: ${sessionKey}${headerSessionId ? " (from header)" : " (derived)"}`);
-  const { prompt, attachments, error } = extractLastTurn(messages);
+  const { prompt, attachments, error } = await extractLastTurn(messages);
 
   if (error) return c.json({ error: { message: error } }, 400);
   if (!prompt && !attachments?.length) return c.json({ error: { message: "No user message found" } }, 400);

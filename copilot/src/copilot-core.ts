@@ -622,6 +622,7 @@ const setupSessionEventListener = (session: CopilotSession, options: any) => {
           logger.store("log", `🔧 System message: ${event.data.content}`);
           break;
 
+        case "model.call_start":
         case "session.resume":
         case "session.handoff":
         case "session.snapshot_rewind":
@@ -631,9 +632,11 @@ const setupSessionEventListener = (session: CopilotSession, options: any) => {
         case "session.mcp_servers_loaded":
         case "session.mcp_server_status_changed":
         case "session.skills_loaded":
+        case "session.usage_checkpoint":
         case "permission.requested":
         case "permission.completed":
         case "assistant.message_start":
+        case "assistant.idle":
           break;
 
         default:
