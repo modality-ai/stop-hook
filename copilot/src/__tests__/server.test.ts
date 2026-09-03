@@ -866,5 +866,96 @@ describe("server.ts", () => {
       // TWO initSession calls — one for the failed turn, one for the recovery.
       expect(mockInitSession.mock.calls.length).toBe(2);
     });
+
+    // ─── Empty turn-final assistant.message must not erase deltas ────────────
+    describe("empty assistant.message frames", () => {
+      // Drives one turn: deltas carry the body, then a turn-final
+      // assistant.message arrives with an EMPTY content string — exactly what
+      // the Copilot SDK emits once the body was fully delivered as deltas.
+      const driveWithEmptyFinalMessage = (deltas: string[]) => {
+        let turnNum = 0;
+        mockOn.mockImplementation((handler: any) => {
+          turnNum++;
+          setTimeout(() => {
+            // Turn 1 on a fresh session is the /clear cleanup turn.
+            if (turnNum > 1) {
+              for (const d of deltas) {
+                handler({ type: "assistant.message_delta", data: { deltaContent: d } });
+              }
+              handler({ type: "assistant.message", data: { content: "" } });
+            }
+            handler({ type: "assistant.turn_end", data: {} });
+          }, 0);
+          return () => {};
+        });
+      };
+
+      test("non-stream: buffered tool_use survives an empty final message", async () => {
+        driveWithEmptyFinalMessage([
+          '{"tool_use":{"name":"Bash",',
+          '"input":{"command":"ls -la"}}}',
+        ]);
+
+        const res = await fetchApp(post("/v1/chat/completions",
+          {
+            model: "gpt-5-mini",
+            stream: false,
+            messages: [{ role: "user", content: "list files" }],
+            tools: [{ type: "function", function: { name: "Bash", parameters: {} } }],
+          },
+          { "x-session-id": "empty-final-tool" }
+        ));
+
+        expect(res.status).toBe(200);
+        const data = await res.json() as any;
+        expect(data.choices[0].finish_reason).toBe("tool_calls");
+        expect(data.choices[0].message.tool_calls[0].function.name).toBe("Bash");
+      });
+
+      test("non-stream: prose survives an empty final message", async () => {
+        driveWithEmptyFinalMessage(["Hello ", "there!"]);
+
+        const res = await fetchApp(post("/v1/chat/completions",
+          { model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "hi" }] },
+          { "x-session-id": "empty-final-text" }
+        ));
+
+        expect(res.status).toBe(200);
+        const data = await res.json() as any;
+        expect(data.choices[0].message.content).toBe("Hello there!");
+      });
+
+      test("stream: a genuinely empty turn reports itself instead of going silent", async () => {
+        // No deltas at all and no final content — the turn produced nothing.
+        driveWithEmptyFinalMessage([]);
+
+        const res = await fetchApp(post("/v1/chat/completions",
+          { model: "gpt-5-mini", stream: true, messages: [{ role: "user", content: "hi" }] },
+          { "x-session-id": "empty-turn-notice" }
+        ));
+
+        expect(res.status).toBe(200);
+        const body = await res.text();
+        expect(body).toContain("without producing any content");
+        expect(body).toContain("data: [DONE]");
+      });
+
+      test("non-stream: a genuinely empty turn reports itself instead of returning silent content", async () => {
+        // Same zero-content drive as the stream test — the non-stream path must
+        // mirror the notice in the message body, not return a silent content: "".
+        driveWithEmptyFinalMessage([]);
+
+        const res = await fetchApp(post("/v1/chat/completions",
+          { model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "hi" }] },
+          { "x-session-id": "empty-turn-notice-nonstream" }
+        ));
+
+        expect(res.status).toBe(200);
+        const data = await res.json() as any;
+        expect(data.choices[0].message.content).toBe(
+          "[copilot] The upstream session ended this turn without producing any content."
+        );
+      });
+    });
   });
 });

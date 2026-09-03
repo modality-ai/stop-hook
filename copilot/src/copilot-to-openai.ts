@@ -1,4 +1,5 @@
 import { tryMkdir } from "./loop-fs";
+import { createRunawayGuard, describeRunaway, detectRunaway } from "./runaway";
 import {
   client,
   initSession,
@@ -715,7 +716,11 @@ function sseOpenAIDelta(id: string, model: string, content: string): Uint8Array 
   );
 }
 
-function sseOpenAIFinish(id: string, model: string, reason: "stop" | "tool_calls" = "stop"): Uint8Array {
+function sseOpenAIFinish(
+  id: string,
+  model: string,
+  reason: "stop" | "tool_calls" | "length" = "stop"
+): Uint8Array {
   return sseChunk(
     JSON.stringify({
       id,
@@ -904,12 +909,24 @@ function runTurn(
 ): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     let fullContent = "";
+    const guard = createRunawayGuard();
     const unsub = entry.session.on((event: any) => {
       try {
         if (event.type === "assistant.message_delta") {
           fullContent += event.data.deltaContent ?? "";
+          // A degenerate model can repeat a fragment forever, so turn_end never
+          // arrives. Cut the turn short at the last sane character instead of
+          // letting the caller wait out an unbounded stream.
+          const verdict = guard.check(fullContent);
+          if (verdict) {
+            logger.log(`✂️ ${describeRunaway(verdict)}`);
+            unsub();
+            resolve(fullContent.slice(0, verdict.keepLength));
+          }
         } else if (event.type === "assistant.message") {
-          fullContent = event.data.content ?? fullContent;
+          // See sendAndStream: an empty turn-final assistant.message must never
+          // erase content already accumulated from deltas.
+          if (event.data.content?.trim()) fullContent = event.data.content;
         } else if (event.type === "assistant.turn_end") {
           unsub();
           resolve(fullContent);
@@ -942,6 +959,11 @@ function runTurn(
 // any delta or while the response is buffered in "tool" mode).
 const SSE_KEEPALIVE_MS = 15_000;
 const sseKeepalive = encoder.encode(": keepalive\n\n");
+
+// Wire-visible text for a genuinely empty turn — shared by the stream notice
+// (sendAndStream) and the non-stream message body (completionsHandler) so the
+// two paths can never drift apart.
+const EMPTY_TURN_TEXT = "[copilot] The upstream session ended this turn without producing any content.";
 
 function sendAndStream(
   entry: SessionEntry,
@@ -979,6 +1001,8 @@ function sendAndStream(
     // "tool": buffering — will emit tool_call at turn_end
     let mode: "pending" | "text" | "tool" = "pending";
     let emittedChars = 0;
+    let truncated = false;
+    const guard = createRunawayGuard();
 
     startKeepalive();
 
@@ -988,6 +1012,19 @@ function sendAndStream(
           if (event.type === "assistant.message_delta") {
             const delta = event.data.deltaContent ?? "";
             fullContent += delta;
+
+            // Runaway turns never reach assistant.turn_end, and the SSE
+            // keepalive would hold the socket open indefinitely. Trim to the
+            // last sane character and end the turn ourselves.
+            const verdict = guard.check(fullContent);
+            if (verdict) {
+              logger.log(`✂️ ${describeRunaway(verdict)}`);
+              fullContent = fullContent.slice(0, verdict.keepLength);
+              truncated = true;
+              unsub();
+              resolve();
+              return;
+            }
 
             if (mode === "pending") {
               const trimmed = fullContent.trimStart();
@@ -1008,7 +1045,15 @@ function sendAndStream(
             }
             // mode === "tool": buffer silently, emit at turn_end
           } else if (event.type === "assistant.message") {
-            fullContent = event.data.content ?? fullContent;
+            // Canonical replacement ONLY when the frame carries content. The SDK
+            // emits a turn-final assistant.message with an EMPTY string once the
+            // body was already delivered as deltas; `?? fullContent` let that
+            // empty string through and wiped the accumulation. Harmless in
+            // "text" mode (deltas were already on the wire) but fatal in "tool"
+            // mode, where the whole response is buffered — the turn then ends
+            // with no tool_call and no text, and the downstream proxy reports
+            // "the upstream model returned no content for this turn".
+            if (event.data.content?.trim()) fullContent = event.data.content;
           } else if (event.type === "assistant.turn_end") {
             unsub();
             resolve();
@@ -1047,8 +1092,18 @@ function sendAndStream(
     } else {
       // Emit any content not yet streamed (covers pending→resolved and short responses)
       const remainder = content.slice(emittedChars);
-      if (remainder) safeWrite(sseOpenAIDelta(completionId, model, remainder));
-      safeWrite(sseOpenAIFinish(completionId, model));
+      if (remainder) {
+        safeWrite(sseOpenAIDelta(completionId, model, remainder));
+      } else if (emittedChars === 0) {
+        // Nothing streamed and nothing left: the turn is genuinely empty.
+        // Say so on the wire instead of finishing silently — a blank
+        // completion is valid SSE, so the client can only render a dead turn.
+        logger.log("⚠️ upstream turn produced no content — emitting notice");
+        safeWrite(sseOpenAIDelta(completionId, model, EMPTY_TURN_TEXT));
+      }
+      // "length" tells the client the turn was cut short rather than completed,
+      // so a truncated runaway is never mistaken for a clean answer.
+      safeWrite(sseOpenAIFinish(completionId, model, truncated ? "length" : "stop"));
     }
     safeWrite(encoder.encode("data: [DONE]\n\n"));
   }
@@ -1075,7 +1130,13 @@ async function sendAndCollect(
   const turn = entry.queue.then(() => runTurn(entry, prompt, attachments));
   entry.queue = turn.then(() => undefined, () => undefined);
   const fullContent = await turn;
-  return canonicalizeToolUseText(tidyToolUseJson(fullContent), tools);
+  // Final net for the non-stream path: a turn-final assistant.message replaces
+  // the delta accumulation wholesale, so runaway content can arrive in one
+  // frame the streaming guard never sampled.
+  const verdict = detectRunaway(fullContent);
+  if (verdict) logger.log(`✂️ ${describeRunaway(verdict)}`);
+  const content = verdict ? fullContent.slice(0, verdict.keepLength) : fullContent;
+  return canonicalizeToolUseText(tidyToolUseJson(content), tools);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1248,13 +1309,18 @@ async function completionsHandler(c: Context) {
     if (tu && !extractInlineToolUse(content)) {
       logger.log(`🛟 Bash rescue (non-stream): ${tu.arguments.slice(0, 120)}`);
     }
+    // Mirror sendAndStream's empty-turn notice: a genuinely empty turn must say
+    // so instead of returning a silent content: "" that the proxy renders as
+    // "the upstream model returned no content for this turn". Quota probes
+    // never reach this branch — they return via emptyCompletion earlier.
+    const visibleContent = content.trim() ? content : EMPTY_TURN_TEXT;
     const message = tu
       ? {
           role: "assistant",
           content: null,
           tool_calls: [{ id: newToolCallId(), type: "function", function: { name: tu.name, arguments: tu.arguments } }],
         }
-      : { role: "assistant", content };
+      : { role: "assistant", content: visibleContent };
     return c.json({
       id: completionId,
       object: "chat.completion",

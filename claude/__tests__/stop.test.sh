@@ -117,6 +117,39 @@ rc=0; CLAUDE_PROJECT_DIR="$D" bash "$STOP" <<< "{}" > /dev/null 2>&1 || rc=$?
 check_eq "no state file → exit 0" "0" "$rc"
 rm -rf "$D"
 
+# 8. Hostile prompt (control char + quote + backslash) → still a valid JSON block
+#    and iteration incremented. Regression for the JSON hardening: the control-char
+#    strip must preserve the prompt text (reason contains "bad", not the fixed
+#    fallback), and the hook must never exit 0 silently.
+D=$(mktemp -d)
+mkdir -p "$D/.claude"
+printf -- '---\niteration: 1\nmax_iterations: 10\ncompletion_promise: "DONE"\n---\n---\nbad \x07 prompt "quoted" \\back\\\n' > "$D/.claude/agent-loop.local.md"
+T=$(make_transcript "$D" "no promise yet")
+out=$(run_stop "$D" "$T")
+valid=no
+printf '%s' "$out" | jq -e '.decision == "block"' >/dev/null 2>&1 && valid=yes
+check_eq       "hostile prompt → valid JSON block"        "yes"  "$valid"
+check_contains "hostile prompt → reason kept prompt text" "bad"  "$out"
+state=$(cat "$D/.claude/agent-loop.local.md" 2>/dev/null || echo "")
+check_contains "hostile prompt → iteration incremented"   "iteration: 2" "$state"
+rm -rf "$D"
+
+# 9. Log gating: DEBUG_HOOKS off → no stdin log written; DEBUG_HOOKS on → writes
+#    the fixed /tmp path. Regression for removing STOP_HOOK_INPUT_LOG.
+D=$(mktemp -d)
+new_state "$D" "DONE"
+/bin/rm -f /tmp/stop-hook-input.log
+CLAUDE_PROJECT_DIR="$D" bash "$STOP" <<< "{}" >/dev/null 2>&1
+[[ ! -f /tmp/stop-hook-input.log ]] \
+  && pass "log gating → no write by default" \
+  || fail "log gating → no write by default" "absent" "present"
+DEBUG_HOOKS=1 CLAUDE_PROJECT_DIR="$D" bash "$STOP" <<< "{}" >/dev/null 2>&1
+[[ -f /tmp/stop-hook-input.log ]] \
+  && pass "log gating → writes with DEBUG_HOOKS" \
+  || fail "log gating → writes with DEBUG_HOOKS" "present" "absent"
+/bin/rm -f /tmp/stop-hook-input.log
+rm -rf "$D"
+
 echo
 echo "=== Results: $PASS passed, $FAIL failed ==="
 [[ "$FAIL" -eq 0 ]]
