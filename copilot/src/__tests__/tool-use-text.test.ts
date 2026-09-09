@@ -8,6 +8,7 @@ import {
   isCounterMethodRegistry,
   slimCounterResult,
   tidyToolUseJsonDetailed,
+  xmlToolUseToJson,
 } from "../tool-use-text";
 
 // A flat all-methods registry: ≥10 keys, no non-registry marker keys, and at
@@ -196,5 +197,84 @@ describe("extractInlineToolUse", () => {
 
   it("returns null for empty input", () => {
     expect(extractInlineToolUse("")).toBeNull();
+  });
+});
+
+// ─── xmlToolUseToJson ────────────────────────────────────────────────────────
+// The `antml:` prefix is assembled at runtime so this file never contains the
+// literal tag text (it would be re-interpreted by tools that read the source).
+const NS = "antml:";
+
+describe("xmlToolUseToJson", () => {
+  it("converts a fully-formed function_calls block", () => {
+    const text = [
+      "<function_calls>",
+      '<invoke name="bash">',
+      '<parameter name="command">ls -la</parameter>',
+      "</invoke>",
+      "</function_calls>",
+    ].join("\n");
+    expect(JSON.parse(xmlToolUseToJson(text))).toEqual({
+      tool_use: { name: "bash", input: { command: "ls -la" } },
+    });
+  });
+
+  it("converts the namespaced variant", () => {
+    const text = `<${NS}invoke name="Read"><${NS}parameter name="file_path">/tmp/a.ts</${NS}parameter></${NS}invoke>`;
+    expect(JSON.parse(xmlToolUseToJson(text))).toEqual({
+      tool_use: { name: "Read", input: { file_path: "/tmp/a.ts" } },
+    });
+  });
+
+  it("drops prose surrounding the block", () => {
+    const text = 'TARGET: read the file\n\n<invoke name="Read">\n<parameter name="limit">100</parameter>\n</invoke>';
+    expect(JSON.parse(xmlToolUseToJson(text))).toEqual({
+      tool_use: { name: "Read", input: { limit: 100 } },
+    });
+  });
+
+  it("closes an unterminated parameter and invoke", () => {
+    const text = '<invoke name="bash">\n<parameter name="command">test -f x && echo EXISTS';
+    expect(JSON.parse(xmlToolUseToJson(text))).toEqual({
+      tool_use: { name: "bash", input: { command: "test -f x && echo EXISTS" } },
+    });
+  });
+
+  it("keeps shell text as a string and parses JSON-shaped values", () => {
+    const text = [
+      '<invoke name="Edit">',
+      '<parameter name="command">echo 1 | head -20</parameter>',
+      '<parameter name="replace_all">true</parameter>',
+      '<parameter name="edits">[{"old":"a"}]</parameter>',
+      "</invoke>",
+    ].join("\n");
+    expect(JSON.parse(xmlToolUseToJson(text)).tool_use.input).toEqual({
+      command: "echo 1 | head -20",
+      replace_all: true,
+      edits: [{ old: "a" }],
+    });
+  });
+
+  it("decodes XML entities in parameter bodies", () => {
+    const text = '<invoke name="Bash"><parameter name="command">echo &quot;a&amp;b&quot; &gt; f</parameter></invoke>';
+    expect(JSON.parse(xmlToolUseToJson(text)).tool_use.input.command).toBe('echo "a&b" > f');
+  });
+
+  it("converts only the first invoke block", () => {
+    const text = '<invoke name="A"><parameter name="x">1</parameter></invoke><invoke name="B"></invoke>';
+    expect(JSON.parse(xmlToolUseToJson(text))).toEqual({ tool_use: { name: "A", input: { x: 1 } } });
+  });
+
+  it("returns text without tool markup verbatim", () => {
+    expect(xmlToolUseToJson("the parameter is optional")).toBe("the parameter is optional");
+    expect(xmlToolUseToJson("<div>hello</div>")).toBe("<div>hello</div>");
+  });
+
+  it("returns text verbatim when the invoke tag carries no name", () => {
+    expect(xmlToolUseToJson("<invoke>")).toBe("<invoke>");
+  });
+
+  it("returns empty input verbatim", () => {
+    expect(xmlToolUseToJson("")).toBe("");
   });
 });

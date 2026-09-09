@@ -13,6 +13,8 @@ import {
   extractInlineToolUse,
   slimCounterResult,
   tidyToolUseJsonDetailed,
+  xmlToolUseToJson,
+  TOOL_MARKUP_START,
 } from "./tool-use-text";
 import { imageUrlToAttachment, type BlobAttachment } from "./image-attachment";
 import type { CopilotSession } from "@github/copilot-sdk";
@@ -281,8 +283,24 @@ function toolsForSession(sessionKey: string, tools?: any[]): any[] | undefined {
 function canonicalizeToolUseText(text: string, tools?: any[]): string {
   const aliases = buildToolAliasMap(tools);
   if (!aliases.size || !text.includes('"tool_use"')) return text;
+  const lowerAliases = new Map<string, string>();
+  for (const [alias, canonical] of aliases) {
+    const key = alias.toLowerCase();
+    if (!lowerAliases.has(key)) lowerAliases.set(key, canonical);
+  }
+  let isToolName = true;
   return text.replace(/"name"\s*:\s*"([^"]+)"/g, (match, rawName) => {
-    const canonicalName = aliases.get(rawName) ?? aliases.get(rawName.replace(/^_+/, ""));
+    const first = isToolName;
+    isToolName = false;
+    const stripped = rawName.replace(/^_+/, "");
+    // Case-insensitive matching is confined to the tool_use name itself (the
+    // first "name" field): models emitting native XML markup routinely
+    // lowercase it (`bash` → `Bash`). Applying it to nested input fields would
+    // rewrite ordinary argument values that happen to look like tool names.
+    const canonicalName =
+      aliases.get(rawName) ??
+      aliases.get(stripped) ??
+      (first ? lowerAliases.get(stripped.toLowerCase()) : undefined);
     return canonicalName ? `"name":"${canonicalName}"` : match;
   });
 }
@@ -1004,6 +1022,21 @@ function sendAndStream(
     let truncated = false;
     const guard = createRunawayGuard();
 
+    // Deltas split anywhere, so a native tool-call tag can arrive as `<inv` +
+    // `oke name=…`. Hold back a trailing unterminated `<…` until it closes so
+    // markup is never half-streamed as prose before it can be recognised.
+    const MAX_MARKUP_HOLDBACK = 80;
+    const flushBoundary = (text: string): number => {
+      const lt = text.lastIndexOf("<");
+      if (lt === -1 || text.indexOf(">", lt) !== -1 || text.length - lt > MAX_MARKUP_HOLDBACK) return text.length;
+      return lt;
+    };
+    const flushText = (text: string, end: number) => {
+      if (end <= emittedChars) return;
+      safeWrite(sseOpenAIDelta(completionId, model, text.slice(emittedChars, end)));
+      emittedChars = end;
+    };
+
     startKeepalive();
 
     await new Promise<void>((resolve, reject) => {
@@ -1026,6 +1059,17 @@ function sendAndStream(
               return;
             }
 
+            // Native XML tool-call markup (`<invoke name=…>`): flush any prose
+            // that preceded it, then buffer the rest for conversion at
+            // turn_end. Without this the markup streams out as visible text and
+            // the turn executes nothing.
+            const markupIdx = fullContent.search(TOOL_MARKUP_START);
+            if (markupIdx !== -1) {
+              if (mode === "text") flushText(fullContent, markupIdx);
+              mode = "tool";
+              return;
+            }
+
             if (mode === "pending") {
               const trimmed = fullContent.trimStart();
               if (trimmed.includes('"tool_use"')) {
@@ -1035,13 +1079,11 @@ function sendAndStream(
                 // model is narrating tool intent ("I will run X"), the rescue
                 // path at turn_end still emits a tool_call alongside the text.
                 mode = "text";
-                safeWrite(sseOpenAIDelta(completionId, model, fullContent));
-                emittedChars = fullContent.length;
+                flushText(fullContent, flushBoundary(fullContent));
               }
               // starts with { or ` but no "tool_use" yet — stay pending
             } else if (mode === "text") {
-              safeWrite(sseOpenAIDelta(completionId, model, delta));
-              emittedChars += delta.length;
+              flushText(fullContent, flushBoundary(fullContent));
             }
             // mode === "tool": buffer silently, emit at turn_end
           } else if (event.type === "assistant.message") {
@@ -1075,9 +1117,10 @@ function sendAndStream(
         .catch((err) => { unsub(); reject(err); });
     });
 
-    // For text/pending modes, transforms are no-ops (no "tool_use" in content).
-    // For tool mode, canonicalize + tidy before extracting the call.
-    const content = canonicalizeToolUseText(tidyToolUseJson(fullContent), tools);
+    // For text/pending modes, transforms are no-ops (no tool markup in content).
+    // For tool mode, normalize XML markup + canonicalize + tidy before
+    // extracting the call.
+    const content = canonicalizeToolUseText(tidyToolUseJson(xmlToolUseToJson(fullContent)), tools);
     const tu = extractInlineToolUse(content) ?? bashRescueToolCall(content, tools);
 
     if (tu) {
@@ -1136,7 +1179,7 @@ async function sendAndCollect(
   const verdict = detectRunaway(fullContent);
   if (verdict) logger.log(`✂️ ${describeRunaway(verdict)}`);
   const content = verdict ? fullContent.slice(0, verdict.keepLength) : fullContent;
-  return canonicalizeToolUseText(tidyToolUseJson(content), tools);
+  return canonicalizeToolUseText(tidyToolUseJson(xmlToolUseToJson(content)), tools);
 }
 
 // ─────────────────────────────────────────────────────────────

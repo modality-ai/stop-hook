@@ -410,6 +410,37 @@ describe("server.ts", () => {
       expect(data.choices[0].finish_reason).toBe("tool_calls");
     });
 
+    test("case-insensitive canonicalization applies only to the tool name, not nested input fields", async () => {
+      mockInitSession.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          // The model lowercases the tool_use name ("bash") AND an argument
+          // value that happens to look like a tool name ("read"). Only the
+          // outer name may be canonicalized — rewriting the nested value would
+          // mangle a legitimate argument.
+          handler({ type: "assistant.message", data: { content: '{"tool_use":{"name":"bash","input":{"name":"read","command":"ls"}}}' } });
+          handler({ type: "assistant.turn_end", data: {} });
+        }, 0);
+        return () => {};
+      });
+
+      const res = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "run it" }],
+        tools: [
+          { name: "Bash", description: "Run shell command", input_schema: { type: "object" } },
+          { name: "Read", description: "Read a file", input_schema: { type: "object" } },
+        ],
+      }, { "x-session-id": "nested-name-guard-test" }));
+
+      const data = await res.json() as any;
+      // Outer tool name: lowercase "bash" → canonical "Bash".
+      expect(data.choices[0].message.tool_calls[0].function.name).toBe("Bash");
+      // Nested "name":"read" is an argument value — must NOT be rewritten to "Read".
+      expect(data.choices[0].message.tool_calls[0].function.arguments).toBe('{"name":"read","command":"ls"}');
+      expect(data.choices[0].finish_reason).toBe("tool_calls");
+    });
+
     test("canonicalizes shortened MCP tool names split across streamed deltas", async () => {
       mockInitSession.mockClear();
       mockOn.mockImplementation((handler: any) => {
@@ -433,6 +464,65 @@ describe("server.ts", () => {
       expect(text).toContain('"function":{"name":"mcp__Counter___Counter__Deploy","arguments":"{\\"callSign\\":\\"SARAH\\"}"}');
       expect(text).toContain('"finish_reason":"tool_calls"');
       expect(text).not.toContain('"name":"_Counter__Deploy"');
+    });
+
+    test("converts native XML tool markup streamed after prose into a tool_call", async () => {
+      mockInitSession.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          handler({ type: "assistant.message_delta", data: { deltaContent: "TARGET: Access the file\n\n<inv" } });
+          handler({ type: "assistant.message_delta", data: { deltaContent: 'oke name="bash">\n<parameter name="command">ls -la</parameter' } });
+          handler({ type: "assistant.message_delta", data: { deltaContent: "></invoke>" } });
+          handler({ type: "assistant.turn_end", data: {} });
+        }, 0);
+        return () => {};
+      });
+
+      const res = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: true,
+        messages: [{ role: "user", content: "list the dir" }],
+        tools: [{ name: "Bash", description: "Run shell command", input_schema: { type: "object" } }],
+      }, { "x-session-id": "xml-markup-stream-test" }));
+
+      const text = await res.text();
+      expect(text).toContain('"function":{"name":"Bash","arguments":"{\\"command\\":\\"ls -la\\"}"}');
+      expect(text).toContain('"finish_reason":"tool_calls"');
+      // Prose before the markup still streams; the markup itself never does.
+      expect(text).toContain("TARGET: Access the file");
+      expect(text).not.toContain("invoke");
+      expect(text).not.toContain("parameter");
+    });
+
+    test("converts native XML tool markup in a collected (non-stream) turn", async () => {
+      mockInitSession.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          handler({
+            type: "assistant.message",
+            data: {
+              content:
+                'Reading the file.\n\n<function_calls>\n<invoke name="Read">\n<parameter name="file_path">/tmp/a.ts</parameter>\n<parameter name="limit">100</parameter>\n</invoke>\n</function_calls>',
+            },
+          });
+          handler({ type: "assistant.turn_end", data: {} });
+        }, 0);
+        return () => {};
+      });
+
+      const res = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "read the file" }],
+        tools: [{ name: "Read", description: "Read a file", input_schema: { type: "object" } }],
+      }, { "x-session-id": "xml-markup-collect-test" }));
+
+      const data = await res.json() as any;
+      expect(data.choices[0].message.content).toBeNull();
+      expect(data.choices[0].message.tool_calls[0].function.name).toBe("Read");
+      expect(JSON.parse(data.choices[0].message.tool_calls[0].function.arguments)).toEqual({
+        file_path: "/tmp/a.ts",
+        limit: 100,
+      });
+      expect(data.choices[0].finish_reason).toBe("tool_calls");
     });
 
     test("reuses remembered tools to canonicalize later turns without tools[]", async () => {

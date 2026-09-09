@@ -122,6 +122,76 @@ export const tidyToolUseJsonDetailed = (text: string): TidyResult => {
   return { text, outcome: "unrepairable" };
 };
 
+// ─── XML-style tool call markup ──────────────────────────────────────────────
+//
+// Frontier models fronted by the Copilot SDK (Claude, GPT) fall back to their
+// native chat-template markup instead of the `{"tool_use": …}` literal the
+// system prefix asks for:
+//
+//   <function_calls>
+//   <invoke name="bash">
+//   <parameter name="command">ls -la</parameter>
+//   </invoke>
+//   </function_calls>
+//
+// Unconverted, that text reaches the client as prose — the visible symptom is
+// a turn that prints markup and executes nothing. Rewriting it into the
+// canonical literal lets the existing tidy → canonicalize → extract pipeline
+// handle it unchanged.
+
+/** Opening tag of a native tool-call block, with or without the `antml:` prefix. */
+export const TOOL_MARKUP_START = /<(?:antml:)?(?:function_calls|invoke)\b/;
+
+const INVOKE_BLOCK = /<(?:antml:)?invoke\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)(?=<\/(?:antml:)?invoke>|<(?:antml:)?invoke\s|<\/(?:antml:)?function_calls>|$)/i;
+const PARAM_BLOCK = /<(?:antml:)?parameter\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)(?=<\/(?:antml:)?parameter>|<(?:antml:)?parameter\s|<\/(?:antml:)?invoke>|<\/(?:antml:)?function_calls>|$)/gi;
+
+const decodeEntities = (s: string): string =>
+  s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&amp;/g, "&");
+
+/**
+ * Coerce a parameter's text body to a JSON value.
+ *
+ * Only unambiguous JSON shapes are parsed — anything else stays a string, so a
+ * shell command like `test -f x && echo 1` is never mangled into a number or
+ * rejected outright.
+ */
+const coerceParamValue = (raw: string): any => {
+  const trimmed = raw.trim();
+  if (/^(?:true|false|null)$/.test(trimmed) || /^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+    return JSON.parse(trimmed);
+  }
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try { return JSON.parse(trimmed); } catch { return raw; }
+  }
+  return raw;
+};
+
+/**
+ * Rewrite the FIRST XML-style invoke block in `text` as a `{"tool_use": …}`
+ * literal. Text without such a block is returned verbatim.
+ *
+ * Only the first block is converted because the downstream OpenAI response
+ * carries a single tool_call per turn; prose surrounding the block is dropped
+ * along with it, matching how a tool_use literal replaces the turn's content.
+ */
+export const xmlToolUseToJson = (text: string): string => {
+  if (!text || !TOOL_MARKUP_START.test(text)) return text;
+  const block = text.match(INVOKE_BLOCK);
+  if (!block) return text;
+
+  const name = block[1].trim();
+  if (!name) return text;
+
+  const input: Record<string, any> = {};
+  PARAM_BLOCK.lastIndex = 0;
+  let param: RegExpExecArray | null;
+  while ((param = PARAM_BLOCK.exec(block[2])) !== null) {
+    input[param[1].trim()] = coerceParamValue(decodeEntities(param[2]));
+  }
+
+  return JSON.stringify({ tool_use: { name, input } });
+};
+
 // ─── tool_use literal extraction ─────────────────────────────────────────────
 
 /**
