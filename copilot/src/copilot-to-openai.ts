@@ -53,6 +53,10 @@ interface SessionEntry {
   // entry so per-turn error handlers can invalidate the right map entry without
   // a reverse lookup, enabling self-healing resume on the next request.
   sessionKey: string;
+  // Consecutive turns that produced no content. A single blank turn can be a
+  // harmless blip, so the entry is only discarded once the session proves it is
+  // stuck (see EMPTY_TURNS_BEFORE_INVALIDATE). Reset by any turn with content.
+  consecutiveEmptyTurns: number;
 }
 
 interface PromptInput {
@@ -433,6 +437,7 @@ async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: strin
           toolFingerprint: fp,
           model: requestedModel,
           sessionKey,
+          consecutiveEmptyTurns: 0,
         };
         sessions.set(sessionKey, entry);
         logger.log(
@@ -953,8 +958,7 @@ function runTurn(
           // sessionKey re-probes via getSessionMetadata → resumeSession (or fresh
           // create if the on-disk state is also gone). Prevents one bad turn
           // from poisoning the rest of the conversation.
-          if (sessions.get(entry.sessionKey) === entry) sessions.delete(entry.sessionKey);
-          logger.log(`🩹 Invalidated entry for ${entry.sessionKey} on session.error — next turn will auto-resume`);
+          invalidateSession(entry, "session.error");
           unsub();
           reject(new Error(event.data.message));
         }
@@ -978,10 +982,40 @@ function runTurn(
 const SSE_KEEPALIVE_MS = 15_000;
 const sseKeepalive = encoder.encode(": keepalive\n\n");
 
-// Wire-visible text for a genuinely empty turn — shared by the stream notice
-// (sendAndStream) and the non-stream message body (completionsHandler) so the
-// two paths can never drift apart.
-const EMPTY_TURN_TEXT = "[copilot] The upstream session ended this turn without producing any content.";
+// Drop the in-memory entry so the next request for this sessionKey re-probes via
+// getSessionMetadata → resumeSession (or creates fresh if the on-disk state is
+// also gone). Shared by the session.error handlers and the empty-turn paths:
+// an empty turn is NOT a session.error — turn_end fires normally — so without
+// this the poisoned entry stays cached and every following turn returns empty.
+function invalidateSession(entry: SessionEntry, reason: string): void {
+  if (sessions.get(entry.sessionKey) === entry) sessions.delete(entry.sessionKey);
+  logger.log(`🩹 Invalidated entry for ${entry.sessionKey} on ${reason} — next turn will auto-resume`);
+}
+
+// How many consecutive empty turns a session may produce before it is treated as
+// stuck and discarded. One blank turn is often a transient blip and the downstream
+// proxy retries it on the same session; a second one means the session itself is
+// poisoned and only a fresh resume can recover it.
+const EMPTY_TURNS_BEFORE_INVALIDATE = 2;
+
+// Record the outcome of a finished turn. An empty turn advances the strike count
+// and, once the session proves it is stuck, drops the entry so the next request
+// re-probes via getSessionMetadata → resumeSession. Any turn carrying content
+// clears the count — strikes must be CONSECUTIVE to mean anything.
+function recordTurnOutcome(entry: SessionEntry, empty: boolean, where: string): void {
+  if (!empty) {
+    entry.consecutiveEmptyTurns = 0;
+    return;
+  }
+  entry.consecutiveEmptyTurns++;
+  logger.log(
+    `⚠️ upstream turn produced no content (${where}) — ` +
+      `${entry.consecutiveEmptyTurns}/${EMPTY_TURNS_BEFORE_INVALIDATE} consecutive`
+  );
+  if (entry.consecutiveEmptyTurns >= EMPTY_TURNS_BEFORE_INVALIDATE) {
+    invalidateSession(entry, "consecutive empty turns");
+  }
+}
 
 function sendAndStream(
   entry: SessionEntry,
@@ -1102,8 +1136,7 @@ function sendAndStream(
           } else if (event.type === "session.error") {
             // Self-healing: drop the in-memory entry so the next request for this
             // sessionKey re-probes via getSessionMetadata → resumeSession.
-            if (sessions.get(entry.sessionKey) === entry) sessions.delete(entry.sessionKey);
-            logger.log(`🩹 Invalidated entry for ${entry.sessionKey} on session.error — next turn will auto-resume`);
+            invalidateSession(entry, "session.error");
             unsub();
             reject(new Error(event.data.message));
           }
@@ -1130,19 +1163,20 @@ function sendAndStream(
         // reason below switches to tool_calls.
         logger.log(`🛟 Bash rescue: ${tu.arguments.slice(0, 120)}`);
       }
+      recordTurnOutcome(entry, false, "stream");
       safeWrite(sseOpenAIToolCallDelta(completionId, model, newToolCallId(), tu.name, tu.arguments));
       safeWrite(sseOpenAIFinish(completionId, model, "tool_calls"));
     } else {
       // Emit any content not yet streamed (covers pending→resolved and short responses)
       const remainder = content.slice(emittedChars);
+      // Nothing streamed and nothing left: the turn is genuinely empty. Report it
+      // to the LOG, never onto the wire — substituting notice text into content
+      // made the completion look non-empty downstream, so the proxy's
+      // emptyUpstreamResponse check never tripped and its retry ladder never ran.
+      // Emitting nothing keeps the turn diagnosably empty.
+      recordTurnOutcome(entry, !content.trim(), "stream");
       if (remainder) {
         safeWrite(sseOpenAIDelta(completionId, model, remainder));
-      } else if (emittedChars === 0) {
-        // Nothing streamed and nothing left: the turn is genuinely empty.
-        // Say so on the wire instead of finishing silently — a blank
-        // completion is valid SSE, so the client can only render a dead turn.
-        logger.log("⚠️ upstream turn produced no content — emitting notice");
-        safeWrite(sseOpenAIDelta(completionId, model, EMPTY_TURN_TEXT));
       }
       // "length" tells the client the turn was cut short rather than completed,
       // so a truncated runaway is never mistaken for a clean answer.
@@ -1352,18 +1386,19 @@ async function completionsHandler(c: Context) {
     if (tu && !extractInlineToolUse(content)) {
       logger.log(`🛟 Bash rescue (non-stream): ${tu.arguments.slice(0, 120)}`);
     }
-    // Mirror sendAndStream's empty-turn notice: a genuinely empty turn must say
-    // so instead of returning a silent content: "" that the proxy renders as
-    // "the upstream model returned no content for this turn". Quota probes
-    // never reach this branch — they return via emptyCompletion earlier.
-    const visibleContent = content.trim() ? content : EMPTY_TURN_TEXT;
+    // Mirror sendAndStream's empty-turn path: count the strike (dropping the
+    // poisoned entry once the session proves it is stuck) and return content: ""
+    // so the downstream proxy's emptyUpstreamResponse check trips and its retry
+    // ladder runs. Quota probes never reach this branch — they return via
+    // emptyCompletion earlier.
+    recordTurnOutcome(entry, !tu && !content.trim(), "non-stream");
     const message = tu
       ? {
           role: "assistant",
           content: null,
           tool_calls: [{ id: newToolCallId(), type: "function", function: { name: tu.name, arguments: tu.arguments } }],
         }
-      : { role: "assistant", content: visibleContent };
+      : { role: "assistant", content };
     return c.json({
       id: completionId,
       object: "chat.completion",

@@ -821,8 +821,14 @@ describe("server.ts", () => {
       mockSetModel.mockImplementation(async () => {
         throw new Error("setModel exploded");
       });
+      // Each turn must carry content: three CONSECUTIVE empty turns would trip the
+      // empty-turn recovery and replace the entry, which is a different code path
+      // from the model-switch bookkeeping under test here.
       mockOn.mockImplementation((handler: any) => {
-        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        setTimeout(() => {
+          handler({ type: "assistant.message_delta", data: { deltaContent: "ok" } });
+          handler({ type: "assistant.turn_end", data: {} });
+        }, 0);
         return () => {};
       });
 
@@ -980,6 +986,23 @@ describe("server.ts", () => {
         });
       };
 
+      // Drives a conversation with per-turn bodies: turn N emits the deltas from
+      // bodies[N] then turn_end. Index 0 is the /clear cleanup turn on a fresh
+      // session, so bodies[1] feeds the first user request.
+      const driveWithBodies = (bodies: string[][]) => {
+        let turnNum = 0;
+        mockOn.mockImplementation((handler: any) => {
+          const deltas = bodies[turnNum++] ?? [];
+          setTimeout(() => {
+            for (const d of deltas) {
+              handler({ type: "assistant.message_delta", data: { deltaContent: d } });
+            }
+            handler({ type: "assistant.turn_end", data: {} });
+          }, 0);
+          return () => {};
+        });
+      };
+
       test("non-stream: buffered tool_use survives an empty final message", async () => {
         driveWithEmptyFinalMessage([
           '{"tool_use":{"name":"Bash",',
@@ -1015,8 +1038,10 @@ describe("server.ts", () => {
         expect(data.choices[0].message.content).toBe("Hello there!");
       });
 
-      test("stream: a genuinely empty turn reports itself instead of going silent", async () => {
+      test("stream: a genuinely empty turn stays empty on the wire", async () => {
         // No deltas at all and no final content — the turn produced nothing.
+        // Notice text must NOT be substituted in: a non-empty completion would
+        // hide the fault from the downstream proxy's empty-turn retry ladder.
         driveWithEmptyFinalMessage([]);
 
         const res = await fetchApp(post("/v1/chat/completions",
@@ -1026,13 +1051,13 @@ describe("server.ts", () => {
 
         expect(res.status).toBe(200);
         const body = await res.text();
-        expect(body).toContain("without producing any content");
+        expect(body).not.toContain("without producing any content");
         expect(body).toContain("data: [DONE]");
       });
 
-      test("non-stream: a genuinely empty turn reports itself instead of returning silent content", async () => {
+      test("non-stream: a genuinely empty turn returns empty content", async () => {
         // Same zero-content drive as the stream test — the non-stream path must
-        // mirror the notice in the message body, not return a silent content: "".
+        // mirror it: content "" is what trips emptyUpstreamResponse downstream.
         driveWithEmptyFinalMessage([]);
 
         const res = await fetchApp(post("/v1/chat/completions",
@@ -1042,9 +1067,159 @@ describe("server.ts", () => {
 
         expect(res.status).toBe(200);
         const data = await res.json() as any;
-        expect(data.choices[0].message.content).toBe(
-          "[copilot] The upstream session ended this turn without producing any content."
-        );
+        expect(data.choices[0].message.content).toBe("");
+      });
+
+      test("consecutive empty turns invalidate the session so it is re-created", async () => {
+        // The poisoned-session recovery path: an empty turn is NOT a
+        // session.error, so without explicit invalidation the same broken entry
+        // stays cached and every following turn returns empty too. One blank turn
+        // is tolerated as a blip; the second proves the session is stuck.
+        driveWithEmptyFinalMessage([]);
+        const before = mockInitSession.mock.calls.length;
+
+        const send = () => fetchApp(post("/v1/chat/completions",
+          { model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "hi" }] },
+          { "x-session-id": "poisoned-session" }
+        ));
+
+        // Turn 1: creates the session, first strike — entry still cached.
+        expect((await send()).status).toBe(200);
+        expect(mockInitSession.mock.calls.length).toBe(before + 1);
+
+        // Turn 2: reuses that entry, second strike — entry now discarded.
+        expect((await send()).status).toBe(200);
+        expect(mockInitSession.mock.calls.length).toBe(before + 1);
+
+        // Turn 3: cache was cleared, so a fresh session is initialised.
+        expect((await send()).status).toBe(200);
+        expect(mockInitSession.mock.calls.length).toBe(before + 2);
+      });
+
+      test("a turn with content resets the empty-turn strike count", async () => {
+        // Strikes must be CONSECUTIVE: an empty turn followed by a good one must
+        // not leave the session one blip away from being thrown out.
+        const before = mockInitSession.mock.calls.length;
+        const send = () => fetchApp(post("/v1/chat/completions",
+          { model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "hi" }] },
+          { "x-session-id": "alternating-session" }
+        ));
+
+        // Per-turn bodies, unlike the shared fixture's replay-every-turn shape.
+        driveWithBodies([[], [], ["hello"], []]);
+
+        expect((await send()).status).toBe(200);      // strike 1
+        expect((await send()).status).toBe(200);      // content → reset
+        expect((await send()).status).toBe(200);      // strike 1 again, not 2
+
+        // One initSession only — the entry survived all three turns.
+        expect(mockInitSession.mock.calls.length).toBe(before + 1);
+      });
+
+      test("stream: a turn with content resets the empty-turn strike count", async () => {
+        // The stream path counts strikes at its OWN call site in sendAndStream,
+        // so the reset proven non-stream above must hold here too: empty →
+        // content → empty must leave one strike, not two (which would discard a
+        // healthy session).
+        const before = mockInitSession.mock.calls.length;
+        const send = () => fetchApp(post("/v1/chat/completions",
+          { model: "gpt-5-mini", stream: true, messages: [{ role: "user", content: "hi" }] },
+          { "x-session-id": "stream-alternating" }
+        ));
+
+        driveWithBodies([[], [], ["hello"], []]);
+
+        expect((await send()).status).toBe(200);          // strike 1
+        const contentTurn = await (await send()).text();  // content → reset
+        expect(contentTurn).toContain("hello");
+        expect((await send()).status).toBe(200);          // strike 1 again, not 2
+
+        // One initSession only — the entry survived all three turns.
+        expect(mockInitSession.mock.calls.length).toBe(before + 1);
+      });
+
+      test("non-stream: a tool-call turn resets the empty-turn strike count", async () => {
+        // A tool call carries no prose — content is "" — so the guard must be
+        // `!tu && !content.trim()`, not just `!content.trim()`: an active
+        // tool-using session must never be counted as empty and discarded.
+        const before = mockInitSession.mock.calls.length;
+        const send = () => fetchApp(post("/v1/chat/completions",
+          {
+            model: "gpt-5-mini",
+            stream: false,
+            messages: [{ role: "user", content: "list files" }],
+            tools: [{ type: "function", function: { name: "Bash", parameters: {} } }],
+          },
+          { "x-session-id": "tool-reset-session" }
+        ));
+
+        driveWithBodies([
+          [],
+          [],
+          ['{"tool_use":{"name":"Bash",', '"input":{"command":"ls -la"}}}'],
+          [],
+        ]);
+
+        expect((await send()).status).toBe(200);   // strike 1
+        const toolTurn = await (await send()).json() as any; // tool call → reset
+        expect(toolTurn.choices[0].finish_reason).toBe("tool_calls");
+        expect((await send()).status).toBe(200);   // strike 1 again, not 2
+
+        // One initSession only — the entry survived all three turns.
+        expect(mockInitSession.mock.calls.length).toBe(before + 1);
+      });
+
+      test("stream: a tool-call turn resets the empty-turn strike count", async () => {
+        // The stream path resets strikes in its dedicated tool-call branch —
+        // same guard spirit as non-stream, same aftermath required.
+        const before = mockInitSession.mock.calls.length;
+        const send = () => fetchApp(post("/v1/chat/completions",
+          {
+            model: "gpt-5-mini",
+            stream: true,
+            messages: [{ role: "user", content: "list files" }],
+            tools: [{ type: "function", function: { name: "Bash", parameters: {} } }],
+          },
+          { "x-session-id": "stream-tool-reset-session" }
+        ));
+
+        driveWithBodies([
+          [],
+          [],
+          ['{"tool_use":{"name":"Bash",', '"input":{"command":"ls -la"}}}'],
+          [],
+        ]);
+
+        expect((await send()).status).toBe(200);          // strike 1
+        const toolTurn = await (await send()).text();     // tool call → reset
+        expect(toolTurn).toContain('"finish_reason":"tool_calls"');
+        expect((await send()).status).toBe(200);          // strike 1 again, not 2
+
+        // One initSession only — the entry survived all three turns.
+        expect(mockInitSession.mock.calls.length).toBe(before + 1);
+      });
+
+      test("non-stream: whitespace-only content strikes as empty but stays on the wire", async () => {
+        // The guard trims before deciding: "   " is an empty turn for strike
+        // purposes, yet the raw content is still returned — no notice text is
+        // substituted in, so downstream's own empty-check can still trip.
+        const before = mockInitSession.mock.calls.length;
+        const send = () => fetchApp(post("/v1/chat/completions",
+          { model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "hi" }] },
+          { "x-session-id": "whitespace-session" }
+        ));
+
+        driveWithBodies([[], ["   "], ["   "], []]);
+
+        const first = await (await send()).json() as any;
+        // Counted as a strike, but the raw content reaches the wire untouched.
+        expect(first.choices[0].message.content).toBe("   ");
+
+        // Two whitespace-only turns are two consecutive strikes: second
+        // invalidates, and the third request re-initialises fresh.
+        expect((await send()).status).toBe(200);
+        expect((await send()).status).toBe(200);
+        expect(mockInitSession.mock.calls.length).toBe(before + 2);
       });
     });
   });
