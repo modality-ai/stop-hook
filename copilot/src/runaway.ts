@@ -21,6 +21,22 @@ const MAX_UNIT_CHARS = 200;
 const MIN_REPEATS = 8;
 
 /**
+ * Minimum total span (unit length × repetitions) for a repetition verdict.
+ *
+ * Without this floor a 1-char unit repeated 8 times trips the guard, and that
+ * is ORDINARY prose/code output — eight spaces of indentation in a TypeScript
+ * or Python block, eight trailing newlines, `--------` in a markdown table,
+ * `========` under a heading, eight closing braces. Each of those ended the
+ * turn early with finish_reason "length" while the Copilot server kept
+ * generating, which is exactly the "stops streaming early" symptom.
+ *
+ * A genuine degenerate loop runs for hundreds of characters, so the floor
+ * still trips well inside a bounded prefix. Mirrors RUN_AWAY_GUARD_MIN_RUN_CHARS
+ * in the mcp-qdrant proxy's runaway.ts, whose value this tracks.
+ */
+const MIN_RUN_CHARS = 32;
+
+/**
  * Hard ceiling on a single turn's content, for runaway output that never
  * settles into a clean repeating unit (drifting counters, shuffled fragments).
  */
@@ -79,7 +95,13 @@ export const detectRunaway = (text: string): RunawayVerdict | null => {
     const unit = text.slice(text.length - unitLen);
     if (!tailRepeats(text, unit)) continue;
     const { start, repeats } = runStart(text, unit);
-    return { reason: "repetition", keepLength: start, unit, repeats };
+    // A short run (eight closing braces, an indent, a table rule) is a
+    // plausible legitimate ending — only spans long enough to be a real loop
+    // trip the guard. Keep scanning longer units: a short 1-char run can sit
+    // inside a genuinely long multi-char loop.
+    if (unit.length * repeats >= MIN_RUN_CHARS) {
+      return { reason: "repetition", keepLength: start, unit, repeats };
+    }
   }
 
   if (text.length >= MAX_TURN_CHARS) {

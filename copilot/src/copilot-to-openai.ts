@@ -53,10 +53,11 @@ interface SessionEntry {
   // entry so per-turn error handlers can invalidate the right map entry without
   // a reverse lookup, enabling self-healing resume on the next request.
   sessionKey: string;
-  // Consecutive turns that produced no content. A single blank turn can be a
-  // harmless blip, so the entry is only discarded once the session proves it is
-  // stuck (see EMPTY_TURNS_BEFORE_INVALIDATE). Reset by any turn with content.
-  consecutiveEmptyTurns: number;
+  // Consecutive abnormal turns (empty or truncated). A single abnormal turn can
+  // be a harmless blip, so the entry is only discarded once the session proves
+  // it is stuck (see ABNORMAL_TURNS_BEFORE_INVALIDATE). Reset by any healthy
+  // turn — a truncated turn carries text, so only "no content" is insufficient.
+  consecutiveAbnormalTurns: number;
 }
 
 interface PromptInput {
@@ -437,7 +438,7 @@ async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: strin
           toolFingerprint: fp,
           model: requestedModel,
           sessionKey,
-          consecutiveEmptyTurns: 0,
+          consecutiveAbnormalTurns: 0,
         };
         sessions.set(sessionKey, entry);
         logger.log(
@@ -984,36 +985,55 @@ const sseKeepalive = encoder.encode(": keepalive\n\n");
 
 // Drop the in-memory entry so the next request for this sessionKey re-probes via
 // getSessionMetadata → resumeSession (or creates fresh if the on-disk state is
-// also gone). Shared by the session.error handlers and the empty-turn paths:
-// an empty turn is NOT a session.error — turn_end fires normally — so without
-// this the poisoned entry stays cached and every following turn returns empty.
+// also gone). Shared by the session.error handlers and the abnormal-turn paths:
+// an abnormal turn is NOT a session.error — turn_end fires normally — so
+// without this the poisoned entry stays cached and every following turn
+// degrades.
 function invalidateSession(entry: SessionEntry, reason: string): void {
   if (sessions.get(entry.sessionKey) === entry) sessions.delete(entry.sessionKey);
   logger.log(`🩹 Invalidated entry for ${entry.sessionKey} on ${reason} — next turn will auto-resume`);
 }
 
-// How many consecutive empty turns a session may produce before it is treated as
-// stuck and discarded. One blank turn is often a transient blip and the downstream
-// proxy retries it on the same session; a second one means the session itself is
-// poisoned and only a fresh resume can recover it.
-const EMPTY_TURNS_BEFORE_INVALIDATE = 2;
+// How many consecutive abnormal turns a session may produce before it is
+// treated as stuck and discarded. One abnormal turn is often a transient blip
+// and the downstream proxy retries it on the same session; a second one means
+// the session itself is poisoned and only a fresh resume can recover it.
+const ABNORMAL_TURNS_BEFORE_INVALIDATE = 2;
 
-// Record the outcome of a finished turn. An empty turn advances the strike count
-// and, once the session proves it is stuck, drops the entry so the next request
-// re-probes via getSessionMetadata → resumeSession. Any turn carrying content
+// Record the outcome of a finished turn. An ABNORMAL turn advances the strike
+// count and, once the session proves it is stuck, drops the entry so the next
+// request re-probes via getSessionMetadata → resumeSession. Any healthy turn
 // clears the count — strikes must be CONSECUTIVE to mean anything.
-function recordTurnOutcome(entry: SessionEntry, empty: boolean, where: string): void {
-  if (!empty) {
-    entry.consecutiveEmptyTurns = 0;
+//
+// "Abnormal" is deliberately wider than "empty". A session that degrades into
+// short, truncated turns never produced a literally empty one, so the old
+// empty-only detector reset the count every turn and the poisoned entry stayed
+// cached until the operator restarted the whole server. Truncation (a runaway
+// trip) counts as a strike for the same reason: a healthy session does not
+// repeatedly run away.
+//
+// Pure stream-turn decision behind recordTurnOutcome's "abnormal" input,
+// exported for tests. A tool call is itself content, so only truncation makes
+// it abnormal; any other turn is abnormal when it produced no text or was
+// truncated.
+export const isAbnormalStreamTurn = (facts: {
+  hasToolCall: boolean;
+  content: string;
+  truncated: boolean;
+}): boolean => facts.truncated || (!facts.hasToolCall && !facts.content.trim());
+
+function recordTurnOutcome(entry: SessionEntry, abnormal: boolean, where: string): void {
+  if (!abnormal) {
+    entry.consecutiveAbnormalTurns = 0;
     return;
   }
-  entry.consecutiveEmptyTurns++;
+  entry.consecutiveAbnormalTurns++;
   logger.log(
-    `⚠️ upstream turn produced no content (${where}) — ` +
-      `${entry.consecutiveEmptyTurns}/${EMPTY_TURNS_BEFORE_INVALIDATE} consecutive`
+    `⚠️ upstream turn ended abnormally (${where}) — ` +
+      `${entry.consecutiveAbnormalTurns}/${ABNORMAL_TURNS_BEFORE_INVALIDATE} consecutive`
   );
-  if (entry.consecutiveEmptyTurns >= EMPTY_TURNS_BEFORE_INVALIDATE) {
-    invalidateSession(entry, "consecutive empty turns");
+  if (entry.consecutiveAbnormalTurns >= ABNORMAL_TURNS_BEFORE_INVALIDATE) {
+    invalidateSession(entry, "consecutive abnormal turns");
   }
 }
 
@@ -1163,7 +1183,11 @@ function sendAndStream(
         // reason below switches to tool_calls.
         logger.log(`🛟 Bash rescue: ${tu.arguments.slice(0, 120)}`);
       }
-      recordTurnOutcome(entry, false, "stream");
+      recordTurnOutcome(
+        entry,
+        isAbnormalStreamTurn({ hasToolCall: true, content, truncated }),
+        "stream:tool"
+      );
       safeWrite(sseOpenAIToolCallDelta(completionId, model, newToolCallId(), tu.name, tu.arguments));
       safeWrite(sseOpenAIFinish(completionId, model, "tool_calls"));
     } else {
@@ -1174,7 +1198,11 @@ function sendAndStream(
       // made the completion look non-empty downstream, so the proxy's
       // emptyUpstreamResponse check never tripped and its retry ladder never ran.
       // Emitting nothing keeps the turn diagnosably empty.
-      recordTurnOutcome(entry, !content.trim(), "stream");
+      recordTurnOutcome(
+        entry,
+        isAbnormalStreamTurn({ hasToolCall: false, content, truncated }),
+        "stream"
+      );
       if (remainder) {
         safeWrite(sseOpenAIDelta(completionId, model, remainder));
       }
@@ -1203,7 +1231,7 @@ async function sendAndCollect(
   prompt: string,
   attachments?: BlobAttachment[],
   tools?: any[]
-): Promise<string> {
+): Promise<{ content: string; truncated: boolean }> {
   const turn = entry.queue.then(() => runTurn(entry, prompt, attachments));
   entry.queue = turn.then(() => undefined, () => undefined);
   const fullContent = await turn;
@@ -1211,9 +1239,13 @@ async function sendAndCollect(
   // the delta accumulation wholesale, so runaway content can arrive in one
   // frame the streaming guard never sampled.
   const verdict = detectRunaway(fullContent);
+  const truncated = !!verdict;
   if (verdict) logger.log(`✂️ ${describeRunaway(verdict)}`);
   const content = verdict ? fullContent.slice(0, verdict.keepLength) : fullContent;
-  return canonicalizeToolUseText(tidyToolUseJson(xmlToolUseToJson(content)), tools);
+  return {
+    content: canonicalizeToolUseText(tidyToolUseJson(xmlToolUseToJson(content)), tools),
+    truncated,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1381,17 +1413,29 @@ async function completionsHandler(c: Context) {
       });
     }
 
-    const content = await sendAndCollect(entry, effectivePrompt, attachments, effectiveTools);
+    const { content, truncated } = await sendAndCollect(entry, effectivePrompt, attachments, effectiveTools);
     const tu = extractInlineToolUse(content) ?? bashRescueToolCall(content, effectiveTools);
     if (tu && !extractInlineToolUse(content)) {
       logger.log(`🛟 Bash rescue (non-stream): ${tu.arguments.slice(0, 120)}`);
     }
-    // Mirror sendAndStream's empty-turn path: count the strike (dropping the
-    // poisoned entry once the session proves it is stuck) and return content: ""
-    // so the downstream proxy's emptyUpstreamResponse check trips and its retry
-    // ladder runs. Quota probes never reach this branch — they return via
+    // Mirror sendAndStream's abnormal-turn path: an empty OR truncated turn
+    // counts a strike (dropping the poisoned entry once the session proves it
+    // is stuck), and empty content returns as "" so the downstream proxy's
+    // emptyUpstreamResponse check trips and its retry ladder runs. A truncated
+    // runaway also surfaces finish_reason "length" so it is never mistaken for
+    // a clean answer. Quota probes never reach this branch — they return via
     // emptyCompletion earlier.
-    recordTurnOutcome(entry, !tu && !content.trim(), "non-stream");
+    recordTurnOutcome(
+      entry,
+      isAbnormalStreamTurn({ hasToolCall: !!tu, content, truncated }),
+      "non-stream"
+    );
+    // "length" tells the client the turn was cut short rather than completed,
+    // mirroring the stream path's finish_reason for truncated runaways.
+    let finishReason: "tool_calls" | "length" | "stop";
+    if (tu) finishReason = "tool_calls";
+    else if (truncated) finishReason = "length";
+    else finishReason = "stop";
     const message = tu
       ? {
           role: "assistant",
@@ -1403,7 +1447,7 @@ async function completionsHandler(c: Context) {
       id: completionId,
       object: "chat.completion",
       model,
-      choices: [{ index: 0, message, finish_reason: tu ? "tool_calls" : "stop" }],
+      choices: [{ index: 0, message, finish_reason: finishReason }],
       usage: {
         prompt_tokens: estimateInputTokens(body),
         completion_tokens: 0,
