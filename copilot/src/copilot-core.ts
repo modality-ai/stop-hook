@@ -290,6 +290,36 @@ const ensureClient = (): CopilotClient => {
   return _client;
 };
 
+// Drop the cached client so the NEXT `client.*` access constructs a fresh one and
+// respawns the Copilot binary over a new stdio pipe.
+//
+// Session-level recovery (invalidateSession) cannot fix a dead or wedged CLI process:
+// every session it re-creates lands on the same broken pipe. This is the process-level
+// escape hatch — without it the proxy retries against a corpse until an operator
+// restarts it by hand.
+//
+// Best-effort `stop()`: the old connection is already presumed broken, so a throw here
+// is expected and must not block the respawn. Existing CopilotSession objects bound to
+// the old client are dead once this returns — callers must discard them.
+export const resetClient = (reason: string): void => {
+  const dying = _client;
+  _client = null;
+  logger.log(`♻️ Copilot client reset (${reason}) — next request respawns the CLI`);
+  if (!dying) return;
+  try {
+    void dying.stop().catch(() => {});
+  } catch {
+    // Already unusable — nothing to clean up.
+  }
+};
+
+// dispose() exists on the runtime CopilotSession object, but the published
+// @github/copilot-sdk types omit it (they declare disconnect()/abort()).
+// Reach it through this narrow structural type instead of an `any` cast.
+export interface SdkLifecycle {
+  dispose?(): unknown;
+}
+
 // Proxy the client so callers (`client.start()`, etc.) work unchanged while
 // allowing setClientCwd to influence the cwd used when the binary spawns.
 export const client = new Proxy({} as CopilotClient, {

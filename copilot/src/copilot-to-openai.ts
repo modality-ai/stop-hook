@@ -1,12 +1,20 @@
 import { tryMkdir } from "./loop-fs";
 import { createRunawayGuard, describeRunaway, detectRunaway } from "./runaway";
 import {
+  ClientStrikeCounter,
+  StartLatch,
+  CLIENT_FAILURES_BEFORE_RESTART,
+} from "./client-lifecycle";
+import { TextEmitter, PendingWrites, drainWithGrace } from "./stream-emit";
+import {
   client,
   initSession,
   logger,
+  resetClient,
   setClientCwd,
   writeLoopFile,
   COPILOT_LOOP_DIR,
+  type SdkLifecycle,
 } from "./copilot-core";
 import { DEFAULT_MODEL } from "./config";
 import {
@@ -432,6 +440,15 @@ async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: strin
     creating = ensureClientStarted()
       .then(() => initSession(toolPrefix, sessionOpts))
       .then(({ session, resumed }) => {
+        // A client restart may have cleared the registry while this create was in
+        // flight (restartClient wipes sessionCreating + sessions). The session we
+        // just built is bound to the OLD client — re-inserting it would poison the
+        // fresh map with a dead pipe. The .finally below already guards its own
+        // cleanup with the identity check; this guards the insertion the same way.
+        if (sessionCreating.get(sessionKey) !== creating) {
+          disposeSession(session);
+          throw new Error("stale session creation after client restart");
+        }
         const entry: SessionEntry = {
           session,
           queue: Promise.resolve(),
@@ -470,12 +487,57 @@ async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: strin
 // Model list cache
 // ─────────────────────────────────────────────────────────────
 let cachedModels: any[] | null = null;
-let clientStarted = false;
 
+// ─────────────────────────────────────────────────────────────
+// Client lifecycle: start latch + process-level failure strikes
+// ─────────────────────────────────────────────────────────────
+// `clientStarted` used to be a one-way latch, which made ensureClientStarted a
+// permanent no-op after the first request. When the CLI process died or wedged, no
+// code path could ever respawn it: session-level recovery kept re-creating sessions
+// on the same dead stdio pipe until an operator restarted the proxy. The latch is now
+// cleared by restartClient, so recovery reaches the process layer too.
+const clientStartLatch = new StartLatch();
+const clientStrikes = new ClientStrikeCounter();
+
+// Concurrent requests share one in-flight start: without this, N requests arriving
+// before the first start resolves would each call client.start() on the same client.
 async function ensureClientStarted(): Promise<void> {
-  if (clientStarted) return;
-  await client.start();
-  clientStarted = true;
+  await clientStartLatch.run(() => client.start());
+}
+
+// A turn completed without a transport-level failure: the pipe is proven healthy, so
+// forgive any earlier strike.
+function noteClientHealthy(): void {
+  clientStrikes.healthy();
+}
+
+// Tear down the CLI process and every session bound to it. Sessions are dropped here
+// rather than left for invalidateSession because they are ALL dead once the underlying
+// pipe is replaced — resuming them would reattach to a client that no longer exists.
+// On-disk session state survives, so the next request resumes conversations normally
+// via getSessionMetadata → resumeSession.
+function restartClient(reason: string): void {
+  clientStartLatch.reset();
+  clientStrikes.reset();
+  cachedModels = null;
+  for (const entry of sessions.values()) disposeSession(entry.session);
+  sessions.clear();
+  sessionCreating.clear();
+  resetClient(reason);
+}
+
+// Record a client-level failure (a rejected send, a transport error, a turn that timed
+// out). Respawns the CLI once the failures prove consecutive. Returns true when a
+// restart was performed, so callers can report it.
+function noteClientFailure(reason: string): boolean {
+  const shouldRestart = clientStrikes.failure();
+  logger.log(
+    `⚠️ client-level failure (${reason}) — ` +
+      `${clientStrikes.count}/${CLIENT_FAILURES_BEFORE_RESTART} consecutive`
+  );
+  if (!shouldRestart) return false;
+  restartClient(reason);
+  return true;
 }
 
 async function getModels(): Promise<any[]> {
@@ -926,6 +988,47 @@ function newToolCallId(): string {
 // content from delta/message events, and resolve with the full content when
 // assistant.turn_end fires. Only assistant.turn_end is reliable — session.idle
 // can fire from a prior turn and would resolve before the model produces output.
+// Hard ceiling on a single turn. A dead or wedged CLI process produces NO events at
+// all — not an empty turn, not an error — so the abnormal-turn detector never sees it
+// and the SSE keepalive happily reports "alive" every 15s while nothing happens. Only
+// a timeout can distinguish "thinking" from "gone". Generous enough that a long
+// legitimate turn (large tool result, deep reasoning) is never cut short.
+const TURN_TIMEOUT_MS = 10 * 60_000;
+
+// Shared by runTurn and drive(): arm the one-shot turn guard plus its timeout
+// ceiling. Returns finish(fn), which every exit path routes through so the timer
+// is always cleared and the event subscription is never left dangling on a
+// settled promise. The timeout is the only way to distinguish "thinking" from
+// "gone" when a dead/wedged CLI produces no events at all; it counts a client
+// strike and drops the entry — unless the strike already respawned the whole
+// client, which clears the session map wholesale and makes the drop redundant.
+function armTurnTimeout(
+  entry: SessionEntry,
+  unsub: () => void,
+  reject: (err: Error) => void
+): (fn: () => void) => void {
+  let settled = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const finish = (fn: () => void) => {
+    if (settled) return;
+    settled = true;
+    if (timer) clearTimeout(timer);
+    unsub();
+    fn();
+  };
+  timer = setTimeout(() => {
+    finish(() => {
+      const restarted = noteClientFailure(`turn timeout after ${TURN_TIMEOUT_MS}ms`);
+      // A timeout means this session produced nothing at all. Drop it regardless of
+      // whether the whole client was respawned (restartClient already cleared the
+      // map, so invalidateSession is a no-op in that case).
+      if (!restarted) invalidateSession(entry, "turn timeout");
+      reject(new Error(`Copilot turn timed out after ${TURN_TIMEOUT_MS}ms`));
+    });
+  }, TURN_TIMEOUT_MS);
+  return finish;
+}
+
 function runTurn(
   entry: SessionEntry,
   prompt: string,
@@ -934,7 +1037,14 @@ function runTurn(
   return new Promise<string>((resolve, reject) => {
     let fullContent = "";
     const guard = createRunawayGuard();
-    const unsub = entry.session.on((event: any) => {
+    // Declared before arming so the timeout's unsub reference can never hit the
+    // temporal dead zone: the timer only fires later, but a listener that ever
+    // dispatched synchronously during subscription would reach unsub before its
+    // initializer ran. A no-op placeholder removes that ordering dependency.
+    let unsub: () => void = () => {};
+    const finish = armTurnTimeout(entry, () => unsub(), reject);
+
+    unsub = entry.session.on((event: any) => {
       try {
         if (event.type === "assistant.message_delta") {
           fullContent += event.data.deltaContent ?? "";
@@ -944,34 +1054,44 @@ function runTurn(
           const verdict = guard.check(fullContent);
           if (verdict) {
             logger.log(`✂️ ${describeRunaway(verdict)}`);
-            unsub();
-            resolve(fullContent.slice(0, verdict.keepLength));
+            // Events reached us, so the transport is healthy — a runaway is a model
+            // problem, not a client problem.
+            noteClientHealthy();
+            finish(() => resolve(fullContent.slice(0, verdict.keepLength)));
           }
         } else if (event.type === "assistant.message") {
           // See sendAndStream: an empty turn-final assistant.message must never
           // erase content already accumulated from deltas.
           if (event.data.content?.trim()) fullContent = event.data.content;
         } else if (event.type === "assistant.turn_end") {
-          unsub();
-          resolve(fullContent);
+          noteClientHealthy();
+          finish(() => resolve(fullContent));
         } else if (event.type === "session.error") {
           // Self-healing: drop the in-memory entry so the next request for this
           // sessionKey re-probes via getSessionMetadata → resumeSession (or fresh
           // create if the on-disk state is also gone). Prevents one bad turn
           // from poisoning the rest of the conversation.
-          invalidateSession(entry, "session.error");
-          unsub();
-          reject(new Error(event.data.message));
+          //
+          // A session.error also counts as a client-level strike: the SDK reports a
+          // dead transport this way, and repeated errors across turns mean the CLI
+          // process itself is gone rather than one conversation being poisoned.
+          const restarted = noteClientFailure("session.error");
+          if (!restarted) invalidateSession(entry, "session.error");
+          finish(() => reject(new Error(event.data.message)));
         }
       } catch (e) {
-        unsub();
-        reject(e);
+        finish(() => reject(e));
       }
     });
 
     entry.session.send(attachments?.length ? { prompt, attachments } : { prompt }).catch((err) => {
-      unsub();
-      reject(err);
+      // A rejected send is a transport failure, not a model failure — the turn never
+      // started, so recordTurnOutcome would never see it. Previously this path counted
+      // no strike at all, which is why a crashed CLI could fail every request forever
+      // without ever tripping recovery.
+      const restarted = noteClientFailure(`send failed: ${err?.message ?? err}`);
+      if (!restarted) invalidateSession(entry, "send failed");
+      finish(() => reject(err));
     });
   });
 }
@@ -983,6 +1103,15 @@ function runTurn(
 const SSE_KEEPALIVE_MS = 15_000;
 const sseKeepalive = encoder.encode(": keepalive\n\n");
 
+// Ceiling on how long the stream teardown waits for the consumer to drain
+// pending writes. A slow-but-alive consumer settles its write promises as it
+// reads, so it completes well within this window; a response body that is never
+// read or cancelled leaves its write promises pending FOREVER, and awaiting an
+// unbounded drain inside the session queue would wedge every later request on
+// that session. One keepalive period is the natural "is anyone still there"
+// signal — a client that has not made transmission progress for 15s is gone.
+const DRAIN_GRACE_MS = SSE_KEEPALIVE_MS;
+
 // Drop the in-memory entry so the next request for this sessionKey re-probes via
 // getSessionMetadata → resumeSession (or creates fresh if the on-disk state is
 // also gone). Shared by the session.error handlers and the abnormal-turn paths:
@@ -991,7 +1120,20 @@ const sseKeepalive = encoder.encode(": keepalive\n\n");
 // degrades.
 function invalidateSession(entry: SessionEntry, reason: string): void {
   if (sessions.get(entry.sessionKey) === entry) sessions.delete(entry.sessionKey);
+  disposeSession(entry.session);
   logger.log(`🩹 Invalidated entry for ${entry.sessionKey} on ${reason} — next turn will auto-resume`);
+}
+
+// Release an SDK session we are dropping. Without this every invalidation leaked the
+// session object and its event subscriptions for the life of the process. Best-effort:
+// the session is usually already broken, and a throw here must not mask the original
+// failure that caused the invalidation.
+function disposeSession(session: CopilotSession): void {
+  try {
+    void Promise.resolve((session as SdkLifecycle).dispose?.()).catch(() => {});
+  } catch {
+    // Already gone — nothing to release.
+  }
 }
 
 // How many consecutive abnormal turns a session may produce before it is
@@ -1047,11 +1189,50 @@ function sendAndStream(
 ): ReadableStream<Uint8Array> {
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
   const writer = writable.getWriter();
-  // Fire-and-forget writes that swallow rejections. Without this, an aborted
-  // consumer turns every delta into an unhandled rejection ("error: undefined")
-  // logged by Bun per event.
+
+  // Writes are fire-and-forget at the CALL SITE (an aborted consumer would otherwise
+  // turn every delta into an unhandled rejection — "error: undefined" — logged by Bun
+  // per event), but the promises are NOT discarded: they are chained here so the
+  // stream can be drained before it is closed.
+  //
+  // Discarding them was the early-termination bug. When the TransformStream queue
+  // fills (long response, slow consumer), write() returns a promise that only settles
+  // once the consumer drains it. drive() would return with the final finish_reason and
+  // [DONE] chunks still pending, and the `finally` below closed the writer straight
+  // over them. The client then saw a stream that just stopped — no finish_reason, no
+  // [DONE] — and treated the turn as complete, ending early with no error to retry on.
+  // Writes are still ISSUED immediately (order is guaranteed by the writer itself, and
+  // serialising them here would deadlock: each write would wait for the consumer to
+  // read the previous chunk before the next was even enqueued). Only the promises are
+  // retained, so the stream can be drained before it is closed.
+  const pendingWrites = new PendingWrites();
   const safeWrite = (chunk: Uint8Array) => {
-    writer.write(chunk).catch(() => {});
+    pendingWrites.push(writer.write(chunk));
+  };
+
+  // Terminal frames: every exit path (tool, text, or error) must emit a
+  // finish_reason frame plus exactly ONE [DONE]. A stream that ends without them
+  // is indistinguishable from "the model finished" — upstream failures used to
+  // end up silently truncating the turn instead of surfacing as a retryable
+  // error.
+  //
+  // Both frames are one-shot. drive() emits them on its success path, and the
+  // .catch tail emits them for a failure that happened BEFORE that path was
+  // reached — but a throw AFTER the success frames were already written would
+  // otherwise run the catch and emit a second finish plus a second [DONE].
+  // Frames after [DONE] are a protocol violation for strict OpenAI clients, so
+  // these latches make every extra emission a no-op: the first writer wins.
+  let finishEmitted = false;
+  let doneEmitted = false;
+  const emitFinish = (reason: "stop" | "tool_calls" | "length") => {
+    if (finishEmitted) return;
+    finishEmitted = true;
+    safeWrite(sseOpenAIFinish(completionId, model, reason));
+  };
+  const emitDone = () => {
+    if (doneEmitted) return;
+    doneEmitted = true;
+    safeWrite(encoder.encode("data: [DONE]\n\n"));
   };
 
   let keepaliveHandle: ReturnType<typeof setInterval> | null = null;
@@ -1072,9 +1253,13 @@ function sendAndStream(
     // "text": streaming live as text deltas
     // "tool": buffering — will emit tool_call at turn_end
     let mode: "pending" | "text" | "tool" = "pending";
-    let emittedChars = 0;
     let truncated = false;
     const guard = createRunawayGuard();
+    // Tracks what text has ACTUALLY been emitted (raw count + exact text) and, at
+    // turn end, what of the final `content` still needs streaming. See
+    // stream-emit.ts — measured against the emitted TEXT, not a raw offset, because
+    // `content` is fullContent AFTER three rewriting passes.
+    const textEmitter = new TextEmitter();
 
     // Deltas split anywhere, so a native tool-call tag can arrive as `<inv` +
     // `oke name=…`. Hold back a trailing unterminated `<…` until it closes so
@@ -1086,15 +1271,19 @@ function sendAndStream(
       return lt;
     };
     const flushText = (text: string, end: number) => {
-      if (end <= emittedChars) return;
-      safeWrite(sseOpenAIDelta(completionId, model, text.slice(emittedChars, end)));
-      emittedChars = end;
+      const slice = textEmitter.flush(text, end);
+      if (slice !== null) safeWrite(sseOpenAIDelta(completionId, model, slice));
     };
 
     startKeepalive();
 
     await new Promise<void>((resolve, reject) => {
-      const unsub = entry.session.on((event: any) => {
+      // Shares the guard + timeout + recovery with runTurn. unsub is declared
+      // before arming for the same temporal-dead-zone reason as runTurn.
+      let unsub: () => void = () => {};
+      const finish = armTurnTimeout(entry, () => unsub(), reject);
+
+      unsub = entry.session.on((event: any) => {
         try {
           if (event.type === "assistant.message_delta") {
             const delta = event.data.deltaContent ?? "";
@@ -1108,8 +1297,10 @@ function sendAndStream(
               logger.log(`✂️ ${describeRunaway(verdict)}`);
               fullContent = fullContent.slice(0, verdict.keepLength);
               truncated = true;
-              unsub();
-              resolve();
+              // Events reached us, so the transport is healthy — a runaway is a
+              // model problem, not a client problem.
+              noteClientHealthy();
+              finish(() => resolve());
               return;
             }
 
@@ -1151,23 +1342,33 @@ function sendAndStream(
             // "the upstream model returned no content for this turn".
             if (event.data.content?.trim()) fullContent = event.data.content;
           } else if (event.type === "assistant.turn_end") {
-            unsub();
-            resolve();
+            noteClientHealthy();
+            finish(() => resolve());
           } else if (event.type === "session.error") {
             // Self-healing: drop the in-memory entry so the next request for this
             // sessionKey re-probes via getSessionMetadata → resumeSession.
-            invalidateSession(entry, "session.error");
-            unsub();
-            reject(new Error(event.data.message));
+            //
+            // A session.error also counts as a client-level strike (mirrors
+            // runTurn): the SDK reports a dead transport this way, and repeated
+            // errors across turns mean the CLI process is gone rather than one
+            // conversation being poisoned.
+            const restarted = noteClientFailure("session.error");
+            if (!restarted) invalidateSession(entry, "session.error");
+            finish(() => reject(new Error(event.data.message)));
           }
         } catch (e) {
-          unsub();
-          reject(e);
+          finish(() => reject(e));
         }
       });
 
       entry.session.send(attachments?.length ? { prompt, attachments } : { prompt })
-        .catch((err) => { unsub(); reject(err); });
+        .catch((err) => {
+          // A rejected send is a transport failure, not a model failure — mirrors
+          // runTurn. Count a strike so recovery reaches the process layer.
+          const restarted = noteClientFailure(`send failed: ${err?.message ?? err}`);
+          if (!restarted) invalidateSession(entry, "send failed");
+          finish(() => reject(err));
+        });
     });
 
     // For text/pending modes, transforms are no-ops (no tool markup in content).
@@ -1177,7 +1378,7 @@ function sendAndStream(
     const tu = extractInlineToolUse(content) ?? bashRescueToolCall(content, tools);
 
     if (tu) {
-      if (emittedChars > 0) {
+      if (textEmitter.emittedChars > 0) {
         // We already streamed prose as text deltas — the client now needs to
         // see the rescue tool_call too. The delta is additive and the finish
         // reason below switches to tool_calls.
@@ -1189,10 +1390,15 @@ function sendAndStream(
         "stream:tool"
       );
       safeWrite(sseOpenAIToolCallDelta(completionId, model, newToolCallId(), tu.name, tu.arguments));
-      safeWrite(sseOpenAIFinish(completionId, model, "tool_calls"));
+      emitFinish("tool_calls");
     } else {
-      // Emit any content not yet streamed (covers pending→resolved and short responses)
-      const remainder = content.slice(emittedChars);
+      // Emit any content not yet streamed (covers pending→resolved and short responses).
+      // Measured against what was ACTUALLY streamed rather than a raw offset: the
+      // transforms above can change length, so `content` and the raw counter index
+      // different strings. When the streamed text is still a prefix of the final
+      // content, send only the tail; otherwise the transforms rewrote text already on
+      // the wire, and re-sending it would duplicate — send nothing more.
+      const remainder = textEmitter.remainder(content);
       // Nothing streamed and nothing left: the turn is genuinely empty. Report it
       // to the LOG, never onto the wire — substituting notice text into content
       // made the completion look non-empty downstream, so the proxy's
@@ -1208,19 +1414,37 @@ function sendAndStream(
       }
       // "length" tells the client the turn was cut short rather than completed,
       // so a truncated runaway is never mistaken for a clean answer.
-      safeWrite(sseOpenAIFinish(completionId, model, truncated ? "length" : "stop"));
+      emitFinish(truncated ? "length" : "stop");
     }
-    safeWrite(encoder.encode("data: [DONE]\n\n"));
+    emitDone();
   }
 
   entry.queue = entry.queue
     .then(drive)
     .catch((err: any) => {
+      // The drive loop failed (transport error, turn timeout, session error) BEFORE
+      // reaching the success-path finish frames. Emit a terminal finish + [DONE] so
+      // the client sees a properly-terminated stream — a bare close looks like "the
+      // model finished" and the failure is silently swallowed. "length" tells the
+      // client the turn was cut short so its retry ladder can run.
       logger.error(`Server stream error: ${err?.message ?? err}`);
+      emitFinish("length");
+      emitDone();
     })
     .finally(() => {
       stopKeepalive();
-      writer.close().catch(() => {});
+      // Drain every issued write before closing so a slow consumer can never
+      // truncate the stream: without this, the final finish_reason and [DONE]
+      // frames could still be pending when the writer closes, and the client
+      // sees a stream that just stopped — no error to retry on.
+      //
+      // Deliberately fire-and-forget (never awaited here): the session queue
+      // must not block on a response body. A body that is never read/cancelled
+      // leaves its write promises pending forever, so drainWithGrace caps the
+      // wait at DRAIN_GRACE_MS and close() runs regardless.
+      void drainWithGrace(pendingWrites, DRAIN_GRACE_MS).then(() => {
+        writer.close().catch(() => {});
+      });
     });
 
   return readable;
