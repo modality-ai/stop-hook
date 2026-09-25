@@ -1,5 +1,6 @@
 import { tryMkdir } from "./loop-fs";
 import { createRunawayGuard, describeRunaway, detectRunaway } from "./runaway";
+import { isTrustedSyntheticToolId } from "./synthetic-tool-id";
 import {
   ClientStrikeCounter,
   StartLatch,
@@ -634,24 +635,45 @@ async function extractPromptInput(message: any): Promise<PromptInput> {
   };
 }
 
-// Resolve the tool name for a tool_use_id / tool_call_id by scanning prior
-// assistant messages. Handles both Anthropic shape (assistant.content[] with
-// type: "tool_use") and OpenAI shape (assistant.tool_calls[] with id+function.name).
-function resolveToolName(messages: any[], toolCallId: string): string {
-  for (const msg of messages) {
-    if (msg.role !== "assistant") continue;
+interface ToolCallRef {
+  index: number;
+  name: string;
+  input: unknown;
+}
+
+function parseToolArguments(args: unknown): unknown {
+  if (typeof args !== "string") return args ?? {};
+  if (!args.trim()) return {};
+  try { return JSON.parse(args); } catch { return args; }
+}
+
+// Locate the assistant tool call for a tool_use_id / tool_call_id. Handles both
+// Anthropic shape (assistant.content[] with type: "tool_use") and OpenAI shape
+// (assistant.tool_calls[] with id + function.name/arguments).
+function findToolCall(messages: any[], toolCallId: string): ToolCallRef | undefined {
+  for (let index = 0; index < messages.length; index++) {
+    const msg = messages[index];
+    if (msg?.role !== "assistant") continue;
     if (Array.isArray(msg.content)) {
       for (const block of msg.content) {
-        if (block?.type === "tool_use" && block.id === toolCallId) return block.name ?? toolCallId;
+        if (block?.type === "tool_use" && block.id === toolCallId) {
+          return { index, name: block.name ?? toolCallId, input: block.input };
+        }
       }
     }
     if (Array.isArray(msg.tool_calls)) {
       for (const tc of msg.tool_calls) {
-        if (tc?.id === toolCallId) return tc.function?.name ?? tc.name ?? toolCallId;
+        if (tc?.id === toolCallId) {
+          return {
+            index,
+            name: tc.function?.name ?? tc.name ?? toolCallId,
+            input: parseToolArguments(tc.function?.arguments),
+          };
+        }
       }
     }
   }
-  return toolCallId;
+  return undefined;
 }
 
 function formatToolResultContent(content: any): string {
@@ -660,14 +682,53 @@ function formatToolResultContent(content: any): string {
   return "";
 }
 
+const MAX_PROMPT_CHARS = 200;
+
+function userMessageText(content: any): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((b: any) => b?.type === "text" && !String(b.text ?? "").trimStart().startsWith("<system-reminder>"))
+    .map((b: any) => b.text)
+    .join("\n");
+}
+
+function findOriginatingUserPrompt(messages: any[], callIdx: number): string {
+  // Walk back from the assistant turn holding this call to the nearest user text.
+  for (let i = callIdx - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role !== "user") continue;
+    const trimmed = userMessageText(m.content).trim();
+    if (trimmed) return Array.from(trimmed).slice(0, MAX_PROMPT_CHARS).join("");
+  }
+  return "";
+}
+
+// Tool calls synthesized by the mcp-qdrant proxy (hero deploy, ToolSearch, MCP
+// warmup) are answered without the Copilot session seeing the tool_use, so their
+// results look unsolicited. Re-state which call was made and why. When
+// SYNTHETIC_TOOL_ID_SECRET is shared with mcp-qdrant, IDs must carry a valid HMAC.
+function syntheticCallPreamble(messages: any[], toolId: string, call: ToolCallRef | undefined): string {
+  if (!call || !isTrustedSyntheticToolId(toolId)) return "";
+
+  const userPrompt = findOriginatingUserPrompt(messages, call.index);
+  const input = call.input === undefined ? "" : JSON.stringify(call.input);
+  return (
+    `[Context: you called ${call.name}(${input})` +
+    (userPrompt ? ` in response to the user's message: ${JSON.stringify(userPrompt)}` : "") +
+    `. This result answers that call.]\n`
+  );
+}
+
 function formatToolResultLine(messages: any[], toolId: string, content: any): string {
-  const name = resolveToolName(messages, toolId);
+  const call = findToolCall(messages, toolId);
+  const name = call?.name ?? toolId;
   let formatted = formatToolResultContent(content);
   // Slim Counter ExecuteMethod results: remove the all-methods registry chunk
   // so the Copilot model presents only the current hero's methods (from the
   // _Counter__Deploy conversation history) instead of the full system method list.
   if (name.includes("ExecuteMethod")) formatted = slimCounterResult(formatted);
-  return `[Tool result for ${name}]: ${formatted}`;
+  return `${syntheticCallPreamble(messages, toolId, call)}[Tool result for ${name}]: ${formatted}`;
 }
 
 // Walk back through consecutive role="tool" entries (OpenAI shape) ending at

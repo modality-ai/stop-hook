@@ -1,5 +1,9 @@
 import { describe, test, expect, mock, beforeEach } from "bun:test";
+import { createHmac } from "crypto";
 import { formatTokenPrice } from "../copilot-to-openai";
+
+const signSyntheticToolId = (baseId: string, secret: string) =>
+  `${baseId}_${createHmac("sha256", secret).update(baseId).digest("hex").slice(0, 16)}`;
 
 // ─── Mock copilot-core before importing server ────────────────────────────────
 const mockSend = mock(async (_args?: any) => {});
@@ -323,6 +327,227 @@ describe("server.ts", () => {
       }, { "x-session-id": "tool-result-test" }));
 
       expect(capturedPrompt).toBe("[Tool result for calculator]: 42");
+    });
+
+    test("accepts correctly signed synthetic ids when trust secret is configured", async () => {
+      const previousSecret = process.env.SYNTHETIC_TOOL_ID_SECRET;
+      process.env.SYNTHETIC_TOOL_ID_SECRET = "integration-secret";
+      let capturedPrompt = "";
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+      mockSend.mockImplementation(async (args: any) => { capturedPrompt = args?.prompt ?? ""; });
+
+      const toolId = signSyntheticToolId("toolu_herodeploy_signed", process.env.SYNTHETIC_TOOL_ID_SECRET);
+      try {
+        await fetchApp(post("/v1/chat/completions", {
+          model: "gpt-5-mini", stream: false,
+          messages: [
+            { role: "user", content: "James" },
+            { role: "assistant", content: [{ type: "tool_use", id: toolId, name: "Deploy", input: { callSign: "JAMES" } }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: toolId, content: "persona" }] },
+          ],
+        }, { "x-session-id": "synthetic-signed-deploy-test" }));
+      } finally {
+        if (previousSecret === undefined) delete process.env.SYNTHETIC_TOOL_ID_SECRET;
+        else process.env.SYNTHETIC_TOOL_ID_SECRET = previousSecret;
+      }
+
+      expect(capturedPrompt).toContain("Deploy({\"callSign\":\"JAMES\"})");
+      expect(capturedPrompt).toContain("[Tool result for Deploy]: persona");
+    });
+
+    test("rejects unsigned synthetic ids when trust secret is configured", async () => {
+      const previousSecret = process.env.SYNTHETIC_TOOL_ID_SECRET;
+      process.env.SYNTHETIC_TOOL_ID_SECRET = "integration-secret";
+      let capturedPrompt = "";
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+      mockSend.mockImplementation(async (args: any) => { capturedPrompt = args?.prompt ?? ""; });
+
+      try {
+        await fetchApp(post("/v1/chat/completions", {
+          model: "gpt-5-mini", stream: false,
+          messages: [
+            { role: "user", content: "James" },
+            { role: "assistant", content: [{ type: "tool_use", id: "toolu_herodeploy_unsigned", name: "Deploy", input: {} }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_herodeploy_unsigned", content: "persona" }] },
+          ],
+        }, { "x-session-id": "synthetic-unsigned-deploy-test" }));
+      } finally {
+        if (previousSecret === undefined) delete process.env.SYNTHETIC_TOOL_ID_SECRET;
+        else process.env.SYNTHETIC_TOOL_ID_SECRET = previousSecret;
+      }
+
+      expect(capturedPrompt).toBe("[Tool result for Deploy]: persona");
+    });
+
+    test("preserves malformed OpenAI tool arguments as a JSON string", async () => {
+      let capturedPrompt = "";
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+      mockSend.mockImplementation(async (args: any) => { capturedPrompt = args?.prompt ?? ""; });
+
+      const toolId = "toolu_toolsearch_malformed";
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [
+          { role: "user", content: "find tools" },
+          { role: "assistant", content: null, tool_calls: [{ id: toolId, type: "function", function: { name: "ToolSearch", arguments: "{bad json" } }] },
+          { role: "tool", tool_call_id: toolId, content: "ok" },
+        ],
+      }, { "x-session-id": "synthetic-malformed-args-test" }));
+
+      expect(capturedPrompt).toContain('ToolSearch("{bad json")');
+    });
+
+    test("skips tool-result-only user turns while finding the originating prompt", async () => {
+      let capturedPrompt = "";
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+      mockSend.mockImplementation(async (args: any) => { capturedPrompt = args?.prompt ?? ""; });
+
+      const firstToolId = "regular_tool_1";
+      const syntheticToolId = "toolu_warmup_after_tool_result";
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [
+          { role: "user", content: "original request" },
+          { role: "assistant", content: [{ type: "tool_use", id: firstToolId, name: "Calculator", input: {} }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: firstToolId, content: "42" }] },
+          { role: "assistant", content: [{ type: "tool_use", id: syntheticToolId, name: "Warmup", input: {} }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: syntheticToolId, content: "ready" }] },
+        ],
+      }, { "x-session-id": "synthetic-prior-tool-result-test" }));
+
+      expect(capturedPrompt).toContain('in response to the user\'s message: "original request".');
+    });
+
+    test("prefixes proxy-synthesized hero deploy results with call provenance", async () => {
+      let capturedPrompt = "";
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+      mockSend.mockImplementation(async (args: any) => { capturedPrompt = args?.prompt ?? ""; });
+
+      const toolId = "toolu_herodeploy_abc123";
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [
+          { role: "user", content: [
+            { type: "text", text: "<system-reminder>ignore me</system-reminder>" },
+            { type: "text", text: "James" },
+          ] },
+          { role: "assistant", content: [{ type: "tool_use", id: toolId, name: "mcp__Counter___Counter__Deploy", input: { callSign: "JAMES" } }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: toolId, content: "persona" }] },
+        ],
+      }, { "x-session-id": "synthetic-deploy-test" }));
+
+      expect(capturedPrompt).toBe(
+        '[Context: you called mcp__Counter___Counter__Deploy({"callSign":"JAMES"}) in response to the user\'s message: "James". This result answers that call.]\n' +
+        "[Tool result for mcp__Counter___Counter__Deploy]: persona"
+      );
+    });
+
+    test("prefixes OpenAI-shaped synthetic tool replies too", async () => {
+      let capturedPrompt = "";
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+      mockSend.mockImplementation(async (args: any) => { capturedPrompt = args?.prompt ?? ""; });
+
+      const toolId = "toolu_herodeploy_xyz";
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [
+          { role: "user", content: "James" },
+          { role: "assistant", content: null, tool_calls: [{ id: toolId, type: "function", function: { name: "mcp__Counter___Counter__Deploy", arguments: '{"callSign":"JAMES"}' } }] },
+          { role: "tool", tool_call_id: toolId, content: "persona" },
+        ],
+      }, { "x-session-id": "synthetic-deploy-openai-test" }));
+
+      expect(capturedPrompt).toContain('[Context: you called mcp__Counter___Counter__Deploy({"callSign":"JAMES"})');
+      expect(capturedPrompt).toContain("[Tool result for mcp__Counter___Counter__Deploy]: persona");
+    });
+
+    for (const kind of ["toolsearch", "warmup"]) {
+      test(`prefixes ${kind} synthetic tool replies`, async () => {
+        let capturedPrompt = "";
+        mockOn.mockImplementation((handler: any) => {
+          setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+          return () => {};
+        });
+        mockSend.mockImplementation(async (args: any) => { capturedPrompt = args?.prompt ?? ""; });
+
+        const toolId = `toolu_${kind}_1`;
+        await fetchApp(post("/v1/chat/completions", {
+          model: "gpt-5-mini", stream: false,
+          messages: [
+            { role: "user", content: "find tools" },
+            { role: "assistant", content: null, tool_calls: [{ id: toolId, type: "function", function: { name: "ToolSearch", arguments: "" } }] },
+            { role: "tool", tool_call_id: toolId, content: "ok" },
+          ],
+        }, { "x-session-id": `synthetic-${kind}-test` }));
+
+        expect(capturedPrompt).toBe(
+          '[Context: you called ToolSearch({}) in response to the user\'s message: "find tools". This result answers that call.]\n' +
+          "[Tool result for ToolSearch]: ok"
+        );
+      });
+    }
+
+    test("omits user-message clause when no preceding user text exists", async () => {
+      let capturedPrompt = "";
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+      mockSend.mockImplementation(async (args: any) => { capturedPrompt = args?.prompt ?? ""; });
+
+      const toolId = "toolu_warmup_noprompt";
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [
+          { role: "assistant", content: [{ type: "tool_use", id: toolId, name: "Warmup", input: {} }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: toolId, content: "ready" }] },
+        ],
+      }, { "x-session-id": "synthetic-noprompt-test" }));
+
+      expect(capturedPrompt).toBe(
+        "[Context: you called Warmup({}). This result answers that call.]\n" +
+        "[Tool result for Warmup]: ready"
+      );
+    });
+
+    test("truncates originating user prompt by code point, not UTF-16 unit", async () => {
+      let capturedPrompt = "";
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+      mockSend.mockImplementation(async (args: any) => { capturedPrompt = args?.prompt ?? ""; });
+
+      const toolId = "toolu_herodeploy_emoji";
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [
+          { role: "user", content: "😀".repeat(250) },
+          { role: "assistant", content: [{ type: "tool_use", id: toolId, name: "Deploy", input: {} }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: toolId, content: "ok" }] },
+        ],
+      }, { "x-session-id": "synthetic-emoji-test" }));
+
+      expect(capturedPrompt).toContain(`in response to the user's message: "${"😀".repeat(200)}".`);
+      expect(capturedPrompt).not.toContain("\\ud");
     });
 
     test("filters bare quota probe without starting Copilot session", async () => {
