@@ -9,6 +9,8 @@ import {
   slimCounterResult,
   tidyToolUseJsonDetailed,
   xmlToolUseToJson,
+  findToolMarkupStart,
+  type XmlToolSchemas,
 } from "../tool-use-text";
 
 // A flat all-methods registry: ≥10 keys, no non-registry marker keys, and at
@@ -198,6 +200,54 @@ describe("extractInlineToolUse", () => {
   it("returns null for empty input", () => {
     expect(extractInlineToolUse("")).toBeNull();
   });
+
+  // Both shapes converge on this parser, so the validation the XML path applies
+  // has to run here too — otherwise an unknown tool is rejected as `<invoke …>`
+  // markup but accepted as a `{"tool_use": …}` literal.
+  describe("with a validator", () => {
+    const validate = (name: string, input: Record<string, any>): boolean =>
+      name === "Bash" && Object.keys(input).every((k) => k === "command");
+
+    it("accepts a vetted call", () => {
+      const text = '{"tool_use":{"name":"Bash","input":{"command":"pwd"}}}';
+      expect(extractInlineToolUse(text, validate)).toEqual({
+        name: "Bash",
+        arguments: '{"command":"pwd"}',
+      });
+    });
+
+    it("rejects an unknown tool", () => {
+      const text = '{"tool_use":{"name":"Nope","input":{"x":1}}}';
+      expect(extractInlineToolUse(text, validate)).toBeNull();
+    });
+
+    it("rejects an undeclared parameter", () => {
+      const text = '{"tool_use":{"name":"Bash","input":{"bogus":"ls"}}}';
+      expect(extractInlineToolUse(text, validate)).toBeNull();
+    });
+
+    it("does not consult a later call once the first literal validates", () => {
+      // Only the balanced first object is a candidate, so a rejected second call
+      // never becomes the answer — the turn runs the first one or nothing.
+      const text = '{"tool_use":{"name":"Bash","input":{"command":"pwd"}}} <invoke name="Nope">';
+      expect(extractInlineToolUse(text, validate)?.name).toBe("Bash");
+    });
+
+    it("returns null rather than a partial literal when it never closes", () => {
+      const text = '{"tool_use":{"name":"Bash","input":{"command":"pwd"';
+      expect(extractInlineToolUse(text, validate)).toBeNull();
+    });
+
+    it("treats missing input as an empty object", () => {
+      const text = '{"tool_use":{"name":"Bash"}}';
+      expect(extractInlineToolUse(text, validate)).toEqual({ name: "Bash", arguments: "{}" });
+    });
+
+    it("keeps the unvetted behaviour when no validator is supplied", () => {
+      const text = '{"tool_use":{"name":"Nope","input":{"x":1}}}';
+      expect(extractInlineToolUse(text)?.name).toBe("Nope");
+    });
+  });
 });
 
 // ─── xmlToolUseToJson ────────────────────────────────────────────────────────
@@ -233,11 +283,59 @@ describe("xmlToolUseToJson", () => {
     });
   });
 
-  it("closes an unterminated parameter and invoke", () => {
+  // A truncated call must never run: half a command can be destructive.
+  it("leaves an unterminated invoke unconverted", () => {
     const text = '<invoke name="bash">\n<parameter name="command">test -f x && echo EXISTS';
-    expect(JSON.parse(xmlToolUseToJson(text))).toEqual({
-      tool_use: { name: "bash", input: { command: "test -f x && echo EXISTS" } },
+    expect(xmlToolUseToJson(text)).toBe(text);
+  });
+
+  it("ignores an invoke block inside a ``` fence", () => {
+    const text = 'Example:\n```\n<invoke name="bash"><parameter name="command">rm -rf /</parameter></invoke>\n```';
+    expect(xmlToolUseToJson(text)).toBe(text);
+    expect(findToolMarkupStart(text)).toBe(-1);
+  });
+
+  it("ignores an invoke block inside inline backticks", () => {
+    const text = 'Use `<invoke name="bash"><parameter name="command">ls</parameter></invoke>` like this';
+    expect(xmlToolUseToJson(text)).toBe(text);
+    expect(findToolMarkupStart(text)).toBe(-1);
+  });
+
+  describe("with tool schemas", () => {
+    const schemas: XmlToolSchemas = new Map([
+      ["Bash", { canonical: "Bash", types: { command: "string", timeout: "number" } }],
+      ["Write", { canonical: "Write", types: { file_path: "string", content: "string" } }],
+    ]);
+
+    it("rejects an unknown tool name", () => {
+      const text = '<invoke name="Nope"><parameter name="x">1</parameter></invoke>';
+      expect(xmlToolUseToJson(text, schemas)).toBe(text);
     });
+
+    it("rejects an undeclared parameter", () => {
+      const text = '<invoke name="Bash"><parameter name="bogus">ls</parameter></invoke>';
+      expect(xmlToolUseToJson(text, schemas)).toBe(text);
+    });
+
+    it("resolves the name case-insensitively", () => {
+      const text = '<invoke name="bash"><parameter name="command">ls</parameter></invoke>';
+      expect(JSON.parse(xmlToolUseToJson(text, schemas)).tool_use.name).toBe("Bash");
+    });
+
+    it("keeps string-typed fields verbatim and coerces others", () => {
+      const text = '<invoke name="Write"><parameter name="file_path">/a</parameter><parameter name="content">123</parameter></invoke>';
+      expect(JSON.parse(xmlToolUseToJson(text, schemas)).tool_use.input).toEqual({ file_path: "/a", content: "123" });
+      const bash = '<invoke name="Bash"><parameter name="command">true</parameter><parameter name="timeout">5000</parameter></invoke>';
+      expect(JSON.parse(xmlToolUseToJson(bash, schemas)).tool_use.input).toEqual({ command: "true", timeout: 5000 });
+    });
+  });
+
+  it("converts a real call that follows a fenced example", () => {
+    const text = '```\n<invoke name="bash"><parameter name="command">rm -rf /</parameter></invoke>\n```\n<invoke name="bash"><parameter name="command">pwd</parameter></invoke>';
+    expect(JSON.parse(xmlToolUseToJson(text))).toEqual({
+      tool_use: { name: "bash", input: { command: "pwd" } },
+    });
+    expect(findToolMarkupStart(text)).toBe(text.lastIndexOf("<invoke"));
   });
 
   it("keeps shell text as a string and parses JSON-shaped values", () => {
@@ -276,5 +374,102 @@ describe("xmlToolUseToJson", () => {
 
   it("returns empty input verbatim", () => {
     expect(xmlToolUseToJson("")).toBe("");
+  });
+
+  // An unclosed fence is the one case where streaming and final conversion must
+  // disagree. Mid-stream the fence may still close, so the stream stays in text
+  // mode; at turn end it never will, so a call leaking out of it is real.
+  describe("an unclosed fence", () => {
+    const text = 'Snippet:\n```\nrm -rf /\n<invoke name="bash"><parameter name="command">pwd</parameter></invoke>';
+
+    it("keeps the streaming check in text mode", () => {
+      expect(findToolMarkupStart(text)).toBe(-1);
+    });
+
+    it("still converts the call at turn end", () => {
+      expect(JSON.parse(xmlToolUseToJson(text))).toEqual({
+        tool_use: { name: "bash", input: { command: "pwd" } },
+      });
+    });
+
+    it("stays verbatim when no call follows the fence", () => {
+      const prose = "Snippet:\n```\nrm -rf /\n";
+      expect(xmlToolUseToJson(prose)).toBe(prose);
+      expect(findToolMarkupStart(prose)).toBe(-1);
+    });
+  });
+});
+
+// Regression: fence markers inside a JSON string must never slice the payload.
+// Built from char codes so this source carries no literal fence marker.
+describe("extractInlineToolUse with fence markers inside string arguments", () => {
+  const B = String.fromCharCode(96);
+  const F = B + B + B;
+  const all = () => true;
+  const writeLiteral = (content: string) =>
+    JSON.stringify({ tool_use: { name: "Write", input: { file_path: "/tmp/x.ts", content } } });
+
+  it("keeps content with one fence marker intact", () => {
+    const body = "const a = /" + F + "(bash)?/;\n";
+    const r = extractInlineToolUse(writeLiteral(body), all);
+    expect(JSON.parse(r!.arguments).content).toBe(body);
+  });
+
+  it("keeps content with two fence markers intact", () => {
+    const body = "const a = /" + F + "(bash)?x" + F + "/;\n";
+    const r = extractInlineToolUse(writeLiteral(body), all);
+    expect(JSON.parse(r!.arguments).content).toBe(body);
+  });
+
+  it("keeps an intent phrase beside a backticked command as plain content", () => {
+    const body = "// I will now run " + B + "use-stock rules --eval --json" + B + "\n";
+    const r = extractInlineToolUse(writeLiteral(body), all);
+    expect(r!.name).toBe("Write");
+  });
+
+  it("still prefers an unfenced literal over a fenced example", () => {
+    const fenced = F + "json\n" + JSON.stringify({ tool_use: { name: "Bash", input: { command: "rm -rf /" } } }) + "\n" + F;
+    const real = JSON.stringify({ tool_use: { name: "Bash", input: { command: "pwd" } } });
+    const r = extractInlineToolUse(fenced + "\n" + real, all);
+    expect(JSON.parse(r!.arguments).command).toBe("pwd");
+  });
+
+  it("returns null when the only literal is rejected", () => {
+    expect(extractInlineToolUse(writeLiteral("x"), () => false)).toBeNull();
+  });
+});
+
+// Literal selection across several tool_use literals (string-aware scanner path).
+describe("extractInlineToolUse literal selection", () => {
+  const B = String.fromCharCode(96);
+  const F = B + B + B;
+  const lit = (command: string) => JSON.stringify({ tool_use: { name: "Bash", input: { command } } });
+  const fence = (s: string) => F + "json\n" + s + "\n" + F;
+  const cmd = (r: { arguments: string } | null) => (r ? JSON.parse(r.arguments).command : null);
+
+  it("takes the last literal when every literal is fenced", () => {
+    expect(cmd(extractInlineToolUse(fence(lit("a")) + "\n" + fence(lit("b")), () => true))).toBe("b");
+  });
+
+  it("skips a rejected literal and takes the next accepted one", () => {
+    const validate = (_n: string, input: Record<string, any>) => input.command !== "bad";
+    expect(cmd(extractInlineToolUse(lit("bad") + " " + lit("good"), validate))).toBe("good");
+  });
+
+  it("takes the first of two unfenced literals", () => {
+    expect(cmd(extractInlineToolUse(lit("first") + " " + lit("second"), () => true))).toBe("first");
+  });
+
+  it("drops prose surrounding an unfenced literal", () => {
+    expect(cmd(extractInlineToolUse("Running it now: " + lit("pwd") + " done.", () => true))).toBe("pwd");
+  });
+
+  it("ignores a non-object tool_use mention in prose", () => {
+    expect(extractInlineToolUse('the "tool_use" key is required', () => true)).toBeNull();
+  });
+
+  it("falls back to the legacy path for a literal with a trailing brace typo", () => {
+    const text = '{"tool_use":{"name":"Bash","input":{"command":"pwd"}}}}';
+    expect(cmd(extractInlineToolUse(text, () => true))).toBe("pwd");
   });
 });

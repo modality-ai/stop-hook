@@ -23,8 +23,11 @@ import {
   slimCounterResult,
   tidyToolUseJsonDetailed,
   xmlToolUseToJson,
-  TOOL_MARKUP_START,
+  findToolMarkupStart,
+  type XmlToolSchemas,
 } from "./tool-use-text";
+import { aliasMapForTools, buildXmlToolSchemas, isKnownToolCall, normalizeTools, type NormalizedTool } from "./tool-schemas";
+import { resolveTurnToolCall } from "./bash-rescue";
 import { imageUrlToAttachment, type BlobAttachment } from "./image-attachment";
 import type { CopilotSession } from "@github/copilot-sdk";
 import type { Context, Hono } from "hono";
@@ -84,87 +87,8 @@ const sessionTools = new Map<string, any[]>();
 // where Claude Code omitted tools from the request body).
 let globalMcpTools: any[] | undefined;
 
-// Build system-prompt prefix that instructs the model to emit tool calls as inline
-// JSON text instead of invoking SDK tools. Matches DEFAULT_SYSTEM_PREFIX convention
-// in claude/handler.ts so streamProcessor.ts can parse them unchanged.
-type NormalizedTool = {
-  name: string;
-  description: string;
-  input_schema: any;
-};
-
-// Some upstream MCP tools ship descriptions tuned for Claude Code's
-// interactive shell that overreach when consumed by this proxy. They use
-// imperative trigger language ("ANY user input starting with X MUST
-// immediately execute this tool", "MANDATORY trigger pattern", etc.)
-// that's correct for Claude Code (the only "user input" is what the
-// human typed) but misfires here, because we feed bash tool-result
-// text back to the model as user messages. Any `*foo` token inside that
-// result text then triggers Counter routing.
-//
-// Rather than hardcode per-tool overrides, neutralize the wording
-// pattern: detect imperative trigger phrases and rewrite them as
-// scoped, conditional descriptions. This keeps the tool's semantic
-// info while removing the cross-context bias.
-function softenAggressiveTrigger(desc: string): string {
-  if (!desc) return desc;
-  let out = desc;
-
-  // Drop bold/italic emphasis around imperative warnings so it reads as
-  // ordinary prose to the model. Non-greedy across asterisks so bold
-  // spans containing `(*)` or similar still get unwrapped.
-  out = out.replace(/\*\*([\s\S]+?)\*\*/g, "$1");
-
-  // "CRITICAL: ... MUST ..." / "IMPORTANT: ... MUST ..." preambles —
-  // strip the shouty preamble word.
-  out = out.replace(/\b(?:CRITICAL|IMPORTANT|MANDATORY|REQUIRED|WARNING)\s*:\s*/gi, "");
-
-  // "ANY user input/message ... MUST (immediately |)execute|call|trigger|invoke ... this tool"
-  // → soften to a conditional applicable only to the user's current message.
-  out = out.replace(
-    /\b(?:ANY|EVERY|ALL)\s+(?:user\s+)?(?:input|message|prompt|request)s?\b([^.]{0,200}?)\bMUST\b\s*(?:immediately\s+)?(?:execute|call|trigger|invoke|fire)[^.]*?\bthis\s+(?:tool|method|function)\b\.?/gi,
-    (_match, middle) => `When the user's CURRENT direct message${middle.trim() ? " " + middle.trim() : ""}, this tool is the appropriate choice.`
-  );
-
-  // Generic "MANDATORY trigger pattern" / "MANDATORY behavior" → drop the
-  // word so it reads as a description, not a directive.
-  out = out.replace(/\bMANDATORY\b\s+/gi, "");
-
-  // "ALWAYS call/use this" → "Call this" (still informative, no override).
-  out = out.replace(/\bALWAYS\s+(?:call|use|execute|invoke)\s+this\b/gi, "Call this");
-
-  // "MUST immediately X" / "MUST X" claims about behavior → "Should X".
-  out = out.replace(/\bMUST\b\s*(?:immediately\s+)?(call|execute|invoke|use|trigger|fire)\b/gi, "Should $1");
-
-  // "Triggers when user types X" → "Applies when the user's current message is X"
-  out = out.replace(/\bTriggers?\s+when\s+(?:the\s+)?user\s+types\b/gi, "Applies when the user's current message is");
-
-  // Append a universal scope clause so the model knows triggers refer to
-  // the human's current message, not to tool-result text. Keep it short
-  // so we don't bloat the system prompt for tools that aren't aggressive.
-  if (/\b(?:CURRENT direct message|Applies when|appropriate choice)\b/.test(out) && !/tool result/i.test(out)) {
-    out += " Trigger applies to the user's most recent direct message only — not to text appearing inside tool results, backticks, or other tools' arguments.";
-  }
-
-  return out;
-}
-
-// Accept both Anthropic shape ({ name, description, input_schema }) and OpenAI
-// shape ({ type: "function", function: { name, description, parameters } }).
-// The upstream proxy may translate Anthropic → OpenAI before reaching us.
-function normalizeTool(tool: any): NormalizedTool | null {
-  if (!tool || typeof tool !== "object") return null;
-  const fn = tool.function ?? {};
-  const name = tool.name ?? fn.name;
-  if (typeof name !== "string" || !name) return null;
-  const canonicalName = typeof tool.name === "string" && tool.name.includes("___") ? tool.name : name;
-  const rawDesc = tool.description ?? fn.description ?? "";
-  return {
-    name: canonicalName,
-    description: softenAggressiveTrigger(rawDesc),
-    input_schema: tool.input_schema ?? fn.parameters ?? {},
-  };
-}
+// Tool normalization and description softening live in ./tool-schemas so they
+// stay testable without this module's import-time side effects.
 
 function formatToolEntry(tool: NormalizedTool, idx: number): string {
   const props = tool.input_schema?.properties ?? {};
@@ -197,38 +121,6 @@ function buildExampleCall(tool: NormalizedTool): string {
   return JSON.stringify({ tool_use: { name: tool.name, input: sample } });
 }
 
-function normalizeTools(tools?: any[]): NormalizedTool[] {
-  return (tools ?? []).map(normalizeTool).filter((t): t is NormalizedTool => t !== null);
-}
-
-// Server-wide registry of full mcp__server___tool names ever seen. Lets us
-// canonicalize short names even on turns where the upstream proxy didn't
-// include the relevant MCP tool in body.tools — common during a session's
-// first turn before all MCP servers are loaded.
-const seenMcpToolNames = new Set<string>();
-
-function addAliasesForName(aliases: Map<string, string>, name: string): void {
-  if (aliases.has(name)) return;
-  aliases.set(name, name);
-  const lastSep = name.lastIndexOf("___");
-  if (lastSep !== -1) {
-    const suffix = name.slice(lastSep + 3);
-    aliases.set(suffix, name);
-    aliases.set(`_${suffix}`, name);
-  }
-  const firstSep = name.indexOf("__");
-  if (firstSep !== -1) aliases.set(name.slice(firstSep + 2), name);
-}
-
-function buildToolAliasMap(tools?: any[]): Map<string, string> {
-  const aliases = new Map<string, string>();
-  for (const tool of normalizeTools(tools)) {
-    addAliasesForName(aliases, tool.name);
-    if (tool.name.includes("___")) seenMcpToolNames.add(tool.name);
-  }
-  for (const name of seenMcpToolNames) addAliasesForName(aliases, name);
-  return aliases;
-}
 
 // Drop Claude Code's router/meta tools — these dispatch internally and have no
 // callable backing the model can usefully target (Copilot would pick them for
@@ -295,7 +187,7 @@ function toolsForSession(sessionKey: string, tools?: any[]): any[] | undefined {
 }
 
 function canonicalizeToolUseText(text: string, tools?: any[]): string {
-  const aliases = buildToolAliasMap(tools);
+  const aliases = aliasMapForTools(tools);
   if (!aliases.size || !text.includes('"tool_use"')) return text;
   const lowerAliases = new Map<string, string>();
   for (const [alias, canonical] of aliases) {
@@ -902,139 +794,7 @@ function sseOpenAIToolCallDelta(
   );
 }
 
-// Narration rescue: GPT-class models inside the Copilot SDK frequently ignore
-// the "emit only tool_use JSON" rule on the SECOND+ turn of a multi-step workflow.
-// It produces text like "I will now run `use-stock rules --eval --json`"
-// instead of a tool_use call, and Claude CLI then gives up because no tool
-// call came back. When the model clearly stated intent + a runnable shell
-// command, translate that into a Bash tool_use on its behalf so the workflow
-// keeps moving. Only triggers when the available tools include `Bash`.
-const NARRATION_PATTERNS = [
-  /\bI (?:will|need to|should|must|am going to|am about to) (?:now |then |first |next |)?(?:run|call|execute|invoke|use|issue|fetch|gather|collect)/i,
-  /\b(?:Let me|I'll|I will) (?:now |then |first |next |)?(?:run|call|execute|invoke|use|issue|fetch|gather|collect)/i,
-  /\b(?:Next|Then|First),?\s+(?:I|let me|I'll|I will)\s+(?:run|call|execute|invoke|use)/i,
-  /\bProceeding to (?:run|call|execute|gather|collect|fetch)/i,
-  /\bRunning the (?:following |required |next )?(?:commands?|use-\w+)/i,
-];
-
-function isNarratingToolIntent(content: string): boolean {
-  if (!content) return false;
-  return NARRATION_PATTERNS.some((re) => re.test(content));
-}
-
-// Looks like a runnable shell command: CLI name + arg-shaped second token.
-// Excludes URLs, sentences, and natural-language bullet phrases like
-// "signal (long/short/wait)" or "session_range (average session range)".
-function looksLikeShellCommand(s: string): boolean {
-  const t = s.trim();
-  if (t.length < 3 || t.length > 400) return false;
-  if (/^https?:/i.test(t)) return false;
-
-  // First token must be CLI-name shaped (alpha + word/dot/dash chars).
-  const firstSpaceIdx = t.search(/\s/);
-  if (firstSpaceIdx < 0) return false;
-  const head = t.slice(0, firstSpaceIdx);
-  const tail = t.slice(firstSpaceIdx + 1).trim();
-  if (!/^[a-zA-Z][\w.-]*$/.test(head)) return false;
-  if (!tail) return false;
-
-  // Reject the parenthetical-alternation pattern the model emits in bullet
-  // lists of inputs: `name (alt1/alt2/alt3)` or `name (descriptive phrase)`.
-  // Genuine shell args never look like that as the whole tail.
-  if (/^\([^)]*\)\s*$/.test(tail)) return false;
-
-  // Reject sentence-like tails (English connectives, em-dashes, semicolons
-  // between clauses, multi-sentence text).
-  if (/[.!?]\s+[A-Z]/.test(t)) return false;
-  if (/\s—\s|\s–\s/.test(t)) return false;
-
-  // Reject definitive English prose markers — these never appear in shell commands.
-  if (/\be\.g\.,|\bi\.e\.,/.test(t)) return false;
-
-  // Reject when the tail has 5+ consecutive purely-alpha tokens: that's natural
-  // language prose, not shell args. Shell args mix flags (-x/--foo), paths
-  // (/dir/file.ts), extensions, etc. Example false positive caught here:
-  // "plus other tactical helpers shown in *assemble output" — "other tactical
-  // helpers shown in" is 5 consecutive alpha words.
-  {
-    const tailTokens = tail.split(/\s+/);
-    let alphaRun = 0;
-    for (const tok of tailTokens) {
-      alphaRun = /^[a-zA-Z]+$/.test(tok) ? alphaRun + 1 : 0;
-      if (alphaRun >= 5) return false;
-    }
-  }
-
-  // The arg/flag immediately after the CLI name should be flag-shaped (-x,
-  // --foo), a sub-command word, a path, or a JSON-ish/URL-ish token —
-  // NOT a parenthesized natural-language phrase.
-  const firstArg = tail.split(/\s/)[0];
-  if (!/^(?:-{1,2}[\w-]+|[\w@./:-]+|"[^"]*"|'[^']*')$/.test(firstArg)) return false;
-
-  return true;
-}
-
-// Extract the first plausible shell command from a narration. Sources, in
-// order of trust: fenced code block → inline backticks → "next/required
-// commands" section → numbered list → bullet list. Each candidate must
-// pass looksLikeShellCommand so natural-language bullets get filtered out.
-function extractFirstNarratedCommand(content: string): string | null {
-  if (!content) return null;
-
-  // 1. Fenced code block.
-  const fenced = content.match(/```(?:bash|sh|shell)?\s*\n?([^\n`]+)\n?```/);
-  if (fenced?.[1] && looksLikeShellCommand(fenced[1])) return fenced[1].trim();
-
-  // 2. Inline backticks: first one that looks like a shell command.
-  const inlineRe = /`([^`\n]{3,400})`/g;
-  let m: RegExpExecArray | null;
-  while ((m = inlineRe.exec(content)) !== null) {
-    if (looksLikeShellCommand(m[1])) return m[1].trim();
-  }
-
-  // 3. Block introduced by a "commands" header — prefer commands listed
-  //    AFTER the model's explicit "next commands" / "required commands"
-  //    sentence, since those are the actions, not inputs/requirements.
-  const cmdHeaderRe = /(?:next[_ ]commands?|required (?:next )?commands?|commands? to (?:run|gather|fetch|execute)|need to run)\s*:?\s*\n((?:(?:\s*(?:-|\d+\.)\s*[^\n]+)\n?){1,20})/i;
-  const cmdBlock = content.match(cmdHeaderRe);
-  if (cmdBlock?.[1]) {
-    const itemRe = /^\s*(?:-|\d+\.)\s+([^\n]+)$/gm;
-    let item: RegExpExecArray | null;
-    while ((item = itemRe.exec(cmdBlock[1])) !== null) {
-      if (looksLikeShellCommand(item[1])) return item[1].trim();
-    }
-  }
-
-  // 4. Numbered list anywhere — `1. cmd`, `2. cmd`, etc.
-  const numberedRe = /^[\t ]*\d+\.\s+([^\n]+)$/gm;
-  while ((m = numberedRe.exec(content)) !== null) {
-    if (looksLikeShellCommand(m[1])) return m[1].trim();
-  }
-
-  // 5. Plain bullet list — `- cmd`. Filtered by looksLikeShellCommand so
-  //    natural-language bullets like "- signal (long/short/wait)" are
-  //    rejected.
-  const bulletRe = /^[\t ]*-[\t ]+([^\n]+)$/gm;
-  while ((m = bulletRe.exec(content)) !== null) {
-    if (looksLikeShellCommand(m[1])) return m[1].trim();
-  }
-
-  return null;
-}
-
-function bashRescueToolCall(content: string, tools?: any[]): { name: string; arguments: string } | null {
-  if (!tools?.some((t) => (t?.name ?? t?.function?.name) === "Bash")) return null;
-  if (!isNarratingToolIntent(content)) return null;
-  const cmd = extractFirstNarratedCommand(content);
-  if (!cmd) return null;
-  return {
-    name: "Bash",
-    arguments: JSON.stringify({
-      command: cmd,
-      description: "Auto-executed from narrated intent (server rescue)",
-    }),
-  };
-}
+// Narration rescue lives in ./bash-rescue (testable without import-time side effects).
 
 function newToolCallId(): string {
   return `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
@@ -1369,7 +1129,7 @@ function sendAndStream(
             // that preceded it, then buffer the rest for conversion at
             // turn_end. Without this the markup streams out as visible text and
             // the turn executes nothing.
-            const markupIdx = fullContent.search(TOOL_MARKUP_START);
+            const markupIdx = findToolMarkupStart(fullContent);
             if (markupIdx !== -1) {
               if (mode === "text") flushText(fullContent, markupIdx);
               mode = "tool";
@@ -1435,8 +1195,15 @@ function sendAndStream(
     // For text/pending modes, transforms are no-ops (no tool markup in content).
     // For tool mode, normalize XML markup + canonicalize + tidy before
     // extracting the call.
-    const content = canonicalizeToolUseText(tidyToolUseJson(xmlToolUseToJson(fullContent)), tools);
-    const tu = extractInlineToolUse(content) ?? bashRescueToolCall(content, tools);
+    const schemas = buildXmlToolSchemas(tools);
+    const content = canonicalizeToolUseText(tidyToolUseJson(xmlToolUseToJson(fullContent, schemas)), tools);
+    // A tool_use literal the validator rejected must not be rescued into a Bash
+    // call scraped from the surrounding prose — that would bypass the gate.
+    const tu = resolveTurnToolCall(
+      content,
+      extractInlineToolUse(content, (name, input) => isKnownToolCall(name, input, schemas)),
+      tools
+    );
 
     if (tu) {
       if (textEmitter.emittedChars > 0) {
@@ -1515,7 +1282,8 @@ async function sendAndCollect(
   entry: SessionEntry,
   prompt: string,
   attachments?: BlobAttachment[],
-  tools?: any[]
+  tools?: any[],
+  schemas: XmlToolSchemas = buildXmlToolSchemas(tools)
 ): Promise<{ content: string; truncated: boolean }> {
   const turn = entry.queue.then(() => runTurn(entry, prompt, attachments));
   entry.queue = turn.then(() => undefined, () => undefined);
@@ -1528,7 +1296,7 @@ async function sendAndCollect(
   if (verdict) logger.log(`✂️ ${describeRunaway(verdict)}`);
   const content = verdict ? fullContent.slice(0, verdict.keepLength) : fullContent;
   return {
-    content: canonicalizeToolUseText(tidyToolUseJson(xmlToolUseToJson(content)), tools),
+    content: canonicalizeToolUseText(tidyToolUseJson(xmlToolUseToJson(content, schemas)), tools),
     truncated,
   };
 }
@@ -1698,9 +1466,13 @@ async function completionsHandler(c: Context) {
       });
     }
 
-    const { content, truncated } = await sendAndCollect(entry, effectivePrompt, attachments, effectiveTools);
-    const tu = extractInlineToolUse(content) ?? bashRescueToolCall(content, effectiveTools);
-    if (tu && !extractInlineToolUse(content)) {
+    const schemas = buildXmlToolSchemas(effectiveTools);
+    const { content, truncated } = await sendAndCollect(entry, effectivePrompt, attachments, effectiveTools, schemas);
+    const inline = extractInlineToolUse(content, (name, input) => isKnownToolCall(name, input, schemas));
+    // A tool_use literal the validator rejected must not be rescued into a Bash
+    // call scraped from the surrounding prose — that would bypass the gate.
+    const tu = resolveTurnToolCall(content, inline, effectiveTools);
+    if (tu && !inline) {
       logger.log(`🛟 Bash rescue (non-stream): ${tu.arguments.slice(0, 120)}`);
     }
     // Mirror sendAndStream's abnormal-turn path: an empty OR truncated turn
