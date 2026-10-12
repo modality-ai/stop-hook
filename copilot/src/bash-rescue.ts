@@ -97,11 +97,31 @@ export const extractFirstNarratedCommand = (content: string): string | null => {
   return null;
 };
 
+// Rescue scrapes commands from prose, so it must never run anything destructive.
+// Denylist of dangerous shapes; a rescued command matching any of these is dropped.
+const DESTRUCTIVE_PATTERNS: RegExp[] = [
+  /\brm\s+(?:-[a-z-]+\s+)*(?:--no-preserve-root\s+)?(?:\/|~|\$HOME|\*|\.\.?)(?:\*|\s|$)/i,
+  /\bmkfs\b/i,
+  /\bdd\b[^|]*\bof=\/dev\//i,
+  /:\(\)\s*\{/,
+  /\bchmod\s+-R\b/i,
+  /\bchown\s+-R\b/i,
+  /\bsudo\b/i,
+  />\s*\/dev\/(?:sd|nvme|disk)/i,
+  /\bfind\b[^|;&]*(?:-delete\b|-exec\s+rm\b)/i,
+  /\bgit\s+(?:reset\s+--hard|clean\s+-[a-z]*f|push\s+(?:.*\s)?(?:--force|-f)\b)/i,
+  /\b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b/i,
+];
+
+export const isDestructiveCommand = (cmd: string): boolean =>
+  DESTRUCTIVE_PATTERNS.some((re) => re.test(cmd));
+
 export const bashRescueToolCall = (content: string, tools?: any[]): RescuedToolCall | null => {
   if (!tools?.some((t) => (t?.name ?? t?.function?.name) === "Bash")) return null;
   if (!isNarratingToolIntent(content)) return null;
   const cmd = extractFirstNarratedCommand(content);
   if (!cmd) return null;
+  if (isDestructiveCommand(cmd)) return null;
   return {
     name: "Bash",
     arguments: JSON.stringify({
