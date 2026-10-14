@@ -959,7 +959,7 @@ describe("server.ts", () => {
       let sendCount = 0;
       mockSend.mockImplementation(async (_args?: any) => {
         sendCount++;
-        if (sendCount === 2) throw new Error("send blew up"); // sendCount=1 is /clear on session init
+        if (sendCount === 1) throw new Error("send blew up"); // no synthetic /clear turn on session init
       });
       mockOn.mockImplementation((handler: any) => {
         setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
@@ -1110,10 +1110,13 @@ describe("server.ts", () => {
       expect(mockSetModel.mock.calls.length).toBe(0);
     });
 
-    test("/clear is NOT sent when initSession reports resumed: true", async () => {
-      // On resume, the conversation memory must be preserved. If /clear fires
-      // after a resume, the very thing we resumed is wiped — defeating the
-      // entire purpose of crash recovery.
+    test("no /clear turn is enqueued on session init, on either the fresh or resumed path", async () => {
+      // The proxy used to enqueue a synthetic /clear on fresh create. The SDK
+      // forwards "/clear" to the model as a real user message, so non-claude
+      // models anchored on it and answered later turns with "Context cleared."
+      // Assert the whole invariant — neither path sends anything but the user's
+      // own message — so a regression cannot hide behind a resume-only check,
+      // which would pass merely because /clear never fires anywhere.
       mockInitSession.mockClear();
       mockSend.mockClear();
       const sendCalls: any[] = [];
@@ -1124,20 +1127,29 @@ describe("server.ts", () => {
         setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
         return () => {};
       });
-      // Tell the proxy this session was RESUMED — /clear must not enqueue.
+
+      // Fresh create — the path that used to enqueue /clear.
+      mockInitSession.mockImplementationOnce(async () => ({
+        session: { send: mockSend, on: mockOn, setModel: mockSetModel },
+        resumed: false,
+      }));
+      await fetchApp(post("/v1/chat/completions",
+        { model: "gpt-5-mini", messages: [{ role: "user", content: "hello" }], stream: false },
+        { "x-session-id": "fresh-no-clear-test" }
+      ));
+
+      // Resume — conversation memory must survive, so /clear must not appear either.
       mockInitSession.mockImplementationOnce(async () => ({
         session: { send: mockSend, on: mockOn, setModel: mockSetModel },
         resumed: true,
       }));
-
       await fetchApp(post("/v1/chat/completions",
         { model: "gpt-5-mini", messages: [{ role: "user", content: "hello again" }], stream: false },
-        { "x-session-id": "resume-test" }
+        { "x-session-id": "resume-no-clear-test" }
       ));
 
-      // No /clear prompt in the send calls — only the user's actual message.
-      const clearPrompts = sendCalls.filter((c) => c?.prompt === "/clear");
-      expect(clearPrompts.length).toBe(0);
+      // Exactly the two user messages reached the session, in order.
+      expect(sendCalls.map((c) => c?.prompt)).toEqual(["hello", "hello again"]);
 
       // Reset for other tests
       mockInitSession.mockImplementation(async (_prompt: string, _opts: any) => ({
@@ -1153,16 +1165,12 @@ describe("server.ts", () => {
       // from on-disk state, or fall back to fresh create).
       mockInitSession.mockClear();
       mockOn.mockClear();
-      // Each new session triggers TWO runTurn calls before the user's first
-      // request runs: /clear (the cleanup turn) + the user turn. We want the
-      // user turn (not /clear) to receive the session.error so that the
-      // self-heal path fires on a real user-visible failure.
-      // Turn 1 = /clear → success; Turn 2 = user request → session.error;
-      // Turn 3 = recovery user request → success.
+      // No synthetic /clear turn on session init, so the user's first request is
+      // turn 1. Turn 1 = user request → session.error; Turn 2 = recovery → success.
       let turnNum = 0;
       mockOn.mockImplementation((handler: any) => {
         turnNum++;
-        if (turnNum === 2) {
+        if (turnNum === 1) {
           setTimeout(() => handler({ type: "session.error", data: { message: "upstream died" } }), 0);
         } else {
           setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
@@ -1194,17 +1202,12 @@ describe("server.ts", () => {
       // assistant.message arrives with an EMPTY content string — exactly what
       // the Copilot SDK emits once the body was fully delivered as deltas.
       const driveWithEmptyFinalMessage = (deltas: string[]) => {
-        let turnNum = 0;
         mockOn.mockImplementation((handler: any) => {
-          turnNum++;
           setTimeout(() => {
-            // Turn 1 on a fresh session is the /clear cleanup turn.
-            if (turnNum > 1) {
-              for (const d of deltas) {
-                handler({ type: "assistant.message_delta", data: { deltaContent: d } });
-              }
-              handler({ type: "assistant.message", data: { content: "" } });
+            for (const d of deltas) {
+              handler({ type: "assistant.message_delta", data: { deltaContent: d } });
             }
+            handler({ type: "assistant.message", data: { content: "" } });
             handler({ type: "assistant.turn_end", data: {} });
           }, 0);
           return () => {};
@@ -1212,8 +1215,8 @@ describe("server.ts", () => {
       };
 
       // Drives a conversation with per-turn bodies: turn N emits the deltas from
-      // bodies[N] then turn_end. Index 0 is the /clear cleanup turn on a fresh
-      // session, so bodies[1] feeds the first user request.
+      // bodies[N] then turn_end. There is no /clear turn on a fresh session, so
+      // bodies[0] is the first user request.
       const driveWithBodies = (bodies: string[][]) => {
         let turnNum = 0;
         mockOn.mockImplementation((handler: any) => {
@@ -1331,7 +1334,7 @@ describe("server.ts", () => {
         ));
 
         // Per-turn bodies, unlike the shared fixture's replay-every-turn shape.
-        driveWithBodies([[], [], ["hello"], []]);
+        driveWithBodies([[], ["hello"], []]);
 
         expect((await send()).status).toBe(200);      // strike 1
         expect((await send()).status).toBe(200);      // content → reset
@@ -1352,7 +1355,7 @@ describe("server.ts", () => {
           { "x-session-id": "stream-alternating" }
         ));
 
-        driveWithBodies([[], [], ["hello"], []]);
+        driveWithBodies([[], ["hello"], []]);
 
         expect((await send()).status).toBe(200);          // strike 1
         const contentTurn = await (await send()).text();  // content → reset
@@ -1379,7 +1382,6 @@ describe("server.ts", () => {
         ));
 
         driveWithBodies([
-          [],
           [],
           ['{"tool_use":{"name":"Bash",', '"input":{"command":"ls -la"}}}'],
           [],
@@ -1410,7 +1412,6 @@ describe("server.ts", () => {
 
         driveWithBodies([
           [],
-          [],
           ['{"tool_use":{"name":"Bash",', '"input":{"command":"ls -la"}}}'],
           [],
         ]);
@@ -1434,7 +1435,7 @@ describe("server.ts", () => {
           { "x-session-id": "whitespace-session" }
         ));
 
-        driveWithBodies([[], ["   "], ["   "], []]);
+        driveWithBodies([["   "], ["   "], []]);
 
         const first = await (await send()).json() as any;
         // Counted as a strike, but the raw content reaches the wire untouched.

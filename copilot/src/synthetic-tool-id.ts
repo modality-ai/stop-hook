@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from "crypto";
 
-const PREFIX_RE = /^toolu_(herodeploy|toolsearch|warmup)_/;
+const PREFIX_RE = /^toolu_(herodeploy|heroassemble|toolsearch|warmup)_/;
 const SIGNATURE_RE = /^[0-9a-f]{16}$/;
 
 export function isTrustedSyntheticToolId(

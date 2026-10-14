@@ -28,6 +28,7 @@ import {
 } from "./tool-use-text";
 import { aliasMapForTools, buildXmlToolSchemas, isKnownToolCall, normalizeTools, type NormalizedTool } from "./tool-schemas";
 import { resolveTurnToolCall } from "./bash-rescue";
+import { mergeAssistantFrame, shouldNudgeToolIntent, TOOL_NUDGE_PROMPT } from "./turn-content";
 import { imageUrlToAttachment, type BlobAttachment } from "./image-attachment";
 import type { CopilotSession } from "@github/copilot-sdk";
 import type { Context, Hono } from "hono";
@@ -355,13 +356,9 @@ async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: strin
           `🆕 Session ${resumed ? "resumed" : "created"}: ${sessionKey} model=${requestedModel} fp=${fp}` +
             `${tools?.length ? ` (${tools.length} tools)` : " (no tools)"}`
         );
-        // Enqueue /clear only on FRESH create. On resume we want to preserve the
-        // prior conversation history — that's the whole point of resume.
-        if (!resumed) {
-          entry.queue = entry.queue
-            .then(() => runTurn(entry, "/clear"))
-            .then(() => { logger.log(`🧹 /clear done: ${sessionKey}`); }, () => {});
-        }
+        // No synthetic /clear turn on fresh create: a new session is already empty, and
+        // the SDK forwards "/clear" to the model as a real user message. Non-claude models
+        // (gpt-5.6-terra) then anchor on it and answer later turns with "Context cleared."
         return entry;
       })
       .finally(() => {
@@ -881,9 +878,8 @@ function runTurn(
             finish(() => resolve(fullContent.slice(0, verdict.keepLength)));
           }
         } else if (event.type === "assistant.message") {
-          // See sendAndStream: an empty turn-final assistant.message must never
-          // erase content already accumulated from deltas.
-          if (event.data.content?.trim()) fullContent = event.data.content;
+          // Frames must not clobber the accumulation — see mergeAssistantFrame.
+          fullContent = mergeAssistantFrame(fullContent, event.data.content);
         } else if (event.type === "assistant.turn_end") {
           noteClientHealthy();
           finish(() => resolve(fullContent));
@@ -999,6 +995,47 @@ function recordTurnOutcome(entry: SessionEntry, abnormal: boolean, where: string
     invalidateSession(entry, "consecutive abnormal turns");
   }
 }
+
+// Serialise a turn through the session queue. `runTurn` does not self-serialise,
+// so a caller that is NOT already inside the queue must come through here: two
+// overlapping turns would both receive every session event, and each would
+// resolve on the other's `assistant.turn_end`.
+const enqueueTurn = (entry: SessionEntry, prompt: string, attachments?: BlobAttachment[]) => {
+  const turn = entry.queue.then(() => runTurn(entry, prompt, attachments));
+  entry.queue = turn.then(() => undefined, () => undefined);
+  return turn;
+};
+
+/**
+ * Nudge the model once for the tool_use literal it announced but never emitted,
+ * then re-run the same extraction over its reply. `run` differs per caller so
+ * the turn is serialised correctly on both the streaming and non-streaming
+ * paths. Returns null when the nudge yields no call — a literal the validator
+ * rejected is not rescued, the same gate the turn itself passes through.
+ */
+const nudgeForToolCall = async (
+  label: string,
+  content: string,
+  schemas: XmlToolSchemas,
+  tools: any[] | undefined,
+  run: (prompt: string) => Promise<string>
+): Promise<{ name: string; arguments: string } | null> => {
+  logger.log(`🔔 Unfulfilled tool intent${label}, nudging once: ${content.slice(0, 120)}`);
+  try {
+    const nudged = await run(TOOL_NUDGE_PROMPT);
+    const nudgedContent = canonicalizeToolUseText(tidyToolUseJson(xmlToolUseToJson(nudged, schemas)), tools);
+    const tu = resolveTurnToolCall(
+      nudgedContent,
+      extractInlineToolUse(nudgedContent, (name, input) => isKnownToolCall(name, input, schemas)),
+      tools
+    );
+    logger.log(`🔔 Nudge${label} ${tu ? "produced " + tu.name : "produced no call"}`);
+    return tu;
+  } catch (err: any) {
+    logger.log(`⚠️ Nudge failed: ${err?.message ?? err}`);
+    return null;
+  }
+};
 
 function sendAndStream(
   entry: SessionEntry,
@@ -1153,15 +1190,8 @@ function sendAndStream(
             }
             // mode === "tool": buffer silently, emit at turn_end
           } else if (event.type === "assistant.message") {
-            // Canonical replacement ONLY when the frame carries content. The SDK
-            // emits a turn-final assistant.message with an EMPTY string once the
-            // body was already delivered as deltas; `?? fullContent` let that
-            // empty string through and wiped the accumulation. Harmless in
-            // "text" mode (deltas were already on the wire) but fatal in "tool"
-            // mode, where the whole response is buffered — the turn then ends
-            // with no tool_call and no text, and the downstream proxy reports
-            // "the upstream model returned no content for this turn".
-            if (event.data.content?.trim()) fullContent = event.data.content;
+            // Same frame rule as runTurn — see mergeAssistantFrame.
+            fullContent = mergeAssistantFrame(fullContent, event.data.content);
           } else if (event.type === "assistant.turn_end") {
             noteClientHealthy();
             finish(() => resolve());
@@ -1196,21 +1226,35 @@ function sendAndStream(
     // For tool mode, normalize XML markup + canonicalize + tidy before
     // extracting the call.
     const schemas = buildXmlToolSchemas(tools);
-    const content = canonicalizeToolUseText(tidyToolUseJson(xmlToolUseToJson(fullContent, schemas)), tools);
+    const normalized = xmlToolUseToJson(fullContent, schemas);
+    const content = canonicalizeToolUseText(tidyToolUseJson(normalized), tools);
+    // tidyToolUseJson trims to the first `{` / fenced body, which is right for call
+    // extraction but loses surrounding prose. When no call is extracted, the text
+    // handed on must be the untrimmed original so the upstream proxy can salvage it.
+    const fullText = canonicalizeToolUseText(normalized, tools);
     // A tool_use literal the validator rejected must not be rescued into a Bash
     // call scraped from the surrounding prose — that would bypass the gate.
-    const tu = resolveTurnToolCall(
+    let tu = resolveTurnToolCall(
       content,
       extractInlineToolUse(content, (name, input) => isKnownToolCall(name, input, schemas)),
       tools
     );
 
+    // GPT models often announce a tool action ("I'll inspect the file") and end the
+    // turn with no call. Nudge once on the same session; the announcement prose is
+    // already streamed, so a recovered call is simply added after it.
+    if (shouldNudgeToolIntent({ hasCall: !!tu, truncated, tools, content })) {
+      // `drive` IS this session's queue continuation, so calling runTurn directly
+      // is already serialised — routing through enqueueTurn here would deadlock.
+      tu = await nudgeForToolCall("", content, schemas, tools, (p) => runTurn(entry, p));
+    }
+
     if (tu) {
       if (textEmitter.emittedChars > 0) {
         // We already streamed prose as text deltas — the client now needs to
-        // see the rescue tool_call too. The delta is additive and the finish
-        // reason below switches to tool_calls.
-        logger.log(`🛟 Bash rescue: ${tu.arguments.slice(0, 120)}`);
+        // see the tool_call too. The delta is additive and the finish reason
+        // below switches to tool_calls.
+        logger.log(`🛟 Tool call appended after streamed prose: ${tu.arguments.slice(0, 120)}`);
       }
       recordTurnOutcome(
         entry,
@@ -1222,11 +1266,15 @@ function sendAndStream(
     } else {
       // Emit any content not yet streamed (covers pending→resolved and short responses).
       // Measured against what was ACTUALLY streamed rather than a raw offset: the
-      // transforms above can change length, so `content` and the raw counter index
+      // transforms above can change length, so `fullText` and the raw counter index
       // different strings. When the streamed text is still a prefix of the final
-      // content, send only the tail; otherwise the transforms rewrote text already on
+      // text, send only the tail; otherwise the transforms rewrote text already on
       // the wire, and re-sending it would duplicate — send nothing more.
-      const remainder = textEmitter.remainder(content);
+      //
+      // `fullText`, NOT the tidied `content`: the trimming described above strips
+      // prose the client already received as deltas, which would fail the prefix
+      // check and drop the real tail from the wire.
+      const remainder = textEmitter.remainder(fullText);
       // Nothing streamed and nothing left: the turn is genuinely empty. Report it
       // to the LOG, never onto the wire — substituting notice text into content
       // made the completion look non-empty downstream, so the proxy's
@@ -1284,10 +1332,8 @@ async function sendAndCollect(
   attachments?: BlobAttachment[],
   tools?: any[],
   schemas: XmlToolSchemas = buildXmlToolSchemas(tools)
-): Promise<{ content: string; truncated: boolean }> {
-  const turn = entry.queue.then(() => runTurn(entry, prompt, attachments));
-  entry.queue = turn.then(() => undefined, () => undefined);
-  const fullContent = await turn;
+): Promise<{ content: string; fullText: string; truncated: boolean }> {
+  const fullContent = await enqueueTurn(entry, prompt, attachments);
   // Final net for the non-stream path: a turn-final assistant.message replaces
   // the delta accumulation wholesale, so runaway content can arrive in one
   // frame the streaming guard never sampled.
@@ -1295,8 +1341,11 @@ async function sendAndCollect(
   const truncated = !!verdict;
   if (verdict) logger.log(`✂️ ${describeRunaway(verdict)}`);
   const content = verdict ? fullContent.slice(0, verdict.keepLength) : fullContent;
+  const normalized = xmlToolUseToJson(content, schemas);
   return {
-    content: canonicalizeToolUseText(tidyToolUseJson(xmlToolUseToJson(content, schemas)), tools),
+    content: canonicalizeToolUseText(tidyToolUseJson(normalized), tools),
+    // Untrimmed text for the no-call path, so the upstream proxy can salvage it.
+    fullText: canonicalizeToolUseText(normalized, tools),
     truncated,
   };
 }
@@ -1467,13 +1516,21 @@ async function completionsHandler(c: Context) {
     }
 
     const schemas = buildXmlToolSchemas(effectiveTools);
-    const { content, truncated } = await sendAndCollect(entry, effectivePrompt, attachments, effectiveTools, schemas);
+    const { content, fullText, truncated } = await sendAndCollect(entry, effectivePrompt, attachments, effectiveTools, schemas);
     const inline = extractInlineToolUse(content, (name, input) => isKnownToolCall(name, input, schemas));
     // A tool_use literal the validator rejected must not be rescued into a Bash
     // call scraped from the surrounding prose — that would bypass the gate.
-    const tu = resolveTurnToolCall(content, inline, effectiveTools);
+    let tu = resolveTurnToolCall(content, inline, effectiveTools);
+    if (shouldNudgeToolIntent({ hasCall: !!tu, truncated, tools: effectiveTools, content })) {
+      // NOT inside the queue here — sendAndCollect released its slot — so the
+      // nudge must re-enter it, or a concurrent request could run a turn
+      // alongside this one on the same session.
+      tu = await nudgeForToolCall(" (non-stream)", content, schemas, effectiveTools, (p) =>
+        enqueueTurn(entry, p)
+      );
+    }
     if (tu && !inline) {
-      logger.log(`🛟 Bash rescue (non-stream): ${tu.arguments.slice(0, 120)}`);
+      logger.log(`🛟 Tool call recovered (non-stream): ${tu.arguments.slice(0, 120)}`);
     }
     // Mirror sendAndStream's abnormal-turn path: an empty OR truncated turn
     // counts a strike (dropping the poisoned entry once the session proves it
@@ -1499,7 +1556,7 @@ async function completionsHandler(c: Context) {
           content: null,
           tool_calls: [{ id: newToolCallId(), type: "function", function: { name: tu.name, arguments: tu.arguments } }],
         }
-      : { role: "assistant", content };
+      : { role: "assistant", content: fullText };
     return c.json({
       id: completionId,
       object: "chat.completion",

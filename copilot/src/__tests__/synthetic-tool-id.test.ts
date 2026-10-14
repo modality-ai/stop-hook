@@ -12,14 +12,22 @@ describe("isTrustedSyntheticToolId", () => {
     expect(isTrustedSyntheticToolId("toolu_abc123", SECRET)).toBe(false);
   });
 
-  test("trusts prefix alone when no secret is configured", () => {
-    expect(isTrustedSyntheticToolId("toolu_herodeploy_xyz", undefined)).toBe(true);
+  test("trusts prefix alone when the secret is empty (not undefined: that reads the ambient env)", () => {
+    expect(isTrustedSyntheticToolId("toolu_herodeploy_xyz", "")).toBe(true);
   });
 
   test("accepts a correctly signed id", () => {
-    for (const kind of ["herodeploy", "toolsearch", "warmup"]) {
+    for (const kind of ["herodeploy", "heroassemble", "toolsearch", "warmup"]) {
       expect(isTrustedSyntheticToolId(sign(`toolu_${kind}_m1abc`), SECRET)).toBe(true);
     }
+  });
+
+  test("trusts the heroassemble prefix when the secret is empty", () => {
+    expect(isTrustedSyntheticToolId("toolu_heroassemble_xyz", "")).toBe(true);
+  });
+
+  test("still rejects an unsigned heroassemble id when a secret is set", () => {
+    expect(isTrustedSyntheticToolId("toolu_heroassemble_m1abc", SECRET)).toBe(false);
   });
 
   test("rejects unsigned, forged, or wrong-secret ids when secret is set", () => {

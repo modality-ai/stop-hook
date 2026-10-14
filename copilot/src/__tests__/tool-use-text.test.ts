@@ -148,6 +148,24 @@ describe("tidyToolUseJsonDetailed", () => {
     const text = '{"tool_use":{"name":"Bash"}}}';
     expect(tidyToolUseJsonDetailed(text).outcome).toBe("unrepairable");
   });
+
+  it("trims prose around a literal, so callers must keep the original when no call is extracted", () => {
+    const literal = '{"tool_use":{"name":"Nope","input":{}}}';
+    const original = `Before the call. ${literal}`;
+    const tidied = tidyToolUseJsonDetailed(original);
+    // Leading prose is dropped by design...
+    expect(tidied.text).toBe(literal);
+    expect(tidied.text).not.toBe(original);
+    // ...and a validator-rejected literal yields no call, so the bridge
+    // must emit the untrimmed original (fullText) for the upstream proxy.
+    expect(extractInlineToolUse(tidied.text, () => false)).toBeNull();
+    expect(original).toContain("Before the call.");
+  });
+
+  it("returns the full original text when trailing prose makes the literal unrepairable", () => {
+    const original = 'Before. {"tool_use":{"name":"Bash","input":{}}} After.';
+    expect(tidyToolUseJsonDetailed(original)).toEqual({ text: original, outcome: "unrepairable" });
+  });
 });
 
 // ─── extractInlineToolUse ────────────────────────────────────────────────────
@@ -471,5 +489,61 @@ describe("extractInlineToolUse literal selection", () => {
   it("falls back to the legacy path for a literal with a trailing brace typo", () => {
     const text = '{"tool_use":{"name":"Bash","input":{"command":"pwd"}}}}';
     expect(cmd(extractInlineToolUse(text, () => true))).toBe("pwd");
+  });
+});
+
+describe("extractInlineToolUse flattened literal", () => {
+  it("recovers arguments placed beside name instead of under input", () => {
+    const text = '{"tool_use":{"name":"Bash","command":"ls -la"}}';
+    expect(extractInlineToolUse(text)).toEqual({ name: "Bash", arguments: JSON.stringify({ command: "ls -la" }) });
+  });
+
+  it("accepts arguments as an alias for input", () => {
+    const text = '{"tool_use":{"name":"Read","arguments":{"file_path":"/a"}}}';
+    expect(extractInlineToolUse(text)).toEqual({ name: "Read", arguments: JSON.stringify({ file_path: "/a" }) });
+  });
+
+  it("accepts parameters as an alias for input", () => {
+    const text = '{"tool_use":{"name":"Read","parameters":{"file_path":"/a"}}}';
+    expect(extractInlineToolUse(text)).toEqual({ name: "Read", arguments: JSON.stringify({ file_path: "/a" }) });
+  });
+
+  // The scanner path and the first-fence fallback share one normalizer, so all
+  // four accepted argument shapes must resolve identically.
+  it("resolves every accepted argument shape to the same call", () => {
+    const expected = { name: "Bash", arguments: JSON.stringify({ command: "ls" }) };
+    for (const body of [
+      '{"name":"Bash","input":{"command":"ls"}}',
+      '{"name":"Bash","arguments":{"command":"ls"}}',
+      '{"name":"Bash","parameters":{"command":"ls"}}',
+      '{"name":"Bash","command":"ls"}',
+    ]) {
+      expect(extractInlineToolUse(`{"tool_use":${body}}`)).toEqual(expected);
+    }
+  });
+
+  // isKnownToolCall only checks DECLARED keys, so an empty envelope would let
+  // Bash({}) pass the gate and silently drop the model's real command.
+  it("prefers a populated sibling over an empty input envelope", () => {
+    const expected = { name: "Bash", arguments: JSON.stringify({ command: "ls" }) };
+    for (const body of [
+      '{"name":"Bash","input":{},"command":"ls"}',
+      '{"name":"Bash","input":{},"arguments":{"command":"ls"}}',
+      '{"name":"Bash","input":{},"parameters":{"command":"ls"}}',
+    ]) {
+      expect(extractInlineToolUse(`{"tool_use":${body}}`)).toEqual(expected);
+    }
+  });
+
+  // Without the validator the raw shape surfaces; with it, the call is rejected
+  // rather than executed empty.
+  it("never launder a non-object envelope into an empty call", () => {
+    for (const body of [
+      '{"name":"Bash","input":"{\\"command\\":\\"ls\\"}"}',
+      '{"name":"Bash","arguments":"{\\"command\\":\\"ls\\"}"}',
+    ]) {
+      expect(extractInlineToolUse(`{"tool_use":${body}}`, () => false)).toBeNull();
+      expect(extractInlineToolUse(`{"tool_use":${body}}`)?.arguments).not.toBe("{}");
+    }
   });
 });

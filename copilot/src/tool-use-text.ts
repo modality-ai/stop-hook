@@ -334,6 +334,27 @@ const FENCE_BLOCK = new RegExp(FENCE_MARK + "(?:json)?\\s*([\\s\\S]+?)" + FENCE_
 
 type ToolUseLiteral = { start: number; end: number; name: string; input: Record<string, any> };
 
+const isPlainObject = (v: any): boolean => !!v && typeof v === "object" && !Array.isArray(v);
+
+// Where a literal's arguments live: under `input`, or beside `name` in the
+// flattened form — {"tool_use":{"name":"Bash","command":"ls"}}. Also accepts
+// `arguments`/`parameters`. Only those four envelope keys are stripped: any other
+// sibling is treated as an argument, since a tool may legitimately declare a
+// parameter that shares a name with a transport key.
+//
+// Neither shape may run with {}: a populated sibling must beat an EMPTY envelope
+// ({"name":"Bash","input":{},"command":"ls"} still runs `ls`, not Bash()), and a
+// non-object candidate is returned UNTOUCHED rather than replaced by {} or by
+// `flat`, so the caller's validator still rejects it — a double-encoded
+// `arguments` string must never be laundered into an empty, accepted call.
+const normalizeLiteralInput = (tu: any): Record<string, any> => {
+  const { name: _n, input: _i, arguments: _a, parameters: _p, ...flat } = tu;
+  const candidates = [tu.input, tu.arguments, tu.parameters];
+  const nonObject = candidates.find((v) => v !== undefined && v !== null && !isPlainObject(v));
+  if (nonObject !== undefined) return nonObject;
+  return candidates.find((v) => isPlainObject(v) && Object.keys(v).length > 0) ?? flat;
+};
+
 /** Every complete tool_use literal in `text`, found with the string-aware scanner. */
 const parseToolUseLiterals = (text: string): ToolUseLiteral[] => {
   const out: ToolUseLiteral[] = [];
@@ -345,7 +366,7 @@ const parseToolUseLiterals = (text: string): ToolUseLiteral[] => {
     try {
       const tu = JSON.parse(text.slice(m.index, end + 1))?.tool_use;
       if (tu && typeof tu.name === "string" && tu.name) {
-        out.push({ start: m.index, end: end + 1, name: tu.name, input: tu.input ?? {} });
+        out.push({ start: m.index, end: end + 1, name: tu.name, input: normalizeLiteralInput(tu) });
         re.lastIndex = end + 1;
       }
     } catch {}
@@ -415,7 +436,7 @@ export const extractInlineToolUse = (
       const parsed = JSON.parse(candidate);
       const tu = parsed?.tool_use;
       if (tu && typeof tu.name === "string" && tu.name) {
-        const input = tu.input ?? {};
+        const input = normalizeLiteralInput(tu);
         // A rejected call falls through to the next candidate rather than
         // returning null: when the brace scanner stopped early, the longer
         // candidate is the retry.
