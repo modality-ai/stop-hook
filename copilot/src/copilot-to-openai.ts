@@ -27,7 +27,6 @@ import {
   type XmlToolSchemas,
 } from "./tool-use-text";
 import { aliasMapForTools, buildXmlToolSchemas, isKnownToolCall, normalizeTools, type NormalizedTool } from "./tool-schemas";
-import { resolveTurnToolCall } from "./bash-rescue";
 import { mergeAssistantFrame, shouldNudgeToolIntent, TOOL_NUDGE_PROMPT } from "./turn-content";
 import { imageUrlToAttachment, type BlobAttachment } from "./image-attachment";
 import type { CopilotSession } from "@github/copilot-sdk";
@@ -791,8 +790,6 @@ function sseOpenAIToolCallDelta(
   );
 }
 
-// Narration rescue lives in ./bash-rescue (testable without import-time side effects).
-
 function newToolCallId(): string {
   return `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -1010,8 +1007,8 @@ const enqueueTurn = (entry: SessionEntry, prompt: string, attachments?: BlobAtta
  * Nudge the model once for the tool_use literal it announced but never emitted,
  * then re-run the same extraction over its reply. `run` differs per caller so
  * the turn is serialised correctly on both the streaming and non-streaming
- * paths. Returns null when the nudge yields no call — a literal the validator
- * rejected is not rescued, the same gate the turn itself passes through.
+ * paths. Returns null when the nudge yields no call — the nudge reply passes the
+ * same validator gate as the turn, so a literal it rejects stays rejected.
  */
 const nudgeForToolCall = async (
   label: string,
@@ -1024,11 +1021,7 @@ const nudgeForToolCall = async (
   try {
     const nudged = await run(TOOL_NUDGE_PROMPT);
     const nudgedContent = canonicalizeToolUseText(tidyToolUseJson(xmlToolUseToJson(nudged, schemas)), tools);
-    const tu = resolveTurnToolCall(
-      nudgedContent,
-      extractInlineToolUse(nudgedContent, (name, input) => isKnownToolCall(name, input, schemas)),
-      tools
-    );
+    const tu = extractInlineToolUse(nudgedContent, (name, input) => isKnownToolCall(name, input, schemas));
     logger.log(`🔔 Nudge${label} ${tu ? "produced " + tu.name : "produced no call"}`);
     return tu;
   } catch (err: any) {
@@ -1178,9 +1171,9 @@ function sendAndStream(
               if (trimmed.includes('"tool_use"')) {
                 mode = "tool";
               } else if (!trimmed.startsWith("{") && !trimmed.startsWith("`") && trimmed.length > 0) {
-                // Clearly not a tool_use JSON — start streaming live. If the
-                // model is narrating tool intent ("I will run X"), the rescue
-                // path at turn_end still emits a tool_call alongside the text.
+                // Clearly not a tool_use JSON — start streaming live. A narration
+                // ("I will run X") reaches turn_end with no call; only the nudge
+                // there can still recover one, and it is additive to this text.
                 mode = "text";
                 flushText(fullContent, flushBoundary(fullContent));
               }
@@ -1232,13 +1225,7 @@ function sendAndStream(
     // extraction but loses surrounding prose. When no call is extracted, the text
     // handed on must be the untrimmed original so the upstream proxy can salvage it.
     const fullText = canonicalizeToolUseText(normalized, tools);
-    // A tool_use literal the validator rejected must not be rescued into a Bash
-    // call scraped from the surrounding prose — that would bypass the gate.
-    let tu = resolveTurnToolCall(
-      content,
-      extractInlineToolUse(content, (name, input) => isKnownToolCall(name, input, schemas)),
-      tools
-    );
+    let tu = extractInlineToolUse(content, (name, input) => isKnownToolCall(name, input, schemas));
 
     // GPT models often announce a tool action ("I'll inspect the file") and end the
     // turn with no call. Nudge once on the same session; the announcement prose is
@@ -1518,9 +1505,7 @@ async function completionsHandler(c: Context) {
     const schemas = buildXmlToolSchemas(effectiveTools);
     const { content, fullText, truncated } = await sendAndCollect(entry, effectivePrompt, attachments, effectiveTools, schemas);
     const inline = extractInlineToolUse(content, (name, input) => isKnownToolCall(name, input, schemas));
-    // A tool_use literal the validator rejected must not be rescued into a Bash
-    // call scraped from the surrounding prose — that would bypass the gate.
-    let tu = resolveTurnToolCall(content, inline, effectiveTools);
+    let tu = inline;
     if (shouldNudgeToolIntent({ hasCall: !!tu, truncated, tools: effectiveTools, content })) {
       // NOT inside the queue here — sendAndCollect released its slot — so the
       // nudge must re-enter it, or a concurrent request could run a turn

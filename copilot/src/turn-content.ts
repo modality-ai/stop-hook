@@ -2,16 +2,11 @@
 // Pure per-turn content decisions for the Copilot proxy — no fs, no network, no
 // module-level mutable state.
 //
-// Extracted from copilot-to-openai for the same reason bash-rescue and
-// tool-use-text were: that module runs `tryMkdir` + `setClientCwd` at import
-// time, so decisions buried inside it cannot be tested without booting the
-// server. Both frame rules below were duplicated across two call sites apiece.
-//
-// The nudge classifier lives here too: it never scrapes a shell command, so it
-// is not bash rescue — it only reuses the narration classifier from there.
+// Extracted from copilot-to-openai for the same reason tool-use-text was: that
+// module runs `tryMkdir` + `setClientCwd` at import time, so decisions buried
+// inside it cannot be tested without booting the server. Both frame rules below
+// were duplicated across two call sites apiece.
 // ─────────────────────────────────────────────────────────────
-
-import { isNarratingToolIntent } from "./bash-rescue";
 
 /**
  * Fold one `assistant.message` frame into the turn's accumulated content.
@@ -28,11 +23,20 @@ export const mergeAssistantFrame = (current: string, incoming: string | undefine
   return current;
 };
 
-// Broader than bash-rescue's NARRATION_PATTERNS: models narrate with verbs like
-// "inspect" or "read" ("I'll inspect the file") and then end the turn with no
-// call at all. Used only to decide whether to nudge once.
+// Models narrate a tool action ("I'll inspect the file", "Proceeding to run the
+// tests") and then end the turn with no call at all. Used only to decide whether
+// to nudge once. The nudge never scrapes a shell command — it only asks for the
+// literal again — so this classifier stays wide even though the prose-scraping
+// rescue it once shared patterns with is gone.
 const NUDGE_PATTERNS = [
-  /\b(?:I'll|I will|I am going to|I'm going to|Let me|I need to|I should)\s+(?:now |then |first |next |also |quickly )?(?:inspect|read|open|check|look|examine|search|grep|find|review|verify|view|list|scan|fetch|run|call|use|execute|gather)\b/i,
+  /\b(?:I'll|I will|I am going to|I'm going to|I am about to|I must|Let me|I need to|I should)\s+(?:now |then |first |next |also |quickly )?(?:inspect|read|open|check|look|examine|search|grep|find|review|verify|view|list|scan|fetch|run|call|use|execute|gather|invoke|issue|collect)\b/i,
+  // Narrations with no first-person verb of their own: a discourse marker
+  // ("Next, I run the build") or a gerund ("Proceeding to run the tests",
+  // "Running the following commands:"). All three are common in tool-calling
+  // prose, so they carry their own entries.
+  /\b(?:Next|Then|First),?\s+(?:I|let me|I'll|I will)\s+(?:run|call|execute|invoke|use)\b/i,
+  /\bProceeding to (?:run|call|execute|gather|collect|fetch)\b/i,
+  /\bRunning the (?:following |required |next )?(?:commands?|use-\w+)\b/i,
   // A false capability refusal: "I don't have access to that local path ...
   // please paste the file" — although Read is listed in Available tools.
   /\b(?:I (?:can(?:no|['’])t|don['’]?t have|do not have|am unable to)|unable to|no (?:filesystem|file|tool))\b[^.\n]{0,60}\b(?:access|read|open|view|tool)\b/i,
@@ -46,7 +50,7 @@ const NUDGE_PATTERNS = [
 export const isUnfulfilledToolIntent = (content: string): boolean => {
   const t = content?.trim();
   if (!t || t.includes('"tool_use"')) return false;
-  return NUDGE_PATTERNS.some((re) => re.test(t)) || isNarratingToolIntent(t);
+  return NUDGE_PATTERNS.some((re) => re.test(t));
 };
 
 export const TOOL_NUDGE_PROMPT =

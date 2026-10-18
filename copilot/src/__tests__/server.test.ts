@@ -1,6 +1,7 @@
 import { describe, test, expect, mock, beforeEach } from "bun:test";
 import { createHmac } from "crypto";
 import { formatTokenPrice } from "../copilot-to-openai";
+import { TOOL_NUDGE_PROMPT } from "../turn-content";
 
 const signSyntheticToolId = (baseId: string, secret: string) =>
   `${baseId}_${createHmac("sha256", secret).update(baseId).digest("hex").slice(0, 16)}`;
@@ -664,6 +665,78 @@ describe("server.ts", () => {
       // Nested "name":"read" is an argument value — must NOT be rewritten to "Read".
       expect(data.choices[0].message.tool_calls[0].function.arguments).toBe('{"name":"read","command":"ls"}');
       expect(data.choices[0].finish_reason).toBe("tool_calls");
+    });
+
+    // Regression for the bash-rescue removal. This turn narrates a runnable
+    // shell command in prose and emits no tool_use literal. The proxy used to
+    // scrape "bun test --watch" out of that narration and return it as a Bash
+    // call — executing text lifted from model prose. It must now end the turn
+    // as plain content instead.
+    test("never converts a narrated shell command into a Bash call", async () => {
+      mockInitSession.mockClear();
+      const FENCE = "```";
+      const narration = "Proceeding to run the tests\n\n" + FENCE + "bash\nbun test --watch\n" + FENCE;
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          handler({ type: "assistant.message", data: { content: narration } });
+          handler({ type: "assistant.turn_end", data: {} });
+        }, 0);
+        return () => {};
+      });
+
+      const res = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "run the tests" }],
+        // Bash is offered: the removed rescue fired only when Bash was available,
+        // so this is the exact condition that used to produce a call.
+        tools: [{ name: "Bash", description: "Run shell command", input_schema: { type: "object" } }],
+      }, { "x-session-id": "no-narration-rescue-test" }));
+
+      const data = await res.json() as any;
+      expect(res.status).toBe(200);
+      expect(data.choices[0].message.tool_calls).toBeUndefined();
+      expect(data.choices[0].finish_reason).toBe("stop");
+    });
+
+    // The other half of that boundary, and the reason the removal must not
+    // narrow the classifier: a narration that still matches gets exactly one
+    // nudge, and the literal it asks for comes back as the call. Without this
+    // the positive direction is untested on the request path — only the
+    // negative one above is.
+    test("nudges once for a narrated tool action and returns the recovered call", async () => {
+      mockInitSession.mockClear();
+      mockSend.mockClear();
+      const prompts: string[] = [];
+      mockSend.mockImplementation(async (args: any) => { prompts.push(args?.prompt ?? ""); });
+
+      const narration = "I'll inspect the file to verify the path.";
+      const literal = '{"tool_use":{"name":"Read","input":{"file_path":"/tmp/x"}}}';
+      // One turn per `session.on` registration: narrated first, literal in the
+      // nudge reply.
+      let turns = 0;
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          const first = turns++ === 0;
+          handler({ type: "assistant.message", data: { content: first ? narration : literal } });
+          handler({ type: "assistant.turn_end", data: {} });
+        }, 0);
+        return () => {};
+      });
+
+      const res = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "check the file" }],
+        tools: [{ name: "Read", description: "Read a file", input_schema: { type: "object" } }],
+      }, { "x-session-id": "nudge-recovery-test" }));
+
+      const data = await res.json() as any;
+      expect(res.status).toBe(200);
+      expect(data.choices[0].finish_reason).toBe("tool_calls");
+      expect(data.choices[0].message.tool_calls[0].function.name).toBe("Read");
+      expect(data.choices[0].message.tool_calls[0].function.arguments).toBe('{"file_path":"/tmp/x"}');
+      // Two sends: the narrated turn, then the nudge prompt.
+      expect(prompts.length).toBe(2);
+      expect(prompts[1]).toBe(TOOL_NUDGE_PROMPT);
     });
 
     test("canonicalizes shortened MCP tool names split across streamed deltas", async () => {

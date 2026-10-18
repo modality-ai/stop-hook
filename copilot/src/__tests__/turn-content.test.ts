@@ -116,3 +116,38 @@ describe("isUnfulfilledToolIntent refusal variants", () => {
     expect(isUnfulfilledToolIntent("I'm unable to read that path.")).toBe(true);
   });
 });
+
+// ─── Classifier boundary after the bash-rescue removal ───────────────────────
+// turn-content no longer delegates narration detection to the now-deleted
+// bash-rescue module, so NUDGE_PATTERNS is the sole classifier. Only the
+// scrape-and-execute half of that module was the hazard — a nudge never runs
+// prose, it asks for the literal again — so the classifier keeps the union's
+// full coverage: every shape below matched the old union, and must still match.
+
+describe("isUnfulfilledToolIntent narration shapes", () => {
+  // `must` / `am about to`, the invoke/issue/collect verbs, and the Next- /
+  // Proceeding to- / "Running the following" openers came from the deleted
+  // NARRATION_PATTERNS; the rest were already here. Losing these cost recovery
+  // on common tool-calling prose for no security gain.
+  const NUDGES = [
+    "I will now run the tests",
+    "Let me gather the data",
+    "I'll inspect the file",
+    "I will read the file",
+    "I must run the tests",
+    "I am about to run the tests",
+    "I will invoke the CLI",
+    "I will issue the command now",
+    "I need to collect the output",
+    "Proceeding to run the tests",
+    "Running the following commands:",
+    "Next, I run the build",
+    "Then I execute the script",
+  ];
+
+  for (const shape of NUDGES) {
+    test(`nudges: ${JSON.stringify(shape)}`, () => {
+      expect(isUnfulfilledToolIntent(shape)).toBe(true);
+    });
+  }
+});
