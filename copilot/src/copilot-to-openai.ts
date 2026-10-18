@@ -1506,7 +1506,7 @@ async function completionsHandler(c: Context) {
     const { content, fullText, truncated } = await sendAndCollect(entry, effectivePrompt, attachments, effectiveTools, schemas);
     const inline = extractInlineToolUse(content, (name, input) => isKnownToolCall(name, input, schemas));
     let tu = inline;
-    if (shouldNudgeToolIntent({ hasCall: !!tu, truncated, tools: effectiveTools, content })) {
+    if (shouldNudgeToolIntent({ hasCall: !!inline, truncated, tools: effectiveTools, content })) {
       // NOT inside the queue here — sendAndCollect released its slot — so the
       // nudge must re-enter it, or a concurrent request could run a turn
       // alongside this one on the same session.

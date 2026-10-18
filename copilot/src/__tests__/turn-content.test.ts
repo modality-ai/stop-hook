@@ -143,6 +143,14 @@ describe("isUnfulfilledToolIntent narration shapes", () => {
     "Running the following commands:",
     "Next, I run the build",
     "Then I execute the script",
+    "Next, I invoke the CLI",
+    "Then I call the API",
+    "First, I use the search tool",
+    "Proceeding to collect the output",
+    "Proceeding to fetch the data",
+    "Proceeding to gather the logs",
+    "Running the required commands",
+    "Running the next commands",
   ];
 
   for (const shape of NUDGES) {
@@ -150,4 +158,20 @@ describe("isUnfulfilledToolIntent narration shapes", () => {
       expect(isUnfulfilledToolIntent(shape)).toBe(true);
     });
   }
+});
+
+// The new openers end in \b: a verb that is only a prefix of a longer word
+// must not count as a verb.
+describe("isUnfulfilledToolIntent new opener boundaries", () => {
+  test("does not nudge when a verb is only a prefix of a longer word", () => {
+    expect(isUnfulfilledToolIntent("Proceeding to runtime checks")).toBe(false);
+  });
+
+  test("does not nudge a completed report that starts with Running", () => {
+    expect(isUnfulfilledToolIntent("Running the tests passed")).toBe(false);
+  });
+
+  test("still ignores a narration that already carries a tool_use literal", () => {
+    expect(isUnfulfilledToolIntent('Next, I run the build {"tool_use":{"name":"Bash","input":{}}}')).toBe(false);
+  });
 });
