@@ -93,10 +93,10 @@ export const normalizeTool = (tool: any): NormalizedTool | null => {
 };
 
 // Tool lists are treated as immutable (mergeTools always builds a fresh array),
-// so a per-array cache collapses work that otherwise repeats per turn:
-// buildToolSystemPrefix, buildXmlToolSchemas and aliasMapForTools all receive the
-// SAME array, and each was re-running softenAggressiveTrigger — a dozen regexes —
-// over every tool description.
+// so a per-array cache collapses work that otherwise repeats per turn: the
+// native SDK declaration, buildXmlToolSchemas and aliasMapForTools all receive
+// the SAME array, and each was re-running softenAggressiveTrigger — a dozen
+// regexes — over every tool description.
 const normalizedToolsCache = new WeakMap<any[], NormalizedTool[]>();
 
 export const normalizeTools = (tools?: any[]): NormalizedTool[] => {

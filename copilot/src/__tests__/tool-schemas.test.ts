@@ -209,9 +209,45 @@ describe("isKnownToolCall", () => {
 });
 
 describe("buildXmlToolSchemas → xmlToolUseToJson integration", () => {
-  it("rejects a call to a tool the schema does not know", () => {
+  it("still converts a call to a tool the schema does not know", () => {
+    // The model wrote the call; the client owns tool validation. Returning the
+    // markup would make the client print it rather than execute anything. The
+    // unresolved tool's parameters stay verbatim — there is no type to coerce by.
     const text = '<invoke name="Nope"><parameter name="x">1</parameter></invoke>';
-    expect(xmlToolUseToJson(text, bashSchemas({ command: { type: "string" } }))).toBe(text);
+    expect(JSON.parse(xmlToolUseToJson(text, bashSchemas({ command: { type: "string" } }))).tool_use).toEqual({
+      name: "Nope",
+      input: { x: "1" },
+    });
+  });
+
+  it("converts a Claude Code Grep call whose params the client schema does not declare", () => {
+    // Regression: an opencode-style `grep` declares only pattern/path/include.
+    // Claude Code's `output_mode` / `-n` are extra, and used to make the whole
+    // call fall back to raw XML.
+    const schemas = buildXmlToolSchemas([
+      anthropicTool("grep", {
+        pattern: { type: "string" },
+        path: { type: "string" },
+        include: { type: "string" },
+      }),
+    ]);
+    const text = [
+      '<invoke name="Grep">',
+      '<parameter name="pattern">buildSessionHeaders\\(</parameter>',
+      '<parameter name="path">/src</parameter>',
+      '<parameter name="output_mode">content</parameter>',
+      '<parameter name="-n">true</parameter>',
+      "</invoke>",
+    ].join("\n");
+    expect(JSON.parse(xmlToolUseToJson(text, schemas)).tool_use).toEqual({
+      name: "grep",
+      input: {
+        pattern: "buildSessionHeaders\\(",
+        path: "/src",
+        output_mode: "content",
+        "-n": true,
+      },
+    });
   });
 
   it("resolves a lowercase invoke name to the canonical schema key", () => {
@@ -232,9 +268,12 @@ describe("buildXmlToolSchemas → xmlToolUseToJson integration", () => {
     expect(JSON.parse(xmlToolUseToJson(text, schemas)).tool_use.input).toEqual({ timeout: 5000 });
   });
 
-  it("rejects a parameter the schema does not declare", () => {
+  it("keeps a parameter the schema does not declare", () => {
     const text = '<invoke name="Bash"><parameter name="bogus">ls</parameter></invoke>';
-    expect(xmlToolUseToJson(text, bashSchemas({ command: { type: "string" } }))).toBe(text);
+    expect(JSON.parse(xmlToolUseToJson(text, bashSchemas({ command: { type: "string" } }))).tool_use).toEqual({
+      name: "Bash",
+      input: { bogus: "ls" },
+    });
   });
 
   it("stays lenient when a tool declares no properties", () => {

@@ -55,7 +55,7 @@ $ copilot-loop --resume abc123def456
 
 Use specific model and reasoning with custom timeout:
 ```bash
-$ copilot-loop --model gpt-5-mini --think high --timeout 3600 -p "Optimize this code"
+$ copilot-loop --model claude-haiku-4.5 --think high --timeout 3600 -p "Optimize this code"
 ```
 
 Enable debug mode with persona deployment:
@@ -71,7 +71,7 @@ mcpServers:
     url: http://localhost:3000/mcp
     tools: ["*"]
 
-model: "gpt-5-mini"
+model: "claude-haiku-4.5"
 reasoningEffort: "high"
 max-iterations: 5
 timeout: 3600

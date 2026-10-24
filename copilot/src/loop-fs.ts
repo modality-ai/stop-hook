@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, appendFileSync } from "fs";
+import { appendFileSync, mkdirSync, readdirSync, unlinkSync, writeFileSync } from "fs";
 
 // ─────────────────────────────────────────────────────────────
 // Durable-write helpers for directories that live under /tmp.
@@ -65,4 +65,32 @@ export const createLoopFs = (dir: string): LoopFs => {
     writeFile: (filePath: string, data: string) => withRetry(() => writeFileSync(filePath, data)),
     appendFile: (filePath: string, data: string) => withRetry(() => appendFileSync(filePath, data)),
   };
+};
+
+/** Names of files directly inside `dir`, or [] when it cannot be read. */
+export const listFiles = (dir: string): string[] => {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+};
+
+/** Remove `filePath`. Returns false when it was already gone or unreadable. */
+export const removeFile = (filePath: string): boolean => {
+  try {
+    unlinkSync(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Files named `<prefix>-*.json` that overflow `keep`, oldest first.
+ * Dump names embed Date.now(), so a lexical sort is chronological.
+ */
+export const staleDumps = (files: string[], prefix: string, keep: number): string[] => {
+  const matching = files.filter((f) => f.startsWith(`${prefix}-`) && f.endsWith(".json")).sort();
+  return matching.slice(0, Math.max(0, matching.length - keep));
 };

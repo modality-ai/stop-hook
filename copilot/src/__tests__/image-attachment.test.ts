@@ -1,4 +1,4 @@
-import { describe, test, expect, mock, afterEach } from "bun:test";
+import { describe, test, expect, afterEach } from "bun:test";
 
 // Import the REAL implementation — some image-attachment tests need network
 // access, so remote-URL cases stub globalThis.fetch; data-URL cases touch no

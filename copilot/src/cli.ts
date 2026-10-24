@@ -121,7 +121,7 @@ Examples:
   $ copilot-loop --resume abc123def456
 
   # Use specific model and reasoning effort
-  $ copilot-loop --model gpt-5-mini --think high -p "Optimize this code"
+  $ copilot-loop --model claude-haiku-4.5 --think high -p "Optimize this code"
 
   # Set max iterations and completion promise
   $ copilot-loop config.yaml --max 10 --promise "Task completed"

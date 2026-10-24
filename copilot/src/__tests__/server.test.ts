@@ -1,6 +1,6 @@
 import { describe, test, expect, mock, beforeEach } from "bun:test";
 import { createHmac } from "crypto";
-import { formatTokenPrice } from "../copilot-to-openai";
+import { completionFrames, formatTokenPrice, streamCompletion } from "../copilot-to-openai";
 import { TOOL_NUDGE_PROMPT } from "../turn-content";
 
 const signSyntheticToolId = (baseId: string, secret: string) =>
@@ -10,6 +10,7 @@ const signSyntheticToolId = (baseId: string, secret: string) =>
 const mockSend = mock(async (_args?: any) => {});
 const mockOn = mock((_handler: any) => (() => {}) as () => void);
 const mockSetModel = mock(async (_model: string, _opts?: any) => {});
+const mockHandlePendingToolCall = mock(async (_args: { requestId: string; result?: string; error?: string }) => {});
 const mockListModels = mock(async () => [
   {
     id: "claude-sonnet-4.6",
@@ -23,14 +24,20 @@ const mockListModels = mock(async () => [
     billing: { tokenPrices: { inputPrice: 25, outputPrice: 200, cachePrice: 0, batchSize: 1000000 } },
   },
 ]);
-const mockInitSession = mock(async (_prompt: string, _opts: any) => ({
-  session: {
-    send: mockSend,
-    on: mockOn,
-    setModel: mockSetModel,
-  },
-  resumed: false,
-}));
+// Session shape is `any` so individual tests can override this mock with the
+// minimal session their case needs.
+const mockInitSession = mock(
+  async (_prompt: string, _opts: any): Promise<{ session: any; resumed: boolean }> => ({
+    session: {
+      send: mockSend,
+      on: mockOn,
+      setModel: mockSetModel,
+      // Native tool mode answers SDK tool requests through this RPC.
+      rpc: { tools: { handlePendingToolCall: mockHandlePendingToolCall } },
+    },
+    resumed: false,
+  })
+);
 
 mock.module("../copilot-core", () => ({
   client: { listModels: mockListModels, start: mock(async () => {}) },
@@ -303,8 +310,8 @@ describe("server.ts", () => {
       expect(res.headers.get("content-type")).toContain("text/event-stream");
 
       const text = await res.text();
-      expect(text).toContain('"content":"Hello"');
-      expect(text).toContain('"content":" world"');
+      // Native legs resolve whole, so the reply arrives as one content frame.
+      expect(text).toContain('"content":"Hello world"');
       expect(text).toContain('"finish_reason":"stop"');
       expect(text).toContain("[DONE]");
     });
@@ -584,14 +591,14 @@ describe("server.ts", () => {
         ],
       }, { "x-session-id": "missing-tools-fallthrough-test" }));
 
-      const data = await res.json() as any;
+      await res.json();
       expect(res.status).toBe(200);
       // Falls through to the model — session is created and send is called (no hang)
       expect(mockInitSession).toHaveBeenCalled();
       expect(mockSend).toHaveBeenCalled();
     });
 
-    test("passes denyAllTools and tool schema prefix when tools[] provided", async () => {
+    test("passes denyAllTools and native externalTools when tools[] provided", async () => {
       mockInitSession.mockClear();
       mockOn.mockImplementation((handler: any) => {
         setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
@@ -605,12 +612,29 @@ describe("server.ts", () => {
       }, { "x-session-id": "deny-all-tools-test" }));
 
       const [prompt, opts] = mockInitSession.mock.calls[0];
-      expect(opts).toEqual({ denyAllTools: true, systemPromptMode: "replace", model: "gpt-5-mini", sessionId: "deny-all-tools-test" });
-      expect(prompt).toContain("mcp__WebSearch___search");
-      expect(prompt).toContain("tool_use");
-      expect(prompt).toContain("ALWAYS emit FORM A");
-      expect(prompt).toContain("no available tool matches, emit FORM B");
-      expect(prompt).toContain("Never shorten MCP tool names");
+      expect(opts).toEqual({
+        denyAllTools: true,
+        // The SDK's default prompt describes built-ins this session cannot
+        // expose, so server mode replaces it when tools are declared.
+        systemPromptMode: "replace",
+        model: "gpt-5-mini",
+        sessionId: "deny-all-tools-test",
+        externalTools: [
+          {
+            name: "mcp__WebSearch___search",
+            description: "web search",
+            parameters: { type: "object" },
+            skipPermission: true,
+            // Always pre-loaded: deferral would hide tools behind the built-in
+            // tool_search_tool, which server mode suppresses.
+            defer: "never",
+          },
+        ],
+      });
+      // Tools are declared natively, so no inline-JSON catalog is injected —
+      // only the short server-mode framing that replaces the default prompt.
+      expect(prompt).toContain("executed by the client application");
+      expect(prompt).not.toContain("tool_use");
     });
 
     test("canonicalizes shortened MCP tool names in collected JSON", async () => {
@@ -785,8 +809,8 @@ describe("server.ts", () => {
       const text = await res.text();
       expect(text).toContain('"function":{"name":"Bash","arguments":"{\\"command\\":\\"ls -la\\"}"}');
       expect(text).toContain('"finish_reason":"tool_calls"');
-      // Prose before the markup still streams; the markup itself never does.
-      expect(text).toContain("TARGET: Access the file");
+      // Native legs resolve whole: a salvaged call replaces the turn, and the
+      // markup itself is never streamed as text.
       expect(text).not.toContain("invoke");
       expect(text).not.toContain("parameter");
     });
@@ -821,6 +845,103 @@ describe("server.ts", () => {
         limit: 100,
       });
       expect(data.choices[0].finish_reason).toBe("tool_calls");
+    });
+
+    test("native round trip: answers a parked external call on the next request", async () => {
+      mockInitSession.mockClear();
+      mockHandlePendingToolCall.mockClear();
+      let legs = 0;
+      mockOn.mockImplementation((handler: any) => {
+        legs++;
+        setTimeout(() => {
+          if (legs === 1) {
+            // The model asks to call a client tool; the runtime parks the call
+            // until we answer it through handlePendingToolCall.
+            handler({
+              type: "external_tool.requested",
+              data: { requestId: "req-1", toolCallId: "call_1", toolName: "mcp__Counter___Counter__Deploy", arguments: {} },
+            });
+            handler({ type: "session.idle", data: {} });
+          } else {
+            handler({ type: "assistant.message_delta", data: { deltaContent: "deployed" } });
+            handler({ type: "session.idle", data: {} });
+          }
+        }, 0);
+        return () => {};
+      });
+
+      const tools = [
+        { name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } },
+      ];
+
+      const first = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "deploy SARAH" }],
+        tools,
+      }, { "x-session-id": "native-round-trip-test" }));
+      const firstData = await first.json() as any;
+      expect(firstData.choices[0].message.tool_calls[0].id).toBe("call_1");
+      expect(firstData.choices[0].finish_reason).toBe("tool_calls");
+
+      // The client runs the tool and sends its result back as a role:"tool"
+      // message — that answer is what resumes the parked turn.
+      const second = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        tools,
+        messages: [
+          { role: "user", content: "deploy SARAH" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [{ id: "call_1", type: "function", function: { name: "mcp__Counter___Counter__Deploy", arguments: "{}" } }],
+          },
+          { role: "tool", tool_call_id: "call_1", content: "deployed" },
+        ],
+      }, { "x-session-id": "native-round-trip-test" }));
+
+      expect(mockHandlePendingToolCall).toHaveBeenCalledWith({ requestId: "req-1", result: "deployed" });
+      const secondData = await second.json() as any;
+      expect(secondData.choices[0].message.content).toBe("deployed");
+      expect(secondData.choices[0].finish_reason).toBe("stop");
+    });
+
+    test("native mode answers parked calls with an error before a new prompt", async () => {
+      mockInitSession.mockClear();
+      mockHandlePendingToolCall.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          handler({
+            type: "external_tool.requested",
+            data: { requestId: "req-abandon", toolCallId: "call_abandon", toolName: "Bash", arguments: {} },
+          });
+          handler({ type: "session.idle", data: {} });
+        }, 0);
+        return () => {};
+      });
+
+      const tools = [{ name: "Bash", description: "Run shell command", input_schema: { type: "object" } }];
+
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "run it" }],
+        tools,
+      }, { "x-session-id": "native-abandon-test" }));
+
+      // A brand-new prompt (no tool result) means the client gave up on the
+      // parked call; sending into a turn still waiting on it would wedge the
+      // session, so it is answered with an error first.
+      mockSend.mockClear();
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "never mind" }],
+        tools,
+      }, { "x-session-id": "native-abandon-test" }));
+
+      expect(mockHandlePendingToolCall).toHaveBeenCalledWith({
+        requestId: "req-abandon",
+        error: expect.any(String),
+      });
+      expect(mockSend).toHaveBeenCalled();
     });
 
     test("reuses remembered tools to canonicalize later turns without tools[]", async () => {
@@ -873,14 +994,12 @@ describe("server.ts", () => {
         ],
       }, { "x-session-id": "filter-non-mcp-test" }));
 
-      const [prompt] = mockInitSession.mock.calls[0];
-      // MCP tool present, router built-ins filtered out
-      expect(prompt).toContain("mcp__Counter___Counter__Deploy");
-      expect(prompt).not.toContain("name: Skill");
-      expect(prompt).not.toContain("name: Agent");
+      const [, opts] = mockInitSession.mock.calls[0];
+      // MCP tool declared natively, router built-ins filtered out
+      expect(opts.externalTools.map((t: any) => t.name)).toEqual(["mcp__Counter___Counter__Deploy"]);
     });
 
-    test("when only non-MCP tools provided, treats as no-tools (no system prefix)", async () => {
+    test("when only non-MCP tools provided, treats as no-tools (no native declarations)", async () => {
       mockInitSession.mockClear();
       mockOn.mockImplementation((handler: any) => {
         setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
@@ -897,8 +1016,8 @@ describe("server.ts", () => {
       }, { "x-session-id": "all-non-mcp-test" }));
 
       const [prompt, opts] = mockInitSession.mock.calls[0];
-      // All filtered → empty tools[] → no tool_use system prefix, but denyAllTools
-      // is still set so the SDK doesn't expose its built-in tools to the model.
+      // All filtered → empty tools[] → no externalTools declaration, but
+      // denyAllTools is still set so the SDK doesn't expose its built-ins.
       expect(opts).toEqual({ denyAllTools: true, model: "gpt-5-mini", sessionId: "all-non-mcp-test" });
       expect(prompt).toBe("");
     });
@@ -924,11 +1043,11 @@ describe("server.ts", () => {
 
       // Session is reused — initSession was called ONCE total, not per-request.
       // This preserves the model's conversation memory across turns. The first
-      // request's tool set is the one baked into the session prompt; later
+      // request's tool set is the one declared to the session; later
       // additions don't trigger a re-init (which would clobber context).
       expect(mockInitSession).toHaveBeenCalledTimes(1);
-      const [prompt] = mockInitSession.mock.calls[0];
-      expect(prompt).toContain("mcp__Counter___Counter__Deploy");
+      const [, opts] = mockInitSession.mock.calls[0];
+      expect(opts.externalTools.map((t: any) => t.name)).toEqual(["mcp__Counter___Counter__Deploy"]);
     });
 
     test("server-wide registry canonicalizes short names across different sessions", async () => {
@@ -1418,10 +1537,9 @@ describe("server.ts", () => {
       });
 
       test("stream: a turn with content resets the empty-turn strike count", async () => {
-        // The stream path counts strikes at its OWN call site in sendAndStream,
-        // so the reset proven non-stream above must hold here too: empty →
-        // content → empty must leave one strike, not two (which would discard a
-        // healthy session).
+        // Stream and non-stream share one native leg, so the reset proven
+        // non-stream above must hold here too: empty → content → empty must
+        // leave one strike, not two (which would discard a healthy session).
         const before = mockInitSession.mock.calls.length;
         const send = () => fetchApp(post("/v1/chat/completions",
           { model: "gpt-5-mini", stream: true, messages: [{ role: "user", content: "hi" }] },
@@ -1521,5 +1639,175 @@ describe("server.ts", () => {
         expect(mockInitSession.mock.calls.length).toBe(before + 2);
       });
     });
+  });
+});
+
+// ─── Native stream framing ────────────────────────────────────────────────────
+// A native leg resolves as a whole, so the streaming route replays the finished
+// completion as SSE frames instead of forwarding deltas. Every path — success,
+// empty, or failed — must end with exactly one finish_reason frame and exactly
+// one [DONE]; a stream that stops without them looks like a clean finish.
+describe("native stream framing", () => {
+  const asText = (frame: Uint8Array) => new TextDecoder().decode(frame);
+  const framesOf = (completion: any) => completionFrames(completion).map(asText);
+  const completion = (message: any, finish_reason: string) => ({
+    id: "chatcmpl-test",
+    model: "m",
+    choices: [{ index: 0, message, finish_reason }],
+  });
+
+  test("replays a tool-call completion as one indexed delta", () => {
+    const frames = framesOf(
+      completion(
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            { id: "call_1", type: "function", function: { name: "Bash", arguments: "{}" } },
+            { id: "call_2", type: "function", function: { name: "Read", arguments: "{}" } },
+          ],
+        },
+        "tool_calls"
+      )
+    );
+
+    const delta = JSON.parse(frames[0].replace(/^data: /, ""));
+    expect(delta.choices[0].delta.tool_calls.map((c: any) => c.index)).toEqual([0, 1]);
+    expect(delta.choices[0].delta.tool_calls[0].function.name).toBe("Bash");
+    expect(delta.choices[0].finish_reason).toBeNull();
+    expect(frames[1]).toContain('"finish_reason":"tool_calls"');
+    expect(frames[2]).toBe("data: [DONE]\n\n");
+    expect(frames).toHaveLength(3);
+  });
+
+  test("replays text as a single content delta", () => {
+    const frames = framesOf(completion({ role: "assistant", content: "hello" }, "stop"));
+
+    expect(frames[0]).toContain('"content":"hello"');
+    expect(frames[1]).toContain('"finish_reason":"stop"');
+    expect(frames[2]).toBe("data: [DONE]\n\n");
+  });
+
+  test("emits no content frame for an empty completion but still terminates", () => {
+    const frames = framesOf(completion({ role: "assistant", content: "" }, "stop"));
+
+    expect(frames).toHaveLength(2);
+    expect(frames[0]).toContain('"finish_reason":"stop"');
+    expect(frames[1]).toBe("data: [DONE]\n\n");
+  });
+
+  test("passes a length finish through so the client can retry", () => {
+    const frames = framesOf(completion({ role: "assistant", content: "cut" }, "length"));
+
+    expect(frames.some((f) => f.includes('"finish_reason":"length"'))).toBe(true);
+  });
+
+  async function drain(stream: ReadableStream<Uint8Array>): Promise<string[]> {
+    const reader = stream.getReader();
+    const out: string[] = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return out;
+      out.push(asText(value));
+    }
+  }
+
+  test("a failed leg still ends with finish_reason length and [DONE]", async () => {
+    const frames = await drain(streamCompletion(Promise.reject(new Error("boom")), "chatcmpl-x", "m"));
+
+    expect(frames).toHaveLength(2);
+    expect(frames[0]).toContain('"finish_reason":"length"');
+    expect(frames[1]).toBe("data: [DONE]\n\n");
+  });
+
+  test("a successful leg replays its frames and then closes", async () => {
+    const frames = await drain(
+      streamCompletion(Promise.resolve(completion({ role: "assistant", content: "ok" }, "stop")), "chatcmpl-x", "m")
+    );
+
+    expect(frames.at(-1)).toBe("data: [DONE]\n\n");
+    expect(frames.join("")).toContain('"content":"ok"');
+  });
+
+  test("a cancelled consumer aborts the leg", async () => {
+    // The client is gone: the leg must resolve (not keep a turn open) so its
+    // calls are refused instead of parked for a response nobody will read.
+    let cancelled = 0;
+    const stream = streamCompletion(new Promise(() => {}), "chatcmpl-x", "m", () => cancelled++);
+    const reader = stream.getReader();
+    void reader.read(); // pending until the leg resolves
+    await reader.cancel();
+
+    expect(cancelled).toBe(1);
+  });
+});
+
+// ─── Native session state isolation ──────────────────────────────────────────
+// Parked calls belong to the entry that parked them. A session recreated after
+// invalidation must start empty: inheriting the dropped entry's map would let a
+// stale tool_call_id be answered on a turn that never issued it.
+describe("native session state isolation", () => {
+  beforeEach(async () => {
+    if (!fetchApp) {
+      const mod = await import("../server");
+      fetchApp = (mod.default as any).fetch as (req: Request) => Promise<Response>;
+    }
+  });
+
+  test("a recreated session does not inherit the dropped entry's parked calls", async () => {
+    mockInitSession.mockClear();
+    mockSend.mockClear();
+    mockHandlePendingToolCall.mockClear();
+
+    const tools = [{ name: "Bash", description: "run", input_schema: { type: "object" } }];
+    let turn = 0;
+    mockOn.mockImplementation((handler: any) => {
+      const mine = turn++;
+      setTimeout(() => {
+        if (mine === 0) {
+          // Park a call, then kill the session before the quiet window flushes it.
+          handler({
+            type: "external_tool.requested",
+            data: { requestId: "req-old", toolCallId: "call_old", toolName: "Bash", arguments: {} },
+          });
+          handler({ type: "session.error", data: { message: "transport gone" } });
+        } else {
+          handler({ type: "assistant.message_delta", data: { deltaContent: "ok" } });
+          handler({ type: "session.idle", data: {} });
+        }
+      }, 0);
+      return () => {};
+    });
+
+    // Turn 1: the session dies while the call is parked → entry invalidated.
+    const first = await fetchApp(post("/v1/chat/completions", {
+      model: "gpt-5-mini", stream: false,
+      messages: [{ role: "user", content: "run it" }],
+      tools,
+    }, { "x-session-id": "native-state-isolation-test" }));
+    expect(first.status).toBe(500);
+
+    mockHandlePendingToolCall.mockClear();
+
+    // Turn 2 answers that id on a NEW entry. It was never parked there, so the
+    // answer must not be forwarded to the runtime — the request is a plain prompt.
+    const second = await fetchApp(post("/v1/chat/completions", {
+      model: "gpt-5-mini", stream: false,
+      tools,
+      messages: [
+        { role: "user", content: "run it" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "call_old", type: "function", function: { name: "Bash", arguments: "{}" } }],
+        },
+        { role: "tool", tool_call_id: "call_old", content: "done" },
+      ],
+    }, { "x-session-id": "native-state-isolation-test" }));
+
+    expect(mockHandlePendingToolCall).not.toHaveBeenCalled();
+    expect(mockSend).toHaveBeenCalledTimes(2);
+    const data = await second.json() as any;
+    expect(data.choices[0].message.content).toBe("ok");
   });
 });

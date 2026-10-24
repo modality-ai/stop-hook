@@ -325,14 +325,31 @@ describe("xmlToolUseToJson", () => {
       ["Write", { canonical: "Write", types: { file_path: "string", content: "string" } }],
     ]);
 
-    it("rejects an unknown tool name", () => {
+    it("still converts an unknown tool name, preserving it verbatim", () => {
+      // A partial tool list must not turn a call the model wrote into printable
+      // markup; the client owns validation of the name. With no declared type
+      // for its parameters either, every body stays the string the model wrote:
+      // coercing "1" to a number would be a guess the client cannot undo.
       const text = '<invoke name="Nope"><parameter name="x">1</parameter></invoke>';
-      expect(xmlToolUseToJson(text, schemas)).toBe(text);
+      expect(JSON.parse(xmlToolUseToJson(text, schemas)).tool_use).toEqual({ name: "Nope", input: { x: "1" } });
     });
 
-    it("rejects an undeclared parameter", () => {
+    it("leaves an unknown tool's boolean-looking body a string", () => {
+      // `command: "true"` must not become boolean true for a tool the proxy
+      // cannot type — the client's schema is the only authority here.
+      const text = '<invoke name="Nope"><parameter name="command">true</parameter></invoke>';
+      expect(JSON.parse(xmlToolUseToJson(text, schemas)).tool_use).toEqual({
+        name: "Nope",
+        input: { command: "true" },
+      });
+    });
+
+    it("keeps an undeclared parameter", () => {
       const text = '<invoke name="Bash"><parameter name="bogus">ls</parameter></invoke>';
-      expect(xmlToolUseToJson(text, schemas)).toBe(text);
+      expect(JSON.parse(xmlToolUseToJson(text, schemas)).tool_use).toEqual({
+        name: "Bash",
+        input: { bogus: "ls" },
+      });
     });
 
     it("resolves the name case-insensitively", () => {

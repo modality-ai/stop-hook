@@ -13,9 +13,9 @@
  *
  * A turn can emit several frames, and two shapes must not clobber the
  * accumulation: an empty turn-final frame (the SDK's post-delta frame — fatal
- * in "tool" mode, which buffers, because the turn then ends with no tool_call
- * and no text), and a later prose frame ("I can't access that path") following
- * one that already carried a tool_use literal.
+ * for a buffered turn, because it would end with no tool_call and no text), and
+ * a later prose frame ("I can't access that path") following one that already
+ * carried a tool_use literal.
  */
 export const mergeAssistantFrame = (current: string, incoming: string | undefined): string => {
   if (!incoming?.trim()) return current;

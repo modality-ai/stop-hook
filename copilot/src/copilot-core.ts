@@ -723,11 +723,13 @@ export const initSession = async (
     },
     // Server mode: client owns tool execution. Hide SDK-managed tools from the
     // model so it cannot pick built-ins (bash/edit/...) — picking one would be
-    // permission-rejected and the turn would end with empty text. With no
-    // tools available, the model emits the injected inline-JSON tool_use as
-    // plain text, which mcp-qdrant claude/streamProcessor parses upstream.
+    // permission-rejected and the turn would end with empty text.
     // (server.ts also calls setClientCwd to keep cwd hooks out of the picture.)
     ...(options.denyAllTools ? { availableTools: [] } : {}),
+    // Native tool mode: client tools declared WITHOUT a handler. The runtime
+    // surfaces each call as external_tool.requested and waits for
+    // handlePendingToolCall (verified in poc-native-tools.ts).
+    ...(options.externalTools?.length ? { tools: options.externalTools } : {}),
     onPermissionRequest: async (request: any) => {
       if (options["denyAllTools"]) {
         logger.log(`🚫 Server mode: permission blocked for: ${request?.kind}`);
@@ -743,6 +745,13 @@ export const initSession = async (
     hooks: {
       onPreToolUse: async (input: any): Promise<PreToolUseHookOutput> => {
         const { toolName, timestamp, toolArgs } = input || {};
+        // PoC finding: a deny here also blocks handler-less external tools, so
+        // their calls never reach external_tool.requested. Let client-owned
+        // tools through; SDK built-ins stay denied.
+        const externalNames: string[] = (options.externalTools ?? []).map((t: any) => t.name);
+        if (externalNames.includes(toolName)) {
+          return { permissionDecision: "allow" };
+        }
         if (options["denyAllTools"]) {
           logger.log(`🚫 Server mode: tool execution blocked for: ${toolName}`);
           return {

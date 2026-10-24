@@ -6,7 +6,7 @@ import { join } from "path";
 // Import the REAL implementation — no re-implementation, no mocking of the
 // module under test. Only the backing directory is a throwaway, so the tests
 // never touch the live /tmp/copilot-loop.
-import { createLoopFs, tryMkdir } from "../loop-fs";
+import { createLoopFs, listFiles, removeFile, staleDumps, tryMkdir } from "../loop-fs";
 
 let dir: string;
 let counter = 0;
@@ -156,6 +156,65 @@ describe("createLoopFs().appendFile", () => {
     const asDirectory = join(dir, "iam-a-dir");
     mkdirSync(asDirectory);
     expect(() => fs.appendFile(asDirectory, "x")).toThrow();
+  });
+});
+
+// ─── listFiles ────────────────────────────────────────────────────────────────
+describe("listFiles", () => {
+  test("lists the entries directly inside the directory", () => {
+    writeFileSync(join(dir, "a.json"), "{}");
+    writeFileSync(join(dir, "b.json"), "{}");
+    expect(listFiles(dir).sort()).toEqual(["a.json", "b.json"]);
+  });
+
+  test("returns [] instead of throwing when the directory is gone", () => {
+    expect(listFiles(join(dir, "missing"))).toEqual([]);
+  });
+});
+
+// ─── removeFile ───────────────────────────────────────────────────────────────
+describe("removeFile", () => {
+  test("deletes an existing file and reports success", () => {
+    const target = join(dir, "gone.txt");
+    writeFileSync(target, "x");
+    expect(removeFile(target)).toBe(true);
+    expect(existsSync(target)).toBe(false);
+  });
+
+  test("returns false when the file is already gone", () => {
+    expect(removeFile(join(dir, "never-existed.txt"))).toBe(false);
+  });
+
+  test("returns false instead of throwing for a directory", () => {
+    const asDirectory = join(dir, "iam-a-dir");
+    mkdirSync(asDirectory);
+    expect(removeFile(asDirectory)).toBe(false);
+  });
+});
+
+// ─── staleDumps ───────────────────────────────────────────────────────────────
+describe("staleDumps", () => {
+  const names = ["suspicious-3.json", "suspicious-1.json", "suspicious-2.json"];
+
+  test("returns the oldest dumps first once the cap is exceeded", () => {
+    expect(staleDumps(names, "suspicious", 2)).toEqual(["suspicious-1.json"]);
+  });
+
+  test("returns nothing while the count is at or under the cap", () => {
+    expect(staleDumps(names, "suspicious", 3)).toEqual([]);
+  });
+
+  test("ignores other prefixes, other extensions, and prefix-lookalikes", () => {
+    const mixed = [...names, "missing-tools-1.json", "suspicious-9.txt", "suspiciousry-1.json"];
+    expect(staleDumps(mixed, "suspicious", 1)).toEqual(["suspicious-1.json", "suspicious-2.json"]);
+  });
+
+  test("treats a negative cap as zero rather than slicing from the end", () => {
+    expect(staleDumps(names, "suspicious", -5)).toEqual([
+      "suspicious-1.json",
+      "suspicious-2.json",
+      "suspicious-3.json",
+    ]);
   });
 });
 

@@ -124,9 +124,9 @@ export const tidyToolUseJsonDetailed = (text: string): TidyResult => {
 
 // ─── XML-style tool call markup ──────────────────────────────────────────────
 //
-// Frontier models fronted by the Copilot SDK (Claude, GPT) fall back to their
-// native chat-template markup instead of the `{"tool_use": …}` literal the
-// system prefix asks for:
+// Frontier models fronted by the Copilot SDK (Claude, GPT) sometimes write a
+// call as their native chat-template markup instead of calling the tool — or
+// emitting the `{"tool_use": …}` literal:
 //
 //   <function_calls>
 //   <invoke name="bash">
@@ -153,8 +153,7 @@ const TOOL_MARKUP_START_G = new RegExp(TOOL_MARKUP_START.source, "g");
  * never a call — so a fence that never closes is what tells the two callers apart:
  *
  *   tailIsQuoted (default, findToolMarkupStart): an unclosed fence runs to the end
- *   of the buffer. Future bytes may still close it, so committing to tool mode
- *   inside one is unsafe, and the stream stays in text mode.
+ *   of the buffer, so markup inside it reads as a quoted example, never a call.
  *
  *   tailIsQuoted=false (findExecutableInvoke): the buffer is complete, so an
  *   unclosed fence holds nothing that could later be a fenced example — its body
@@ -165,7 +164,7 @@ const TOOL_MARKUP_START_G = new RegExp(TOOL_MARKUP_START.source, "g");
 const quotedRanges = (text: string, tailIsQuoted = true): Array<[number, number]> => {
   const ranges: Array<[number, number]> = [];
   // Nothing to look for in the common case (most turns carry no backticks at
-  // all); skipping the scan keeps the per-delta streaming check cheap.
+  // all); skipping the scan keeps the markup check cheap.
   if (!text.includes("`")) return ranges;
   const re = /```[\s\S]*?(?:```|$)|`[^`\n]*`/g;
   let m: RegExpExecArray | null;
@@ -187,8 +186,8 @@ const isQuoted = (pos: number, ranges: Array<[number, number]>): boolean =>
 
 /**
  * Index of the first tool-markup opening tag that is NOT inside a quoted span, or -1.
- * Streaming uses this instead of a bare search so an XML example in a code block
- * does not switch the turn into tool mode.
+ * Used instead of a bare search so an XML example in a code block is never
+ * mistaken for a call.
  */
 export const findToolMarkupStart = (text: string): number => {
   if (!text || !TOOL_MARKUP_START.test(text)) return -1;
@@ -253,10 +252,15 @@ type XmlToolSchemaEntry = {
 
 /**
  * Optional tool schemas: every name a tool answers to → the tool it denotes and
- * its declared property types. When supplied, the invoke name must resolve to a
- * known tool (exact, then case-insensitive), every parameter must be a declared
- * property, and string-typed properties keep their body verbatim. Without it the
- * legacy lenient behaviour holds.
+ * its declared property types. When supplied, a resolvable invoke name is
+ * canonicalized (exact, then case-insensitive) and declared string properties
+ * keep their body verbatim instead of being coerced.
+ *
+ * The schema map is a NORMALIZER, not a gate. An unlisted tool or an undeclared
+ * parameter is still converted: the model already wrote the call, and leaving
+ * `<invoke …>` markup in the response only makes the client print it instead of
+ * executing anything. The client owns execution and can reject an unknown field
+ * itself.
  *
  * The alias keys are derived once, by buildXmlToolSchemas, and each carries the
  * name it denotes — so precedence is decided there and only there. Re-deriving
@@ -283,7 +287,18 @@ const resolveSchemaName = (raw: string, schemas: XmlToolSchemas): string | undef
 
 /**
  * Rewrite the FIRST XML-style invoke block in `text` as a `{"tool_use": …}`
- * literal. Text without such a block is returned verbatim.
+ * literal. Text without a COMPLETE block is returned verbatim (a truncated call
+ * is never executed).
+ *
+ * This ALWAYS converts a complete block, even when the tool is not in `schemas`
+ * or a parameter is undeclared. Such a call is not fabricated — the model wrote
+ * it — and returning the markup verbatim only means the downstream OpenAI
+ * response carries prose instead of a `tool_calls` entry, which the client then
+ * prints instead of running. The schema map narrows typing, it does not veto.
+ *
+ * An unresolved tool name therefore keeps every parameter body verbatim: with
+ * no declared type, coercing `true` or `123` would be a guess that can corrupt
+ * a string argument, and the client can still coerce a string itself.
  *
  * Only the first block is converted because the downstream OpenAI response
  * carries a single tool_call per turn; prose surrounding the block is dropped
@@ -298,26 +313,30 @@ export const xmlToolUseToJson = (text: string, schemas?: XmlToolSchemas): string
   if (!name) return text;
 
   let types: Record<string, string | undefined> | undefined;
-  let open = false;
+  let unresolved = false;
   if (schemas?.size) {
     const resolved = resolveSchemaName(name, schemas);
-    if (!resolved) return text; // unknown tool — never fabricate a call
-    name = resolved;
-    const entry = schemas.get(resolved);
-    types = entry?.types;
-    open = entry?.open === true;
+    // Canonicalize when the name is known; otherwise keep what the model wrote.
+    // The client still has the final say (it may have a tool the proxy has not
+    // seen this turn), so an unresolved name is forwarded, not dropped.
+    if (resolved) {
+      name = resolved;
+      types = schemas.get(resolved)?.types;
+    } else {
+      unresolved = true;
+    }
   }
   const declared = types && Object.keys(types).length ? types : undefined;
-  // An open schema still types its declared keys but accepts undeclared ones.
-  const rejectUndeclared = declared !== undefined && !open;
 
   const input: Record<string, any> = {};
   PARAM_BLOCK.lastIndex = 0;
   let param: RegExpExecArray | null;
   while ((param = PARAM_BLOCK.exec(block[2])) !== null) {
     const key = param[1].trim();
-    if (rejectUndeclared && !Object.prototype.hasOwnProperty.call(declared, key)) return text; // undeclared parameter
-    input[key] = coerceParamValue(decodeEntities(param[2]), declared?.[key]);
+    // Undeclared keys are kept as-is: declared ones are typed, the rest pass
+    // through so a stricter client schema is the only thing that can reject them.
+    // An unresolved tool keeps every body verbatim — there is no type to go on.
+    input[key] = coerceParamValue(decodeEntities(param[2]), unresolved ? "string" : declared?.[key]);
   }
 
   return JSON.stringify({ tool_use: { name, input } });
