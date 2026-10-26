@@ -144,7 +144,6 @@ const CLAUDE_CODE_ROUTER_TOOLS = new Set([
   "ExitPlanMode",
   "EnterWorktree",
   "ExitWorktree",
-  "ToolSearch",
   "ScheduleWakeup",
   "ShareOnboardingGuide",
   "Monitor",

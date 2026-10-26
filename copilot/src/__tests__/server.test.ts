@@ -999,6 +999,27 @@ describe("server.ts", () => {
       expect(opts.externalTools.map((t: any) => t.name)).toEqual(["mcp__Counter___Counter__Deploy"]);
     });
 
+    test("keeps ToolSearch so deferred built-ins like Bash stay loadable", async () => {
+      mockInitSession.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+        return () => {};
+      });
+
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "quota" }],
+        tools: [
+          { name: "ToolSearch", description: "Load deferred tools", input_schema: { type: "object" } },
+          { name: "Skill", description: "Invoke a skill", input_schema: { type: "object" } },
+          { name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } },
+        ],
+      }, { "x-session-id": "keep-toolsearch-test" }));
+
+      const [, opts] = mockInitSession.mock.calls[0];
+      expect(opts.externalTools.map((t: any) => t.name)).toEqual(["ToolSearch", "mcp__Counter___Counter__Deploy"]);
+    });
+
     test("when only non-MCP tools provided, treats as no-tools (no native declarations)", async () => {
       mockInitSession.mockClear();
       mockOn.mockImplementation((handler: any) => {
