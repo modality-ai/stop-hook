@@ -1,6 +1,8 @@
-import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, afterAll } from "bun:test";
+import { bunMockModule, clearAllMocks } from "modality-bun-kit";
+import { client, resetClient } from "../copilot-core";
 
-// ─── Mock @github/copilot-sdk before importing the real copilot-core ──────────
+// ─── @github/copilot-sdk mock (applied per test via bunMockModule) ────────────
 // Only copilot-core imports the SDK at runtime, so this mock is contained.
 // Everything else in copilot-core (loop-fs, /tmp dirs, whichCli) is real — the
 // test exercises the ACTUAL resetClient implementation against a controllable
@@ -22,18 +24,22 @@ class FakeCopilotClient {
   }
 }
 
-mock.module("@github/copilot-sdk", () => ({
+// copilot-core imports the ESM entry, while bunMockModule resolves a bare
+// specifier through require() (the CJS entry) — pass the ESM path so the mock
+// hits the module actually loaded.
+const SDK_PATH = Bun.fileURLToPath(import.meta.resolve("@github/copilot-sdk"));
+const sdkMock = () => ({
   CopilotClient: FakeCopilotClient,
   RuntimeConnection: { forStdio: () => ({}) },
-}));
+});
 
-import { client, resetClient } from "../copilot-core";
+// `client` is a lazy proxy, so re-mocking before the first access is enough: the
+// stub is installed before any constructor runs, and restoring it in afterEach
+// keeps the real SDK out of other test files.
+let resetSdk: (() => void) | undefined;
 
-// resetClient is real module state shared across tests, so each test must drop
-// any lingering client BEFORE resetting the local counters — otherwise a client
-// constructed by the previous test survives into the next one and the expected
-// construction counts skew.
-beforeEach(() => {
+beforeEach(async () => {
+  resetSdk = await bunMockModule(SDK_PATH, sdkMock);
   resetClient("test");
   constructed = 0;
   calls = [];
@@ -41,9 +47,13 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  // Leave no live client behind for other test files sharing the module.
+  // Leave no live client behind for other test files sharing the module, then
+  // put the real SDK back.
   resetClient("test");
+  resetSdk?.();
 });
+
+afterAll(() => clearAllMocks());
 
 // ─────────────────────────────────────────────────────────────
 // resetClient — drop the cached client so the next access respawns the CLI.

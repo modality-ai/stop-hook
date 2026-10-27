@@ -4,7 +4,6 @@ import { describe, test, expect } from "bun:test";
 // to mock and no I/O to isolate.
 import {
   detectRunaway,
-  createRunawayGuard,
   describeRunaway,
   MAX_TURN_CHARS,
 } from "../runaway";
@@ -73,44 +72,6 @@ describe("detectRunaway", () => {
 
     // The tail is also `x` repeated, so the shortest unit legitimately wins.
     expect(v!.unit).toBe("x");
-  });
-});
-
-describe("createRunawayGuard", () => {
-  test("stays silent while content is healthy", () => {
-    const guard = createRunawayGuard();
-    let text = "";
-    for (let i = 0; i < 200; i++) {
-      text += `delta ${i} of ordinary streamed prose\n`;
-      expect(guard.check(text)).toBeNull();
-    }
-  });
-
-  test("trips once a runaway run accumulates", () => {
-    const guard = createRunawayGuard();
-    let text = "Here is the answer.\n";
-    let verdict = null;
-
-    for (let i = 0; i < 500 && !verdict; i++) {
-      text += LOOP_UNIT;
-      verdict = guard.check(text);
-    }
-
-    expect(verdict).not.toBeNull();
-    expect(verdict!.reason).toBe("repetition");
-  });
-
-  test("reports at most one verdict per turn", () => {
-    const guard = createRunawayGuard();
-    let text = "";
-    let trips = 0;
-
-    for (let i = 0; i < 800; i++) {
-      text += LOOP_UNIT;
-      if (guard.check(text)) trips++;
-    }
-
-    expect(trips).toBe(1);
   });
 });
 

@@ -1,5 +1,6 @@
-import { describe, test, expect, mock, beforeEach } from "bun:test";
+import { describe, test, expect, mock, beforeEach, afterEach, afterAll } from "bun:test";
 import { createHmac } from "crypto";
+import { bunMockModule, clearAllMocks } from "modality-bun-kit";
 import { completionFrames, formatTokenPrice, streamCompletion } from "../copilot-to-openai";
 import { TOOL_NUDGE_PROMPT } from "../turn-content";
 
@@ -45,7 +46,10 @@ const mockInitSession = mock(
   })
 );
 
-mock.module("../copilot-core", () => ({
+// ─── copilot-core mock (applied per test via bunMockModule) ───────────────────
+// bunMockModule stores the real module and restores it on reset, so the mock
+// cannot leak into other test files and every test starts from the same stub.
+const copilotCoreMock = () => ({
   client: { listModels: mockListModels, start: mock(async () => {}) },
   initSession: mockInitSession,
   logger: { log: () => {}, error: () => {} },
@@ -53,10 +57,24 @@ mock.module("../copilot-core", () => ({
   whichCli: () => null,
   setClientCwd: mock(() => {}),
   COPILOT_LOOP_DIR: "/tmp/copilot-loop",
-}));
+});
 
-// Resolved after module mock is registered
+// Resolved after the module mock is registered, then reused: the server module is
+// imported once under the mock and its bindings re-resolve on each re-mock.
 let fetchApp: (req: Request) => Promise<Response>;
+let resetCore: (() => void) | undefined;
+
+// Re-apply the stub before every test so `import("../server")` links against it.
+beforeEach(async () => {
+  resetCore = await bunMockModule("../copilot-core", copilotCoreMock, import.meta.dir);
+  if (!fetchApp) {
+    const mod = await import("../server");
+    fetchApp = (mod.default as any).fetch as (req: Request) => Promise<Response>;
+  }
+});
+
+afterEach(() => resetCore?.());
+afterAll(() => clearAllMocks());
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function makeReq(path: string, opts: RequestInit = {}) {
@@ -72,15 +90,10 @@ function post(path: string, body: any, headers: Record<string, string> = {}) {
 }
 
 // ─── Test setup ───────────────────────────────────────────────────────────────
-// Import server lazily inside describe so Bun processes mock.module first
+// The copilot-core mock and the lazy server import are file-level hooks (above),
+// so every describe in this file — including the ones that only use fetchApp —
+// runs against the stub regardless of execution order.
 describe("server.ts", () => {
-  beforeEach(async () => {
-    if (!fetchApp) {
-      const mod = await import("../server");
-      fetchApp = (mod.default as any).fetch as (req: Request) => Promise<Response>;
-    }
-  });
-
   // ─── GET /v1/models ─────────────────────────────────────────────────────────
   describe("GET /v1/models", () => {
     test("returns OpenAI-format model list", async () => {
@@ -730,6 +743,7 @@ describe("server.ts", () => {
     test("nudge answered with a native tool call returns that call", async () => {
       mockInitSession.mockClear();
       mockSend.mockClear();
+      mockHandlePendingToolCall.mockClear();
       const prompts: string[] = [];
       mockSend.mockImplementation(async (args: any) => { prompts.push(args?.prompt ?? ""); });
 
@@ -1782,13 +1796,6 @@ describe("native stream framing", () => {
 // invalidation must start empty: inheriting the dropped entry's map would let a
 // stale tool_call_id be answered on a turn that never issued it.
 describe("native session state isolation", () => {
-  beforeEach(async () => {
-    if (!fetchApp) {
-      const mod = await import("../server");
-      fetchApp = (mod.default as any).fetch as (req: Request) => Promise<Response>;
-    }
-  });
-
   test("a recreated session does not inherit the dropped entry's parked calls", async () => {
     mockInitSession.mockClear();
     mockSend.mockClear();

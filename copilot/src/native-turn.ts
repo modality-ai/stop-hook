@@ -8,8 +8,9 @@
 // "leg" of a turn: it runs until the model either asks for tools (return them
 // as tool_calls) or finishes (return text). The next request's role:"tool"
 // messages resolve the parked calls and start the next leg. A client that stops
-// reading aborts its leg; the calls the model still asks for are refused rather
-// than parked, so the runtime is never left waiting on a response nobody reads.
+// reading aborts its leg: the calls it already collected, and any the model asks
+// for afterwards, are refused rather than parked, so the runtime is never left
+// waiting on a response nobody reads.
 
 import {
   isKnownToolCall,
@@ -168,7 +169,9 @@ export function runNativeLeg(
     let graceTimer: ReturnType<typeof setTimeout> | null = null;
     let released = false;
     let unsub: () => void = () => {};
-    // Declared before `settle` can reach it — same ordering rule as runTurn.
+    // Declared before `settle` can reach it: the timer only fires later, but a
+    // listener that dispatched synchronously during subscription would otherwise
+    // hit the temporal dead zone.
     let legTimer: ReturnType<typeof setTimeout> | null = null;
 
     const release = () => {
@@ -182,8 +185,8 @@ export function runNativeLeg(
     // An unanswered external call keeps the runtime turn busy, and a later resume
     // reattaches to that busy turn and hangs. Answering it (with an error) is what
     // closes the turn. Fire-and-forget: the caller must be released even when the
-    // transport is already dead, and a failed answer leaves the id parked so the
-    // next prompt refuses it.
+    // transport is already dead, and a refusal that cannot be delivered is dropped
+    // rather than retried — the turn that owned the call is gone with it.
     const refuseParked = () => {
       if (pending.size) void abandonPendingCalls(session, pending).catch(() => {});
     };

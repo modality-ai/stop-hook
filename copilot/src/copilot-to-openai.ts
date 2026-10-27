@@ -787,12 +787,14 @@ function newToolCallId(): string {
 // nudge is asking the model to produce.
 async function nudgeLeg(
   entry: SessionEntry,
-  prompt: string
+  prompt: string,
+  signal?: AbortSignal
 ): Promise<FinishedLegResult | null> {
   const session = entry.session as any;
   const leg = entry.queue.then(() =>
     runNativeLeg(session, entry.native.pending, () => session.send({ prompt }), {
       orphans: entry.native.orphans,
+      signal,
     })
   );
   // Same queue rule as completeNative: a rejected leg must not poison the queue.
@@ -989,7 +991,8 @@ async function countTokensHandler(c: Context) {
 async function salvageTextLeg(
   entry: SessionEntry,
   text: string,
-  tools?: any[]
+  tools?: any[],
+  signal?: AbortSignal
 ): Promise<{ result: FinishedLegResult; truncated: boolean }> {
   const schemas = buildXmlToolSchemas(tools);
   const verdict = detectRunaway(text);
@@ -1001,7 +1004,7 @@ async function salvageTextLeg(
   let tu: { id?: string; name: string; arguments: string } | null =
     extractInlineToolUse(content, salvageValidator(raw, schemas));
   if (shouldNudgeToolIntent({ hasCall: !!tu, truncated, tools, content })) {
-    tu = await nudgeForToolCall(" (native)", content, schemas, tools, (p) => nudgeLeg(entry, p));
+    tu = await nudgeForToolCall(" (native)", content, schemas, tools, (p) => nudgeLeg(entry, p, signal));
   }
   return {
     result: tu
@@ -1086,7 +1089,7 @@ async function completeNative(
     // `tools` is the set this request resolved (including the server-wide
     // fallback). Re-deriving it from the session registry would come back
     // empty in exactly that fallback case, silently disabling the salvage.
-    ({ result, truncated } = await salvageTextLeg(entry, result.content, tools));
+    ({ result, truncated } = await salvageTextLeg(entry, result.content, tools, signal));
   }
 
   recordTurnOutcome(

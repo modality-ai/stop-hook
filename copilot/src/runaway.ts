@@ -42,14 +42,6 @@ const MIN_RUN_CHARS = 32;
  */
 export const MAX_TURN_CHARS = 400_000;
 
-/**
- * Scanning every delta would re-walk the tail thousands of times per turn.
- * The detector only runs once the accumulated length crosses a new multiple of
- * this interval — bounded work per turn, and a loop is still caught within a
- * few hundred wasted characters.
- */
-const CHECK_INTERVAL_CHARS = 512;
-
 export interface RunawayVerdict {
   /** Why the turn tripped the guard. */
   reason: "repetition" | "length";
@@ -109,27 +101,6 @@ export const detectRunaway = (text: string): RunawayVerdict | null => {
   }
 
   return null;
-};
-
-/**
- * Stateful wrapper for the streaming path: feed it the accumulated content
- * after each delta and it runs {@link detectRunaway} on a fixed schedule
- * instead of on every event. Trips at most once — the caller unsubscribes on
- * the first verdict, and a second verdict for the same run would be noise.
- */
-export const createRunawayGuard = () => {
-  let nextCheckAt = CHECK_INTERVAL_CHARS;
-  let tripped = false;
-
-  return {
-    check: (text: string): RunawayVerdict | null => {
-      if (tripped || text.length < nextCheckAt) return null;
-      nextCheckAt = text.length + CHECK_INTERVAL_CHARS;
-      const verdict = detectRunaway(text);
-      if (verdict) tripped = true;
-      return verdict;
-    },
-  };
 };
 
 /** One-line summary of a verdict, safe to drop straight into a log. */
