@@ -186,15 +186,17 @@ describe("toExternalTools", () => {
   test("declares a client tool handler-less and pre-loaded", () => {
     const schema = { type: "object", properties: { command: { type: "string" } } };
     expect(toExternalTools([{ name: "Bash", description: "run", input_schema: schema }])).toEqual([
-      { name: "Bash", description: "run", parameters: schema, skipPermission: true, defer: "never" },
+      { name: "Bash", description: "run", parameters: schema, skipPermission: true, overridesBuiltInTool: true, defer: "never" },
     ]);
   });
 
-  test("accepts the OpenAI shape the upstream proxy may send", () => {
-    const parameters = { type: "object", properties: { pattern: { type: "string" } } };
-    expect(
-      toExternalTools([{ type: "function", function: { name: "Grep", description: "search", parameters } }])
-    ).toEqual([{ name: "Grep", description: "search", parameters, skipPermission: true, defer: "never" }]);
+  test("flags only built-in-named tools as overriding", () => {
+    const [bash, counter] = toExternalTools([
+      { name: "Bash", description: "run", input_schema: { type: "object" } },
+      { name: "mcp__Counter___Counter__Deploy", description: "deploy", input_schema: { type: "object" } },
+    ]);
+    expect(bash.overridesBuiltInTool).toBe(true);
+    expect(counter.overridesBuiltInTool).toBeUndefined();
   });
 
   test("drops entries with no usable name", () => {

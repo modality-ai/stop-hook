@@ -590,12 +590,17 @@ function findOriginatingUserPrompt(messages: any[], callIdx: number): string {
   return "";
 }
 
-// Tool calls synthesized by the mcp-qdrant proxy (hero deploy, ToolSearch, MCP
-// warmup) are answered without the Copilot session seeing the tool_use, so their
-// results look unsolicited. Re-state which call was made and why. When
-// SYNTHETIC_TOOL_ID_SECRET is shared with mcp-qdrant, IDs must carry a valid HMAC.
+// Some tool results arrive without the Copilot session having seen the tool_use:
+// calls synthesized by the mcp-qdrant proxy (hero deploy, MCP warmup) and native
+// Claude Code CLI ToolSearch calls. Such results look unsolicited, so re-state which
+// call was made and why. When SYNTHETIC_TOOL_ID_SECRET is shared with mcp-qdrant,
+// synthetic IDs must carry a valid HMAC.
 function syntheticCallPreamble(messages: any[], toolId: string, call: ToolCallRef | undefined): string {
-  if (!call || !isTrustedSyntheticToolId(toolId)) return "";
+  // ToolSearch is a native Claude Code CLI tool, so its calls carry non-synthetic IDs
+  // and cannot pass the HMAC check. The name match is not a trust boundary (the model
+  // controls it); it only exempts ToolSearch from the ID check. All other calls stay strict.
+  const isCliToolSearch = call?.name === "ToolSearch";
+  if (!call || (!isCliToolSearch && !isTrustedSyntheticToolId(toolId))) return "";
 
   const userPrompt = findOriginatingUserPrompt(messages, call.index);
   const input = call.input === undefined ? "" : JSON.stringify(call.input);

@@ -666,7 +666,9 @@ const setupSessionEventListener = (session: CopilotSession, options: any) => {
         case "permission.requested":
         case "permission.completed":
         case "assistant.message_start":
+        case "assistant.tool_call_delta":
         case "assistant.idle":
+        case "external_tool.requested":
           break;
 
         default:
@@ -725,7 +727,7 @@ export const initSession = async (
     // model so it cannot pick built-ins (bash/edit/...) — picking one would be
     // permission-rejected and the turn would end with empty text.
     // (server.ts also calls setClientCwd to keep cwd hooks out of the picture.)
-    ...(options.denyAllTools ? { availableTools: [] } : {}),
+    ...(options.denyAllTools ? { availableTools: ["custom:*"] } : {}),
     // Native tool mode: client tools declared WITHOUT a handler. The runtime
     // surfaces each call as external_tool.requested and waits for
     // handlePendingToolCall (verified in poc-native-tools.ts).

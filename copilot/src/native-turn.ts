@@ -11,11 +11,27 @@
 // reading aborts its leg; the calls the model still asks for are refused rather
 // than parked, so the runtime is never left waiting on a response nobody reads.
 
-import { isKnownToolCall, normalizeTools, type NormalizedTool } from "./tool-schemas";
+import {
+  isKnownToolCall,
+  normalizeTools,
+  type NormalizedTool,
+} from "./tool-schemas";
 import { findToolMarkupStart, type XmlToolSchemas } from "./tool-use-text";
 import { mergeAssistantFrame } from "./turn-content";
 
 export type NativeToolCall = { id: string; name: string; arguments: string };
+
+// Client tools named like a runtime built-in must say they replace it, or the
+// runtime treats the name as a clash and the tool never reaches the model.
+const BUILTIN_CLASH_NAMES = new Set([
+  "Bash",
+  "Read",
+  "Edit",
+  "Write",
+  "WebFetch",
+  "WebSearch",
+  "ToolSearch",
+]);
 
 // SDK declaration for one client tool — handler-less, per the module header.
 export function toExternalTools(tools?: any[]): any[] {
@@ -24,9 +40,10 @@ export function toExternalTools(tools?: any[]): any[] {
     description: t.description,
     parameters: t.input_schema ?? { type: "object", properties: {} },
     skipPermission: true,
+    ...(BUILTIN_CLASH_NAMES.has(t.name) ? { overridesBuiltInTool: true } : {}),
     // The runtime defers external tools behind the built-in tool_search_tool
     // once the session holds more than ~30. That built-in is suppressed by
-    // availableTools: [], so a deferred tool set would reach the model as no
+    // availableTools: ["custom:*"], so a deferred tool set would reach the model as no
     // tools at all. Keep every client tool pre-loaded.
     defer: "never" as const,
   }));
@@ -50,7 +67,8 @@ export function nativeFinishReason(
  */
 export function salvageValidator(raw: string, schemas: XmlToolSchemas) {
   return findToolMarkupStart(raw) === -1
-    ? (name: string, input: Record<string, any>) => isKnownToolCall(name, input, schemas)
+    ? (name: string, input: Record<string, any>) =>
+        isKnownToolCall(name, input, schemas)
     : undefined;
 }
 
@@ -82,7 +100,11 @@ type Session = {
   send: (input: any) => Promise<unknown>;
   rpc: {
     tools: {
-      handlePendingToolCall: (args: { requestId: string; result?: string; error?: string }) => Promise<unknown>;
+      handlePendingToolCall: (args: {
+        requestId: string;
+        result?: string;
+        error?: string;
+      }) => Promise<unknown>;
     };
   };
 };
@@ -130,7 +152,12 @@ export function runNativeLeg(
   session: Session,
   pending: PendingCalls,
   start: () => Promise<unknown>,
-  { quietMs = PARALLEL_CALL_QUIET_MS, answering = false, orphans = [], signal }: NativeLegOptions = {}
+  {
+    quietMs = PARALLEL_CALL_QUIET_MS,
+    answering = false,
+    orphans = [],
+    signal,
+  }: NativeLegOptions = {}
 ): Promise<NativeLegResult> {
   return new Promise((resolve, reject) => {
     const calls: NativeToolCall[] = [];
@@ -191,7 +218,10 @@ export function runNativeLeg(
     };
     signal?.addEventListener("abort", abort, { once: true });
 
-    legTimer = setTimeout(() => fail(new Error(`native turn timed out after ${LEG_TIMEOUT_MS}ms`)), LEG_TIMEOUT_MS);
+    legTimer = setTimeout(
+      () => fail(new Error(`native turn timed out after ${LEG_TIMEOUT_MS}ms`)),
+      LEG_TIMEOUT_MS
+    );
 
     unsub = session.on((event: any) => {
       // The SDK dispatches handlers inside its own try/catch, so a throw here
@@ -204,7 +234,10 @@ export function runNativeLeg(
             const { toolCallId, requestId } = event.data;
             if (aborted) {
               void session.rpc.tools
-                .handlePendingToolCall({ requestId, error: ABANDONED_CALL_REASON })
+                .handlePendingToolCall({
+                  requestId,
+                  error: ABANDONED_CALL_REASON,
+                })
                 .catch(() => {});
             } else {
               orphans.push({ toolCallId, requestId });
@@ -214,9 +247,18 @@ export function runNativeLeg(
         }
         switch (event.type) {
           case "external_tool.requested": {
-            const { requestId, toolCallId, toolName, arguments: args } = event.data;
+            const {
+              requestId,
+              toolCallId,
+              toolName,
+              arguments: args,
+            } = event.data;
             pending.set(toolCallId, requestId);
-            calls.push({ id: toolCallId, name: toolName, arguments: stringifyArgs(args) });
+            calls.push({
+              id: toolCallId,
+              name: toolName,
+              arguments: stringifyArgs(args),
+            });
             armQuiet();
             break;
           }
@@ -269,7 +311,10 @@ export async function answerPendingCalls(
       unknown.push(r.toolCallId);
       continue;
     }
-    await session.rpc.tools.handlePendingToolCall({ requestId, result: r.content });
+    await session.rpc.tools.handlePendingToolCall({
+      requestId,
+      result: r.content,
+    });
     // Deleted only after the answer lands, so a failed call stays retryable
     // instead of being dropped from the map unanswered.
     pending.delete(r.toolCallId);
@@ -307,7 +352,10 @@ export async function abandonCalls(
     if (!requestId) continue;
     pending.delete(toolCallId);
     try {
-      await session.rpc.tools.handlePendingToolCall({ requestId, error: ABANDONED_CALL_REASON });
+      await session.rpc.tools.handlePendingToolCall({
+        requestId,
+        error: ABANDONED_CALL_REASON,
+      });
       answered++;
     } catch {
       // The turn is already gone; nothing is waiting on this answer.
@@ -321,7 +369,10 @@ export async function abandonCalls(
  * calls are still parked: the client abandoned them, and sending into a turn
  * that is waiting on an answer would leave the session busy forever.
  */
-export async function abandonPendingCalls(session: Session, pending: PendingCalls): Promise<number> {
+export async function abandonPendingCalls(
+  session: Session,
+  pending: PendingCalls
+): Promise<number> {
   return abandonCalls(session, pending, [...pending.keys()]);
 }
 
@@ -336,7 +387,10 @@ export async function drainOrphanedCalls(
     const { toolCallId, requestId } = orphans.shift()!;
     if (pending.has(toolCallId)) continue; // a live leg owns it now
     try {
-      await session.rpc.tools.handlePendingToolCall({ requestId, error: LATE_CALL_REASON });
+      await session.rpc.tools.handlePendingToolCall({
+        requestId,
+        error: LATE_CALL_REASON,
+      });
       answered++;
     } catch {
       // Already answered, or the turn closed — nothing left to do.
@@ -346,9 +400,15 @@ export async function drainOrphanedCalls(
 }
 
 /** Trailing role:"tool" messages of an OpenAI request, oldest first. */
-export function trailingToolResults(messages: any[]): { toolCallId: string; content: string }[] {
+export function trailingToolResults(
+  messages: any[]
+): { toolCallId: string; content: string }[] {
   const out: { toolCallId: string; content: string }[] = [];
-  for (let i = messages.length - 1; i >= 0 && messages[i]?.role === "tool"; i--) {
+  for (
+    let i = messages.length - 1;
+    i >= 0 && messages[i]?.role === "tool";
+    i--
+  ) {
     const c = messages[i].content;
     const content = typeof c === "string" ? c : JSON.stringify(c ?? "");
     out.unshift({ toolCallId: messages[i].tool_call_id, content });
