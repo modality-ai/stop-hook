@@ -179,6 +179,14 @@ export function runNativeLeg(
       signal?.removeEventListener("abort", abort);
       unsub();
     };
+    // An unanswered external call keeps the runtime turn busy, and a later resume
+    // reattaches to that busy turn and hangs. Answering it (with an error) is what
+    // closes the turn. Fire-and-forget: the caller must be released even when the
+    // transport is already dead, and a failed answer leaves the id parked so the
+    // next prompt refuses it.
+    const refuseParked = () => {
+      if (pending.size) void abandonPendingCalls(session, pending).catch(() => {});
+    };
     const settle = (fn: () => void) => {
       if (settled) return;
       settled = true;
@@ -188,6 +196,7 @@ export function runNativeLeg(
       fn();
     };
     const fail = (err: unknown) => {
+      refuseParked();
       settle(() => reject(err));
       release();
     };
@@ -207,13 +216,14 @@ export function runNativeLeg(
       if (quietTimer) clearTimeout(quietTimer);
       quietTimer = setTimeout(flushCalls, quietMs);
     };
-    // The client gave up on this response. Resolve now, but keep the listener:
-    // the model may still ask for tools, and an unanswered call would leave the
-    // runtime busy until the next request. Those calls are refused on arrival.
+    // The client gave up on this response. Resolve now, then refuse the calls it
+    // already collected and keep the listener: the model may still ask for tools,
+    // and an unanswered call would leave the runtime busy until the next request.
     const abort = () => {
       if (settled) return;
       aborted = true;
       settle(() => resolve({ kind: "aborted" }));
+      refuseParked();
       graceTimer = setTimeout(release, LATE_CALL_GRACE_MS);
     };
     signal?.addEventListener("abort", abort, { once: true });

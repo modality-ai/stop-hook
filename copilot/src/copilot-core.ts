@@ -328,10 +328,14 @@ export const resetClient = (reason: string): void => {
   }
 };
 
-// dispose() exists on the runtime CopilotSession object, but the published
-// @github/copilot-sdk types omit it (they declare disconnect()/abort()).
-// Reach it through this narrow structural type instead of an `any` cast.
+// How a dropped session is released. The 0.1.x SDK exposed dispose(); 1.0.x
+// removed it — CopilotSession now has abort() (ends the turn in flight) and
+// disconnect() (detaches; its [Symbol.asyncDispose] delegates to disconnect).
+// dispose is kept optional so an older runtime still gets released. Typed
+// structurally because the published SDK types omit the disposal members.
 export interface SdkLifecycle {
+  abort?(): Promise<void>;
+  disconnect?(): Promise<void>;
   dispose?(): unknown;
 }
 

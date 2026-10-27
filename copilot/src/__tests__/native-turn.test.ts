@@ -180,6 +180,39 @@ describe("runNativeLeg", () => {
     expect(s.answered).toEqual([{ requestId: "r9", error: expect.stringContaining("stopped waiting") }]);
     expect(pending.size).toBe(0);
   });
+
+  test("an aborted leg refuses the calls it had already collected", async () => {
+    // Those calls can no longer reach the client, and leaving them unanswered
+    // keeps the runtime turn busy — a later resume then reattaches and hangs.
+    const s = fakeSession();
+    const pending: PendingCalls = new Map();
+    const abort = new AbortController();
+    const leg = runNativeLeg(s, pending, async () => {
+      s.emit("external_tool.requested", { requestId: "r1", toolCallId: "c1", toolName: "a", arguments: {} });
+      abort.abort();
+    }, { quietMs: 10_000, signal: abort.signal });
+
+    expect(await leg).toEqual({ kind: "aborted" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(s.answered).toEqual([{ requestId: "r1", error: expect.stringContaining("stopped waiting") }]);
+    expect(pending.size).toBe(0);
+  });
+
+  test("a failed leg refuses the calls it had already collected", async () => {
+    // The turn is over either way; without the refusal the runtime keeps waiting
+    // for a tool result and the session stays busy after this leg is gone.
+    const s = fakeSession();
+    const pending: PendingCalls = new Map();
+    const leg = runNativeLeg(s, pending, async () => {
+      s.emit("external_tool.requested", { requestId: "r1", toolCallId: "c1", toolName: "a", arguments: {} });
+      s.emit("session.error", { message: "boom" });
+    });
+
+    await expect(leg).rejects.toThrow("boom");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(s.answered).toEqual([{ requestId: "r1", error: expect.stringContaining("stopped waiting") }]);
+    expect(pending.size).toBe(0);
+  });
 });
 
 describe("toExternalTools", () => {

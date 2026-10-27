@@ -11,6 +11,10 @@ const mockSend = mock(async (_args?: any) => {});
 const mockOn = mock((_handler: any) => (() => {}) as () => void);
 const mockSetModel = mock(async (_model: string, _opts?: any) => {});
 const mockHandlePendingToolCall = mock(async (_args: { requestId: string; result?: string; error?: string }) => {});
+// Session lifecycle: invalidating an entry must close the runtime turn (abort)
+// and detach the object (disconnect) — dispose() no longer exists in SDK 1.0.x.
+const mockAbort = mock(async () => {});
+const mockDisconnect = mock(async () => {});
 const mockListModels = mock(async () => [
   {
     id: "claude-sonnet-4.6",
@@ -32,6 +36,8 @@ const mockInitSession = mock(
       send: mockSend,
       on: mockOn,
       setModel: mockSetModel,
+      abort: mockAbort,
+      disconnect: mockDisconnect,
       // Native tool mode answers SDK tool requests through this RPC.
       rpc: { tools: { handlePendingToolCall: mockHandlePendingToolCall } },
     },
@@ -714,6 +720,82 @@ describe("server.ts", () => {
       // Two sends: the narrated turn, then the nudge prompt.
       expect(prompts.length).toBe(2);
       expect(prompts[1]).toBe(TOOL_NUDGE_PROMPT);
+    });
+
+    // Regression: the nudge used to run on a text-only driver with no
+    // external_tool.requested branch. A model that answered the nudge with a
+    // real tool call left the runtime waiting for an answer forever, so the
+    // response hung until the 10-minute turn timeout and the session stayed
+    // busy — every later resume of it hung too.
+    test("nudge answered with a native tool call returns that call", async () => {
+      mockInitSession.mockClear();
+      mockSend.mockClear();
+      const prompts: string[] = [];
+      mockSend.mockImplementation(async (args: any) => { prompts.push(args?.prompt ?? ""); });
+
+      const narration = "I'll inspect the file to verify the path.";
+      let turns = 0;
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          // First leg: prose only. Second leg (nudge): a real external call.
+          if (turns++ === 0) {
+            handler({ type: "assistant.message", data: { content: narration } });
+            handler({ type: "assistant.turn_end", data: {} });
+            return;
+          }
+          handler({
+            type: "external_tool.requested",
+            data: {
+              requestId: "req-nudge",
+              toolCallId: "call-nudge",
+              toolName: "Read",
+              arguments: { file_path: "/tmp/x" },
+            },
+          });
+        }, 0);
+        return () => {};
+      });
+
+      const res = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "check the file" }],
+        tools: [{ name: "Read", description: "Read a file", input_schema: { type: "object" } }],
+      }, { "x-session-id": "nudge-native-test" }));
+
+      const data = await res.json() as any;
+      expect(res.status).toBe(200);
+      expect(data.choices[0].finish_reason).toBe("tool_calls");
+      expect(data.choices[0].message.tool_calls[0].id).toBe("call-nudge");
+      expect(data.choices[0].message.tool_calls[0].function.name).toBe("Read");
+      expect(data.choices[0].message.tool_calls[0].function.arguments).toBe('{"file_path":"/tmp/x"}');
+      expect(prompts.length).toBe(2);
+      expect(prompts[1]).toBe(TOOL_NUDGE_PROMPT);
+      // The call is parked, not answered: the client executes it and sends the
+      // result on the next request.
+      expect(mockHandlePendingToolCall.mock.calls.length).toBe(0);
+    });
+
+    test("invalidating a failed turn aborts and detaches the runtime session", async () => {
+      mockInitSession.mockClear();
+      mockAbort.mockClear();
+      mockDisconnect.mockClear();
+      mockSend.mockImplementation(async () => {});
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => handler({ type: "session.error", data: { message: "transport gone" } }), 0);
+        return () => {};
+      });
+
+      const res = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "hello" }],
+        tools: [{ name: "Read", description: "Read a file", input_schema: { type: "object" } }],
+      }, { "x-session-id": "invalidate-abort-test" }));
+
+      expect(res.status).toBe(500);
+      // disposeSession releases the session off the response path.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(mockAbort).toHaveBeenCalled();
+      expect(mockDisconnect).toHaveBeenCalled();
     });
 
     test("canonicalizes shortened MCP tool names split across streamed deltas", async () => {

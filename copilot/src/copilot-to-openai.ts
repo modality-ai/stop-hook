@@ -1,6 +1,6 @@
 import { chmodSync } from "fs";
 import { listFiles, removeFile, staleDumps, tryMkdir } from "./loop-fs";
-import { createRunawayGuard, describeRunaway, detectRunaway } from "./runaway";
+import { describeRunaway, detectRunaway } from "./runaway";
 import { isTrustedSyntheticToolId } from "./synthetic-tool-id";
 import {
   ClientStrikeCounter,
@@ -26,7 +26,7 @@ import {
   type XmlToolSchemas,
 } from "./tool-use-text";
 import { aliasMapForTools, buildXmlToolSchemas } from "./tool-schemas";
-import { mergeAssistantFrame, shouldNudgeToolIntent, TOOL_NUDGE_PROMPT } from "./turn-content";
+import { shouldNudgeToolIntent, TOOL_NUDGE_PROMPT } from "./turn-content";
 import { imageUrlToAttachment, type BlobAttachment } from "./image-attachment";
 import {
   abandonPendingCalls,
@@ -774,119 +774,41 @@ function newToolCallId(): string {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Core: send prompt, collect events until turn end
-// Serialised per session via entry.queue so events don't cross-contaminate.
+// Nudge turn: recover a tool call the model narrated but never emitted.
+// Serialised through entry.queue so it never overlaps another turn.
 // ─────────────────────────────────────────────────────────────
 
-// Drive one turn against the session: send the prompt, accumulate assistant
-// content from delta/message events, and resolve with the full content when
-// assistant.turn_end fires. Only assistant.turn_end is reliable — session.idle
-// can fire from a prior turn and would resolve before the model produces output.
-// Hard ceiling on a single turn. A dead or wedged CLI process produces NO events at
-// all — not an empty turn, not an error — so the abnormal-turn detector never sees it
-// and the SSE keepalive happily reports "alive" every 15s while nothing happens. Only
-// a timeout can distinguish "thinking" from "gone". Generous enough that a long
-// legitimate turn (large tool result, deep reasoning) is never cut short.
-const TURN_TIMEOUT_MS = 10 * 60_000;
-
-// Shared by runTurn and drive(): arm the one-shot turn guard plus its timeout
-// ceiling. Returns finish(fn), which every exit path routes through so the timer
-// is always cleared and the event subscription is never left dangling on a
-// settled promise. The timeout is the only way to distinguish "thinking" from
-// "gone" when a dead/wedged CLI produces no events at all; it counts a client
-// strike and drops the entry — unless the strike already respawned the whole
-// client, which clears the session map wholesale and makes the drop redundant.
-function armTurnTimeout(
+// Run one nudge turn through the native leg machinery. The nudge must not use a
+// text-only driver: every tool call in server mode arrives as
+// external_tool.requested, and a driver without a handler for it leaves the
+// runtime waiting for an answer nobody will send — the turn never ends, and the
+// session stays busy forever, so even a later resume hangs. runNativeLeg records
+// the call in `pending` and returns it to the client, which is exactly what the
+// nudge is asking the model to produce.
+async function nudgeLeg(
   entry: SessionEntry,
-  unsub: () => void,
-  reject: (err: Error) => void
-): (fn: () => void) => void {
-  let settled = false;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  const finish = (fn: () => void) => {
-    if (settled) return;
-    settled = true;
-    if (timer) clearTimeout(timer);
-    unsub();
-    fn();
-  };
-  timer = setTimeout(() => {
-    finish(() => {
-      const restarted = noteClientFailure(`turn timeout after ${TURN_TIMEOUT_MS}ms`);
-      // A timeout means this session produced nothing at all. Drop it regardless of
-      // whether the whole client was respawned (restartClient already cleared the
-      // map, so invalidateSession is a no-op in that case).
-      if (!restarted) invalidateSession(entry, "turn timeout");
-      reject(new Error(`Copilot turn timed out after ${TURN_TIMEOUT_MS}ms`));
-    });
-  }, TURN_TIMEOUT_MS);
-  return finish;
-}
-
-function runTurn(
-  entry: SessionEntry,
-  prompt: string,
-  attachments?: BlobAttachment[]
-): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    let fullContent = "";
-    const guard = createRunawayGuard();
-    // Declared before arming so the timeout's unsub reference can never hit the
-    // temporal dead zone: the timer only fires later, but a listener that ever
-    // dispatched synchronously during subscription would reach unsub before its
-    // initializer ran. A no-op placeholder removes that ordering dependency.
-    let unsub: () => void = () => {};
-    const finish = armTurnTimeout(entry, () => unsub(), reject);
-
-    unsub = entry.session.on((event: any) => {
-      try {
-        if (event.type === "assistant.message_delta") {
-          fullContent += event.data.deltaContent ?? "";
-          // A degenerate model can repeat a fragment forever, so turn_end never
-          // arrives. Cut the turn short at the last sane character instead of
-          // letting the caller wait out an unbounded stream.
-          const verdict = guard.check(fullContent);
-          if (verdict) {
-            logger.log(`✂️ ${describeRunaway(verdict)}`);
-            // Events reached us, so the transport is healthy — a runaway is a model
-            // problem, not a client problem.
-            noteClientHealthy();
-            finish(() => resolve(fullContent.slice(0, verdict.keepLength)));
-          }
-        } else if (event.type === "assistant.message") {
-          // Frames must not clobber the accumulation — see mergeAssistantFrame.
-          fullContent = mergeAssistantFrame(fullContent, event.data.content);
-        } else if (event.type === "assistant.turn_end") {
-          noteClientHealthy();
-          finish(() => resolve(fullContent));
-        } else if (event.type === "session.error") {
-          // Self-healing: drop the in-memory entry so the next request for this
-          // sessionKey re-probes via getSessionMetadata → resumeSession (or fresh
-          // create if the on-disk state is also gone). Prevents one bad turn
-          // from poisoning the rest of the conversation.
-          //
-          // A session.error also counts as a client-level strike: the SDK reports a
-          // dead transport this way, and repeated errors across turns mean the CLI
-          // process itself is gone rather than one conversation being poisoned.
-          const restarted = noteClientFailure("session.error");
-          if (!restarted) invalidateSession(entry, "session.error");
-          finish(() => reject(new Error(event.data.message)));
-        }
-      } catch (e) {
-        finish(() => reject(e));
-      }
-    });
-
-    entry.session.send(attachments?.length ? { prompt, attachments } : { prompt }).catch((err) => {
-      // A rejected send is a transport failure, not a model failure — the turn never
-      // started, so recordTurnOutcome would never see it. Previously this path counted
-      // no strike at all, which is why a crashed CLI could fail every request forever
-      // without ever tripping recovery.
-      const restarted = noteClientFailure(`send failed: ${err?.message ?? err}`);
-      if (!restarted) invalidateSession(entry, "send failed");
-      finish(() => reject(err));
-    });
-  });
+  prompt: string
+): Promise<FinishedLegResult | null> {
+  const session = entry.session as any;
+  const leg = entry.queue.then(() =>
+    runNativeLeg(session, entry.native.pending, () => session.send({ prompt }), {
+      orphans: entry.native.orphans,
+    })
+  );
+  // Same queue rule as completeNative: a rejected leg must not poison the queue.
+  entry.queue = leg.then(() => undefined, () => undefined);
+  try {
+    const result = await leg;
+    // The client gave up on the response: nothing to salvage, and the calls the
+    // model asked for were refused on arrival by runNativeLeg.
+    return result.kind === "aborted" ? null : result;
+  } catch (err: any) {
+    // The nudge runs inside another request's response, so it answers to the same
+    // recovery rules: strike the client and drop the entry for the next resume.
+    const restarted = noteClientFailure(`nudge failed: ${err?.message ?? err}`);
+    if (!restarted) invalidateSession(entry, "nudge failed");
+    throw err;
+  }
 }
 
 // SSE keepalive: comment lines (begin with ":") are ignored by clients but
@@ -908,16 +830,28 @@ function invalidateSession(entry: SessionEntry, reason: string): void {
   logger.log(`🩹 Invalidated entry for ${entry.sessionKey} on ${reason} — next turn will auto-resume`);
 }
 
-// Release an SDK session we are dropping. Without this every invalidation leaked the
-// session object and its event subscriptions for the life of the process. Best-effort:
-// the session is usually already broken, and a throw here must not mask the original
-// failure that caused the invalidation.
+// Release an SDK session we are dropping. abort() first: a turn left waiting on
+// an answer nobody will send keeps the runtime session busy forever, and the next
+// resume would reattach to that busy turn instead of restoring it — the request
+// then hangs with no events until the leg timeout. disconnect() detaches the
+// object; dispose() is the 0.1.x equivalent and only runs when it exists.
+// Best-effort: the session is usually already broken, and a throw here must not
+// mask the original failure that caused the invalidation.
 function disposeSession(session: CopilotSession): void {
-  try {
-    void Promise.resolve((session as SdkLifecycle).dispose?.()).catch(() => {});
-  } catch {
-    // Already gone — nothing to release.
-  }
+  const lifecycle = session as SdkLifecycle;
+  void (async () => {
+    try {
+      await lifecycle.abort?.();
+    } catch {
+      // Turn already gone or transport dead — nothing to abort.
+    }
+    try {
+      if (lifecycle.disconnect) await lifecycle.disconnect();
+      else if (lifecycle.dispose) await Promise.resolve(lifecycle.dispose());
+    } catch {
+      // Already gone — nothing to release.
+    }
+  })();
 }
 
 // How many consecutive abnormal turns a session may produce before it is
@@ -963,21 +897,10 @@ function recordTurnOutcome(entry: SessionEntry, abnormal: boolean, where: string
   }
 }
 
-// Serialise a turn through the session queue. `runTurn` does not self-serialise,
-// so a caller that is NOT already inside the queue must come through here: two
-// overlapping turns would both receive every session event, and each would
-// resolve on the other's `assistant.turn_end`.
-const enqueueTurn = (entry: SessionEntry, prompt: string, attachments?: BlobAttachment[]) => {
-  const turn = entry.queue.then(() => runTurn(entry, prompt, attachments));
-  entry.queue = turn.then(() => undefined, () => undefined);
-  return turn;
-};
-
 /**
  * Nudge the model once for the tool_use literal it announced but never emitted,
- * then re-run the same extraction over its reply. `run` is supplied by the
- * caller because queueing depends on where the caller sits: a nudge issued from
- * outside the queue must re-enter it, while one issued from inside it must not.
+ * then read the call back out of its reply. `run` is supplied by the caller
+ * because queueing belongs to the caller's position: see nudgeLeg.
  * Returns null when the nudge yields no call — the nudge reply passes the
  * same validator gate as the turn, so a literal it rejects stays rejected.
  */
@@ -986,13 +909,25 @@ const nudgeForToolCall = async (
   content: string,
   schemas: XmlToolSchemas,
   tools: any[] | undefined,
-  run: (prompt: string) => Promise<string>
-): Promise<{ name: string; arguments: string } | null> => {
+  run: (prompt: string) => Promise<FinishedLegResult | null>
+): Promise<{ id?: string; name: string; arguments: string } | null> => {
   logger.log(`🔔 Unfulfilled tool intent${label}, nudging once: ${content.slice(0, 120)}`);
   try {
     const nudged = await run(TOOL_NUDGE_PROMPT);
-    const nudgedContent = canonicalizeToolUseText(tidyToolUseJson(xmlToolUseToJson(nudged, schemas)), tools);
-    const tu = extractInlineToolUse(nudgedContent, salvageValidator(nudged, schemas));
+    if (!nudged) {
+      logger.log(`🔔 Nudge${label} aborted by the client`);
+      return null;
+    }
+    if (nudged.kind === "tool_calls") {
+      // The nudge did its job natively: the model emitted the call itself, so
+      // there is no literal to parse out of prose. Keep the SDK's toolCallId —
+      // it is the key the call is parked under, and the client sends it back.
+      const call = nudged.calls[0];
+      logger.log(`🔔 Nudge${label} produced ${call ? call.name : "no call"} (native)`);
+      return call ?? null;
+    }
+    const nudgedContent = canonicalizeToolUseText(tidyToolUseJson(xmlToolUseToJson(nudged.content, schemas)), tools);
+    const tu = extractInlineToolUse(nudgedContent, salvageValidator(nudged.content, schemas));
     logger.log(`🔔 Nudge${label} ${tu ? "produced " + tu.name : "produced no call"}`);
     return tu;
   } catch (err: any) {
@@ -1063,13 +998,14 @@ async function salvageTextLeg(
   const raw = verdict ? text.slice(0, verdict.keepLength) : text;
   const normalized = xmlToolUseToJson(raw, schemas);
   const content = canonicalizeToolUseText(tidyToolUseJson(normalized), tools);
-  let tu = extractInlineToolUse(content, salvageValidator(raw, schemas));
+  let tu: { id?: string; name: string; arguments: string } | null =
+    extractInlineToolUse(content, salvageValidator(raw, schemas));
   if (shouldNudgeToolIntent({ hasCall: !!tu, truncated, tools, content })) {
-    tu = await nudgeForToolCall(" (native)", content, schemas, tools, (p) => enqueueTurn(entry, p));
+    tu = await nudgeForToolCall(" (native)", content, schemas, tools, (p) => nudgeLeg(entry, p));
   }
   return {
     result: tu
-      ? { kind: "tool_calls", calls: [{ id: newToolCallId(), name: tu.name, arguments: tu.arguments }] }
+      ? { kind: "tool_calls", calls: [{ id: tu.id ?? newToolCallId(), name: tu.name, arguments: tu.arguments }] }
       : { kind: "text", content: canonicalizeToolUseText(normalized, tools) },
     truncated,
   };
@@ -1130,7 +1066,7 @@ async function completeNative(
   try {
     result = await leg;
   } catch (err: any) {
-    // Same recovery as runTurn: strike the client and drop the entry so the
+    // Same recovery as nudgeLeg: strike the client and drop the entry so the
     // next request re-probes via resume instead of reusing a broken session.
     const restarted = noteClientFailure(`native leg failed: ${err?.message ?? err}`);
     if (!restarted) invalidateSession(entry, "native leg failed");
