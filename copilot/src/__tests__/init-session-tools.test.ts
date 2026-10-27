@@ -91,3 +91,13 @@ describe("initSession availableTools", () => {
     });
   });
 });
+
+describe("initSession infiniteSessions", () => {
+  test("compaction starts before the point where the turn blocks", async () => {
+    const opts = await optionsFor({});
+    const { backgroundCompactionThreshold: bg, bufferExhaustionThreshold: buffer } = opts.infiniteSessions;
+    expect(bg).toBe(0.65);
+    expect(buffer).toBe(0.8);
+    expect(bg).toBeLessThan(buffer);
+  });
+});

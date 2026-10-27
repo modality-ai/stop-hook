@@ -1,4 +1,9 @@
-import { CopilotClient, RuntimeConnection, type CopilotSession } from "@github/copilot-sdk";
+import {
+  CopilotClient,
+  RuntimeConnection,
+  type CopilotSession,
+  type SessionConfigBase,
+} from "@github/copilot-sdk";
 import { readFileSync, writeSync, existsSync } from "fs";
 import { appendFile } from "fs/promises";
 import { execSync } from "child_process";
@@ -206,7 +211,10 @@ const saveModelsCache = (models: any[]) => {
 export const logger = {
   resetTimeout: () => {
     clearTimeout(sessionTimout);
-    sessionTimout = setTimeout(() => (state.gNeedContinue = true), 5 * 60 * 1000);
+    sessionTimout = setTimeout(
+      () => (state.gNeedContinue = true),
+      5 * 60 * 1000
+    );
   },
   store: (logType: string, message: string) => {
     logger.resetTimeout();
@@ -229,7 +237,10 @@ export const logger = {
   },
 };
 
-export const setupHealthCheck = (client: CopilotClient, abortController: AbortController) => {
+export const setupHealthCheck = (
+  client: CopilotClient,
+  abortController: AbortController
+) => {
   // Periodic server health check via ping
   const healthCheckIntervalMs = 3000; // 3 seconds
   const pingTimeoutMs = 1000; // 1 second timeout for ping response
@@ -263,7 +274,9 @@ let _clientCwd: string | undefined;
 
 export const setClientCwd = (cwd: string): void => {
   if (_client) {
-    logger.log(`⚠️  setClientCwd called after client construction — ignored: ${cwd}`);
+    logger.log(
+      `⚠️  setClientCwd called after client construction — ignored: ${cwd}`
+    );
     return;
   }
   _clientCwd = cwd;
@@ -304,7 +317,9 @@ const ensureClient = (): CopilotClient => {
 export const resetClient = (reason: string): void => {
   const dying = _client;
   _client = null;
-  logger.log(`♻️ Copilot client reset (${reason}) — next request respawns the CLI`);
+  logger.log(
+    `♻️ Copilot client reset (${reason}) — next request respawns the CLI`
+  );
   if (!dying) return;
   try {
     void dying.stop().catch(() => {});
@@ -695,7 +710,9 @@ export const initSession = async (
   if (null == options.model) {
     delete options.model;
   }
-  const defaultModel = options.reasoningEffort ? DEFAULT_REASON_MODEL : DEFAULT_MODEL;
+  const defaultModel = options.reasoningEffort
+    ? DEFAULT_REASON_MODEL
+    : DEFAULT_MODEL;
   const {
     model = defaultModel,
     reasoningEffort,
@@ -709,8 +726,10 @@ export const initSession = async (
     `🚀 Initializing session with model: ${model} ${reasoningEffort ? "reasoningEffort: " + reasoningEffort : "..."}`
   );
   logger.log(`   📌 systemPromptMode: ${systemPromptMode}`);
-  logger.log(`   📌 Session ID: ${state.gSessionId} | Loop ID: ${state.loopId}`);
-  const sessionOptions: any = {
+  logger.log(
+    `   📌 Session ID: ${state.gSessionId} | Loop ID: ${state.loopId}`
+  );
+  const sessionOptions: SessionConfigBase = {
     model,
     mcpServers,
     streaming: true,
@@ -719,9 +738,12 @@ export const initSession = async (
       content: systemPrompt,
     },
     reasoningEffort,
+    // https://github.com/github/copilot-sdk/blob/main/nodejs/src/types.ts#L2199
     infiniteSessions: {
-      // https://github.com/github/copilot-sdk/blob/main/nodejs/src/types.ts#L584
+      // default backgroundCompactionThreshold: 0.8
+      // default bufferExhaustionThreshold: 0.95
       backgroundCompactionThreshold: 0.65,
+      bufferExhaustionThreshold: 0.8,
     },
     // Server mode: client owns tool execution. Hide SDK-managed tools from the
     // model so it cannot pick built-ins (bash/edit/...) — picking one would be
@@ -750,7 +772,9 @@ export const initSession = async (
         // PoC finding: a deny here also blocks handler-less external tools, so
         // their calls never reach external_tool.requested. Let client-owned
         // tools through; SDK built-ins stay denied.
-        const externalNames: string[] = (options.externalTools ?? []).map((t: any) => t.name);
+        const externalNames: string[] = (options.externalTools ?? []).map(
+          (t: any) => t.name
+        );
         if (externalNames.includes(toolName)) {
           return { permissionDecision: "allow" };
         }
@@ -758,7 +782,8 @@ export const initSession = async (
           logger.log(`🚫 Server mode: tool execution blocked for: ${toolName}`);
           return {
             permissionDecision: "deny",
-            permissionDecisionReason: "Tool execution is handled by the client in server mode.",
+            permissionDecisionReason:
+              "Tool execution is handled by the client in server mode.",
           };
         }
         const denyTools: string[] = options["denyTools"] ?? [];
@@ -949,13 +974,17 @@ export const initSession = async (
   // process-wide gSessionId, the same way CLI mode does, so they share one
   // throwaway slot on disk instead of N.
   const isAnonymousProxyKey =
-    typeof options.sessionId === "string" && options.sessionId.startsWith("__anonymous__");
+    typeof options.sessionId === "string" &&
+    options.sessionId.startsWith("__anonymous__");
   const effectiveId: string =
-    options.sessionId && !isAnonymousProxyKey ? options.sessionId : state.gSessionId;
+    options.sessionId && !isAnonymousProxyKey
+      ? options.sessionId
+      : state.gSessionId;
   // Only attempt resume when the proxy actually keyed this request — never for
   // anonymous keys and never for CLI mode's process-wide id (createSession +
   // catch fallback covers CLI semantics).
-  const canResume = typeof options.sessionId === "string" && !isAnonymousProxyKey;
+  const canResume =
+    typeof options.sessionId === "string" && !isAnonymousProxyKey;
   let resumed = false;
 
   ensureClientCwd();
@@ -971,7 +1000,9 @@ export const initSession = async (
       try {
         meta = await client.getSessionMetadata(effectiveId);
       } catch (err: any) {
-        logger.log(`⚠️ getSessionMetadata failed for ${effectiveId}: ${err?.message ?? err}`);
+        logger.log(
+          `⚠️ getSessionMetadata failed for ${effectiveId}: ${err?.message ?? err}`
+        );
         meta = undefined;
       }
       if (meta) {
@@ -979,17 +1010,28 @@ export const initSession = async (
           session = await client.resumeSession(effectiveId, sessionOptions);
           resumed = true;
         } catch (err: any) {
-          logger.log(`⚠️ Resume failed for ${effectiveId}: ${err?.message ?? err} — creating fresh session`);
+          logger.log(
+            `⚠️ Resume failed for ${effectiveId}: ${err?.message ?? err} — creating fresh session`
+          );
         }
       }
       if (!session) {
-        session = await client.createSession({ ...sessionOptions, sessionId: effectiveId });
+        session = await client.createSession({
+          ...sessionOptions,
+          sessionId: effectiveId,
+        });
       }
     } else {
-      session = await client.createSession({ ...sessionOptions, sessionId: effectiveId });
+      session = await client.createSession({
+        ...sessionOptions,
+        sessionId: effectiveId,
+      });
     }
   } catch (error) {
-    session = await client.createSession({ ...sessionOptions, sessionId: effectiveId });
+    session = await client.createSession({
+      ...sessionOptions,
+      sessionId: effectiveId,
+    });
     resumed = false;
   }
 
