@@ -148,6 +148,8 @@ interface PromptInput {
 
 const sessions = new Map<string, SessionEntry>();
 const sessionCreating = new Map<string, Promise<SessionEntry>>();
+// Tools outlive idle eviction (see releaseSession), so bound the map by count.
+const MAX_REMEMBERED_TOOL_SESSIONS = 500;
 const sessionTools = new Map<string, any[]>();
 
 // Server-wide fallback: last MCP tool set seen across ALL sessions.
@@ -207,7 +209,12 @@ function mergeTools(existing?: any[], incoming?: any[]): any[] | undefined {
 function rememberSessionTools(sessionKey: string, tools?: any[]): void {
   const merged = mergeTools(sessionTools.get(sessionKey), tools);
   if (merged?.length) {
+    // Re-insert so the Map's insertion order tracks recency, then cap its size.
+    sessionTools.delete(sessionKey);
     sessionTools.set(sessionKey, merged);
+    if (sessionTools.size > MAX_REMEMBERED_TOOL_SESSIONS) {
+      sessionTools.delete(sessionTools.keys().next().value as string);
+    }
     // Update server-wide fallback whenever we see a non-empty MCP tool set.
     const mcpOnly = merged.filter((t: any) => {
       const name = t?.name ?? t?.function?.name ?? "";
@@ -943,7 +950,8 @@ function invalidateSession(entry: SessionEntry, reason: string): void {
 // same key resumes it; side sessions use a unique key and are never resumed.
 function releaseSession(entry: SessionEntry, why: string): void {
   if (sessions.get(entry.sessionKey) === entry) sessions.delete(entry.sessionKey);
-  sessionTools.delete(entry.sessionKey);
+  // sessionTools is deliberately kept: it is how a later title/summary one-shot
+  // recognises a tool conversation whose session was only idle-evicted.
   entry.disposed = true;
   disposeSession(entry.session);
   logger.log(`🧹 Released ${entry.sessionKey} (${why})`);
@@ -1436,20 +1444,10 @@ async function completionsHandler(c: Context) {
   // the stateful Copilot session can continue after client-side tool execution.
   const messages: any[] = body.messages ?? [];
   const headerSessionId = c.req.header("x-session-id");
-  const live = headerSessionId ? sessions.get(headerSessionId) : undefined;
-  // Keying this off a parked call or an active leg missed the title request,
-  // which normally arrives before the turn it describes has registered its leg.
-  // A conversation that already has tools is the reliable signal: a tool-less
-  // one-shot cannot be a new turn of it, so it must not inherit those tools.
-  const rememberedToolCount = headerSessionId
-    ? sessionTools.get(headerSessionId)?.length ?? 0
-    : 0;
-  const sideRequest = isSideRequest(
-    headerSessionId,
-    messages,
-    body.tools,
-    !!live && rememberedToolCount > 0
-  );
+  // See isSideRequest for why this keys off remembered tools, not live legs or
+  // a live session entry (which is created later than the tools are remembered).
+  const toolConversation = !!headerSessionId && !!sessionTools.get(headerSessionId)?.length;
+  const sideRequest = isSideRequest(headerSessionId, messages, body.tools, toolConversation);
   // A side request gets its own throwaway session: sharing one `side-<id>` key
   // made each title/summary prompt inherit the earlier ones' history, and the
   // entry was never released. Disposed once its response completes.

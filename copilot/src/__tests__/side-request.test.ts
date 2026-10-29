@@ -47,6 +47,20 @@ describe("isSideRequest", () => {
     expect(isSideRequest("s1", oneShot, undefined, false)).toBe(false);
   });
 
+  // Regression: the decision rests solely on the remembered-tools flag; a live
+  // session entry is no longer required, and missing messages are one-shot.
+  test("missing messages in a tool-capable conversation are a side request", () => {
+    expect(isSideRequest("s1", undefined as any, undefined, true)).toBe(true);
+  });
+
+  test("an empty tools array does not exempt a request from being a side request", () => {
+    expect(isSideRequest("s1", oneShot, [], true)).toBe(true);
+  });
+
+  test("an empty session header is never a side request", () => {
+    expect(isSideRequest("", oneShot, undefined, true)).toBe(false);
+  });
+
   test("a continuation in a tool-capable conversation is not a side request", () => {
     const continuation = [{ role: "user" }, { role: "assistant" }, { role: "tool" }];
     expect(isSideRequest("s1", continuation, undefined, true)).toBe(false);

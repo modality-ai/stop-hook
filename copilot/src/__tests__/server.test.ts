@@ -1128,6 +1128,30 @@ describe("server.ts", () => {
       expect(sideOpts.externalTools).toBeUndefined();
     });
 
+    // A plain chat client sends only the new message each turn and offers no
+    // tools; treating that as a side request would drop its history.
+    test("a one-shot in a tool-less conversation keeps sharing its session", async () => {
+      mockInitSession.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          handler({ type: "assistant.message", data: { content: "Hello" } });
+          handler({ type: "assistant.turn_end", data: {} });
+        }, 0);
+        return () => {};
+      });
+      const headers = { "x-session-id": "plain-chat-test" };
+      const send = () => fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "hi" }],
+      }, headers));
+
+      await send();
+      await send();
+
+      expect(mockInitSession.mock.calls.length).toBe(1);
+      const [, opts] = mockInitSession.mock.calls[0];
+      expect(opts.sessionId).not.toStartWith("side-");
+    });
+
     test("evictIdleSessions releases an idle session and a later request resumes it", async () => {
       const { evictIdleSessions } = await import("../copilot-to-openai");
       mockInitSession.mockClear();
@@ -1155,6 +1179,72 @@ describe("server.ts", () => {
 
       await send();
       expect(mockInitSession.mock.calls.length).toBe(2);
+    });
+
+    // Regression: eviction used to forget the conversation's tools, so a title
+    // one-shot arriving after an idle release joined the resumed session.
+    test("a tool-less one-shot after an idle eviction is still a side request", async () => {
+      const { evictIdleSessions } = await import("../copilot-to-openai");
+      mockInitSession.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          handler({ type: "assistant.message", data: { content: "hi" } });
+          handler({ type: "assistant.turn_end", data: {} });
+        }, 0);
+        return () => {};
+      });
+      const tools = [
+        { name: "mcp__Counter___Counter__ExecuteMethod", description: "Run method", input_schema: { type: "object" } },
+      ];
+      const headers = { "x-session-id": "evict-then-title-test" };
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "hi" }], tools,
+      }, headers));
+
+      expect(evictIdleSessions(Date.now() + 61_000, 60_000)).toBeGreaterThanOrEqual(1);
+
+      mockInitSession.mockClear();
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "Write the title." }],
+      }, headers));
+
+      const [, opts] = mockInitSession.mock.calls[0];
+      expect(opts.sessionId).toStartWith("side-");
+    });
+
+    // The remembered-tools map outlives eviction, so it is capped by count and
+    // drops the least recently used conversation, not the oldest-created one.
+    test("remembered tools are capped and drop the least recently used conversation", async () => {
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          handler({ type: "assistant.message", data: { content: "ok" } });
+          handler({ type: "assistant.turn_end", data: {} });
+        }, 0);
+        return () => {};
+      });
+      const tools = [
+        { name: "mcp__Counter___Counter__ExecuteMethod", description: "Run method", input_schema: { type: "object" } },
+      ];
+      const withTools = (id: string) => fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "hi" }], tools,
+      }, { "x-session-id": id }));
+      const sideSessionOf = async (id: string) => {
+        mockInitSession.mockClear();
+        await fetchApp(post("/v1/chat/completions", {
+          model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "Write the title." }],
+        }, { "x-session-id": id }));
+        // A request that joins the live session never initialises a new one.
+        return mockInitSession.mock.calls[0]?.[1].sessionId.startsWith("side-") ?? false;
+      };
+
+      await withTools("lru-0");
+      await withTools("lru-1");
+      for (let i = 2; i < 500; i++) await withTools(`lru-${i}`);
+      await withTools("lru-0"); // touch: lru-1 is now the least recently used
+      await withTools("lru-500"); // 501st entry pushes out lru-1
+
+      expect(await sideSessionOf("lru-0")).toBe(true);
+      expect(await sideSessionOf("lru-1")).toBe(false);
     });
 
     test("evictIdleSessions keeps a session whose tool call is parked for the client", async () => {

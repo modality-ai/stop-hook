@@ -28,10 +28,10 @@ export function isSideRequest(
   headerSessionId: string | undefined,
   messages: any[],
   tools: any[] | undefined,
-  liveToolConversation: boolean
+  toolConversation: boolean
 ): boolean {
   if (!headerSessionId || tools?.length) return false;
-  return liveToolConversation && isOneShotRequest(messages);
+  return toolConversation && isOneShotRequest(messages);
 }
 
 export function sideSessionKey(headerSessionId: string): string {
