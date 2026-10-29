@@ -17,6 +17,30 @@ describe("isOneShotRequest", () => {
   test("missing messages count as one-shot", () => {
     expect(isOneShotRequest(undefined as any)).toBe(true);
   });
+
+  test("an empty message list is one-shot", () => {
+    expect(isOneShotRequest([])).toBe(true);
+  });
+
+  test("system and user messages alone stay one-shot", () => {
+    expect(isOneShotRequest([{ role: "system" }, { role: "user" }])).toBe(true);
+  });
+
+  test("null entries are ignored rather than thrown on", () => {
+    expect(isOneShotRequest([null, { role: "user" }] as any)).toBe(true);
+  });
+
+  test("an assistant turn alone is a continuation", () => {
+    expect(isOneShotRequest([{ role: "assistant" }])).toBe(false);
+  });
+
+  test("a continuation is still detected beside null entries", () => {
+    expect(isOneShotRequest([null, { role: "assistant" }] as any)).toBe(false);
+  });
+
+  test("null messages count as one-shot", () => {
+    expect(isOneShotRequest(null as any)).toBe(true);
+  });
 });
 
 describe("isSideRequest", () => {
@@ -70,5 +94,9 @@ describe("isSideRequest", () => {
 describe("sideSessionKey", () => {
   test("prefixes the header id so it never collides with the live session", () => {
     expect(sideSessionKey("abc")).toBe("side-abc");
+  });
+
+  test("the key differs from the raw header id", () => {
+    expect(sideSessionKey("abc")).not.toBe("abc");
   });
 });
