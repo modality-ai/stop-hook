@@ -12,14 +12,26 @@ export function isOneShotRequest(messages: any[]): boolean {
 // prompt, so it abandoned the tool calls the client was still executing and the
 // runtime reported them as failed tools. A one-shot request carries no
 // assistant or tool turns, so it can never be the continuation of those calls.
+//
+// The test is "a tool-capable conversation already exists", NOT "a leg is parked
+// right now". A title/summary request arrives concurrently with the turn it
+// describes and normally lands before that turn's leg registers, so a transient
+// parked/active check misses it: the request joins the conversation, inherits
+// its MCP tools, and the model executes a `*method` token quoted in the title
+// text. The stray call is then abandoned when the real request arrives, which is
+// what surfaces to the model as a fabricated "Tool execution failed".
+//
+// A conversation with no tools keeps sharing its session: a plain chat client
+// that sends only the new message each turn must not lose its history to a
+// throwaway session, and with no tools there is nothing for it to call anyway.
 export function isSideRequest(
   headerSessionId: string | undefined,
   messages: any[],
   tools: any[] | undefined,
-  hasParkedCalls: boolean
+  liveToolConversation: boolean
 ): boolean {
   if (!headerSessionId || tools?.length) return false;
-  return hasParkedCalls && isOneShotRequest(messages);
+  return liveToolConversation && isOneShotRequest(messages);
 }
 
 export function sideSessionKey(headerSessionId: string): string {

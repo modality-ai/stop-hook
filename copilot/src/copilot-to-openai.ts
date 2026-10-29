@@ -1437,8 +1437,19 @@ async function completionsHandler(c: Context) {
   const messages: any[] = body.messages ?? [];
   const headerSessionId = c.req.header("x-session-id");
   const live = headerSessionId ? sessions.get(headerSessionId) : undefined;
-  const hasLiveTurn = !!live && (live.native.pending.size > 0 || live.activeLegs > 0);
-  const sideRequest = isSideRequest(headerSessionId, messages, body.tools, hasLiveTurn);
+  // Keying this off a parked call or an active leg missed the title request,
+  // which normally arrives before the turn it describes has registered its leg.
+  // A conversation that already has tools is the reliable signal: a tool-less
+  // one-shot cannot be a new turn of it, so it must not inherit those tools.
+  const rememberedToolCount = headerSessionId
+    ? sessionTools.get(headerSessionId)?.length ?? 0
+    : 0;
+  const sideRequest = isSideRequest(
+    headerSessionId,
+    messages,
+    body.tools,
+    !!live && rememberedToolCount > 0
+  );
   // A side request gets its own throwaway session: sharing one `side-<id>` key
   // made each title/summary prompt inherit the earlier ones' history, and the
   // entry was never released. Disposed once its response completes.

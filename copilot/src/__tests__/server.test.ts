@@ -1091,6 +1091,43 @@ describe("server.ts", () => {
       expect(mockDisconnect.mock.calls.length).toBeGreaterThanOrEqual(2);
     });
 
+    // Regression: the title request normally lands before the turn it describes
+    // registers a leg. Keying the side-request test off a parked call or an
+    // active leg missed it, so it joined the tool-capable session, inherited its
+    // MCP tools, and executed a `*method` quoted in the title text. That stray
+    // call was then abandoned as a failed tool when the real request arrived —
+    // which is what reached the model as "Tool execution failed".
+    test("a tool-less one-shot is a side request even before its turn's leg is active", async () => {
+      mockInitSession.mockClear();
+      mockHandlePendingToolCall.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          handler({ type: "assistant.message", data: { content: "Hello" } });
+          handler({ type: "assistant.turn_end", data: {} });
+        }, 0);
+        return () => {};
+      });
+
+      const tools = [
+        { name: "mcp__Counter___Counter__ExecuteMethod", description: "Run method", input_schema: { type: "object" } },
+      ];
+      const headers = { "x-session-id": "side-early-test" };
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "hi" }], tools,
+      }, headers));
+
+      // Nothing is parked and no leg is running: only the conversation's tool
+      // set tells this title request apart from a new turn.
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "Write the title." }],
+      }, headers));
+
+      expect(mockHandlePendingToolCall).not.toHaveBeenCalled();
+      const [, sideOpts] = mockInitSession.mock.calls[mockInitSession.mock.calls.length - 1];
+      expect(sideOpts.sessionId).toStartWith("side-");
+      expect(sideOpts.externalTools).toBeUndefined();
+    });
+
     test("evictIdleSessions releases an idle session and a later request resumes it", async () => {
       const { evictIdleSessions } = await import("../copilot-to-openai");
       mockInitSession.mockClear();
@@ -1118,6 +1155,95 @@ describe("server.ts", () => {
 
       await send();
       expect(mockInitSession.mock.calls.length).toBe(2);
+    });
+
+    test("evictIdleSessions keeps a session whose tool call is parked for the client", async () => {
+      const { evictIdleSessions } = await import("../copilot-to-openai");
+      mockInitSession.mockClear();
+      let legs = 0;
+      mockOn.mockImplementation((handler: any) => {
+        legs++;
+        setTimeout(() => {
+          if (legs === 1) {
+            handler({
+              type: "external_tool.requested",
+              data: { requestId: "req-evict", toolCallId: "call_evict", toolName: "mcp__Counter___Counter__ExecuteMethod", arguments: {} },
+            });
+            handler({ type: "session.idle", data: {} });
+          } else {
+            handler({ type: "assistant.message", data: { content: "done" } });
+            handler({ type: "session.idle", data: {} });
+          }
+        }, 0);
+        return () => {};
+      });
+      const tools = [
+        { name: "mcp__Counter___Counter__ExecuteMethod", description: "Run method", input_schema: { type: "object" } },
+      ];
+      const headers = { "x-session-id": "evict-parked-test" };
+      const first = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "*debug" }], tools,
+      }, headers));
+      expect((await first.json() as any).choices[0].message.tool_calls[0].id).toBe("call_evict");
+      expect(mockInitSession.mock.calls.length).toBe(1);
+
+      // Long past the TTL, but the client still owes an answer: the session stays.
+      evictIdleSessions(Date.now() + 10 * 60 * 60_000, 60_000);
+
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false, tools,
+        messages: [
+          { role: "user", content: "*debug" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [{ id: "call_evict", type: "function", function: { name: "mcp__Counter___Counter__ExecuteMethod", arguments: "{}" } }],
+          },
+          { role: "tool", tool_call_id: "call_evict", content: "ran" },
+        ],
+      }, headers));
+      // The same live session answered: nothing was re-created.
+      expect(mockInitSession.mock.calls.length).toBe(1);
+    });
+
+    test("evictIdleSessions keeps a session whose leg is still running", async () => {
+      const { evictIdleSessions } = await import("../copilot-to-openai");
+      mockInitSession.mockClear();
+      let release: (() => void) | undefined;
+      let legs = 0;
+      mockOn.mockImplementation((handler: any) => {
+        legs++;
+        if (legs === 1) {
+          // Hold the leg open until the test lets it finish.
+          release = () => {
+            handler({ type: "assistant.message", data: { content: "slow" } });
+            handler({ type: "assistant.turn_end", data: {} });
+          };
+        } else {
+          setTimeout(() => {
+            handler({ type: "assistant.message", data: { content: "again" } });
+            handler({ type: "assistant.turn_end", data: {} });
+          }, 0);
+        }
+        return () => {};
+      });
+      const send = () => fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "hello" }],
+      }, { "x-session-id": "evict-active-leg-test" }));
+
+      const inFlight = send();
+      for (let i = 0; i < 100 && !release; i++) await new Promise((r) => setTimeout(r, 5));
+      expect(release).toBeDefined();
+
+      // Long past the TTL, but a leg is mid-flight: the session stays.
+      evictIdleSessions(Date.now() + 10 * 60 * 60_000, 60_000);
+
+      release!();
+      expect((await inFlight).status).toBe(200);
+
+      // Still the same live session: a later request does not re-create it.
+      await send();
+      expect(mockInitSession.mock.calls.length).toBe(1);
     });
 
     test("a side request leaves a parked native call for the client to answer", async () => {

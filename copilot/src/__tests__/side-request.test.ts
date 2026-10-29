@@ -30,15 +30,24 @@ describe("isSideRequest", () => {
     expect(isSideRequest("s1", oneShot, [{ type: "function" }], true)).toBe(false);
   });
 
-  test("no parked calls is not a side request", () => {
+  test("a conversation's first turn is not a side request", () => {
     expect(isSideRequest("s1", oneShot, undefined, false)).toBe(false);
   });
 
-  test("a one-shot prompt while calls are parked is a side request", () => {
+  // The title request arrives before the turn it describes registers a leg, so
+  // the decision must rest on the conversation already being tool-capable — not
+  // on a parked call or an active leg that happens to be there at that instant.
+  test("a tool-less one-shot landing before its turn's leg is active is a side request", () => {
     expect(isSideRequest("s1", oneShot, undefined, true)).toBe(true);
   });
 
-  test("a continuation with parked calls is not a side request", () => {
+  // A plain chat client sends only the new message each turn and offers no
+  // tools; it must keep sharing its session or it loses its history.
+  test("a one-shot in a tool-less conversation is not a side request", () => {
+    expect(isSideRequest("s1", oneShot, undefined, false)).toBe(false);
+  });
+
+  test("a continuation in a tool-capable conversation is not a side request", () => {
     const continuation = [{ role: "user" }, { role: "assistant" }, { role: "tool" }];
     expect(isSideRequest("s1", continuation, undefined, true)).toBe(false);
   });
