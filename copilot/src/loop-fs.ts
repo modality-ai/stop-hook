@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, readdirSync, unlinkSync, writeFileSync } from "fs";
+import { appendFileSync, chmodSync, mkdirSync, readdirSync, unlinkSync, writeFileSync } from "fs";
 
 // ─────────────────────────────────────────────────────────────
 // Durable-write helpers for directories that live under /tmp.
@@ -19,9 +19,9 @@ import { appendFileSync, mkdirSync, readdirSync, unlinkSync, writeFileSync } fro
  * Returns `null` on success, or the Error when the directory could not be
  * created — letting the caller decide whether to log, ignore, or surface it.
  */
-export const tryMkdir = (dir: string): Error | null => {
+export const tryMkdir = (dir: string, mode?: number): Error | null => {
   try {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(dir, { recursive: true, ...(mode !== undefined && { mode }) });
     return null;
   } catch (err: any) {
     return err instanceof Error ? err : new Error(String(err));
@@ -31,8 +31,11 @@ export const tryMkdir = (dir: string): Error | null => {
 export interface LoopFs {
   /** Re-create the backing directory. Never throws. */
   ensureDir: () => void;
-  /** Write `data` to `filePath`, recreating the directory if it vanished. */
-  writeFile: (filePath: string, data: string) => void;
+  /**
+   * Write `data` to `filePath`, recreating the directory if it vanished. `mode`
+   * applies when the file is created, so a secret is never readable even briefly.
+   */
+  writeFile: (filePath: string, data: string, mode?: number) => void;
   /** Append `data` to `filePath`, recreating the directory if it vanished. */
   appendFile: (filePath: string, data: string) => void;
 }
@@ -46,8 +49,14 @@ export interface LoopFs {
  * not fix it, the directory was never the problem.
  */
 export const createLoopFs = (dir: string): LoopFs => {
+  // Owner-only: /tmp is shared, and this directory holds prompts and credentials.
+  // mkdir's mode is ignored for a directory that already exists, so tighten it too.
+  // Best effort: a directory someone else owns cannot be chmod'ed.
   const ensureDir = (): void => {
-    tryMkdir(dir);
+    tryMkdir(dir, 0o700);
+    try {
+      chmodSync(dir, 0o700);
+    } catch {}
   };
 
   const withRetry = <T>(op: () => T): T => {
@@ -62,7 +71,8 @@ export const createLoopFs = (dir: string): LoopFs => {
 
   return {
     ensureDir,
-    writeFile: (filePath: string, data: string) => withRetry(() => writeFileSync(filePath, data)),
+    writeFile: (filePath: string, data: string, mode?: number) =>
+      withRetry(() => writeFileSync(filePath, data, mode === undefined ? undefined : { mode })),
     appendFile: (filePath: string, data: string) => withRetry(() => appendFileSync(filePath, data)),
   };
 };

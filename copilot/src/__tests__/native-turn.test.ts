@@ -8,11 +8,20 @@ import {
   runNativeLeg,
   salvageValidator,
   toExternalTools,
+  toolMessageText,
   trailingToolResults,
   type OrphanedCall,
   type PendingCalls,
 } from "../native-turn";
 import { buildXmlToolSchemas } from "../tool-schemas";
+
+// runNativeLeg requires an orphan recorder; tests get a fresh one unless they pass their own.
+const runLeg = (
+  s: any,
+  pending: PendingCalls,
+  start: () => Promise<unknown>,
+  opts: Partial<Parameters<typeof runNativeLeg>[3]> = {}
+) => runNativeLeg(s, pending, start, { orphans: [], ...opts });
 
 function fakeSession() {
   let listener: (e: any) => void = () => {};
@@ -38,10 +47,59 @@ function fakeSession() {
 }
 
 describe("runNativeLeg", () => {
+  test("a leg aborted before it starts does not run start() unless it is answering", async () => {
+    const ctl = new AbortController();
+    ctl.abort();
+    let prompts = 0;
+    const result = await runLeg(fakeSession(), new Map(), async () => void prompts++, { signal: ctl.signal });
+    expect(result).toEqual({ kind: "aborted" });
+    expect(prompts).toBe(0);
+
+    let answers = 0;
+    await runLeg(fakeSession(), new Map(), async () => void answers++, { signal: ctl.signal, answering: true });
+    expect(answers).toBe(1);
+  });
+
+  test("an answering leg aborted before it starts still runs start() and refuses late calls", async () => {
+    const s = fakeSession();
+    const ctl = new AbortController();
+    ctl.abort();
+    const result = await runLeg(
+      s,
+      new Map(),
+      async () => {
+        s.emit("external_tool.requested", { requestId: "r1", toolCallId: "c1", toolName: "Bash", arguments: {} });
+      },
+      { signal: ctl.signal, answering: true }
+    );
+    expect(result).toEqual({ kind: "aborted" });
+    expect(s.answered).toEqual([{ requestId: "r1", error: expect.any(String) }]);
+  });
+
+  test("a start() failure after the batch was returned does not refuse the client's calls", async () => {
+    const s = fakeSession();
+    const pending: PendingCalls = new Map();
+    let failStart: (e: Error) => void = () => {};
+    const result = await runLeg(
+      s,
+      pending,
+      () =>
+        new Promise((_, reject) => {
+          failStart = reject;
+          s.emit("external_tool.requested", { requestId: "r1", toolCallId: "c1", toolName: "Bash", arguments: {} });
+        }),
+      { quietMs: 5 }
+    );
+    expect(result.kind).toBe("tool_calls");
+    failStart(new Error("late"));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(s.answered).toEqual([]);
+    expect(pending.has("c1")).toBe(true);
+  });
   test("batches parallel external calls into one tool_calls result", async () => {
     const s = fakeSession();
     const pending: PendingCalls = new Map();
-    const leg = runNativeLeg(s, pending, async () => {
+    const leg = runLeg(s, pending, async () => {
       s.emit("external_tool.requested", { requestId: "r1", toolCallId: "c1", toolName: "a", arguments: { x: 1 } });
       s.emit("external_tool.requested", { requestId: "r2", toolCallId: "c2", toolName: "b", arguments: "{}" });
     }, { quietMs: 10 });
@@ -61,7 +119,7 @@ describe("runNativeLeg", () => {
 
   test("returns text when the turn goes idle without calls", async () => {
     const s = fakeSession();
-    const result = await runNativeLeg(s, new Map(), async () => {
+    const result = await runLeg(s, new Map(), async () => {
       s.emit("assistant.message_delta", { deltaContent: "hi " });
       s.emit("assistant.message_delta", { deltaContent: "there" });
       s.emit("session.idle");
@@ -71,20 +129,20 @@ describe("runNativeLeg", () => {
 
   test("rejects on session.error", async () => {
     const s = fakeSession();
-    await expect(runNativeLeg(s, new Map(), async () => s.emit("session.error", { message: "boom" }))).rejects.toThrow("boom");
+    await expect(runLeg(s, new Map(), async () => s.emit("session.error", { message: "boom" }))).rejects.toThrow("boom");
   });
 
   test("rejects instead of hanging when an event carries no data", async () => {
     // The SDK swallows listener throws; without the guard this leg would stay
     // pending until the 10-minute timeout.
     const s = fakeSession();
-    await expect(runNativeLeg(s, new Map(), async () => s.emit("external_tool.requested", null))).rejects.toThrow();
+    await expect(runLeg(s, new Map(), async () => s.emit("external_tool.requested", null))).rejects.toThrow();
   });
 
   test("rejects when the start callback itself fails", async () => {
     const s = fakeSession();
     await expect(
-      runNativeLeg(s, new Map(), async () => {
+      runLeg(s, new Map(), async () => {
         throw new Error("send failed");
       })
     ).rejects.toThrow("send failed");
@@ -95,7 +153,7 @@ describe("runNativeLeg", () => {
     // resolving on it would return an empty answer and leave the model's
     // continuation unreported.
     const s = fakeSession();
-    const leg = runNativeLeg(s, new Map(), async () => {
+    const leg = runLeg(s, new Map(), async () => {
       s.emit("assistant.turn_end");
       s.emit("assistant.message_delta", { deltaContent: "done" });
       s.emit("session.idle");
@@ -103,9 +161,21 @@ describe("runNativeLeg", () => {
     expect(await leg).toEqual({ kind: "text", content: "done" });
   });
 
+  test("a call arriving after an empty turn_end while answering is still returned", async () => {
+    const s = fakeSession();
+    const leg = runLeg(s, new Map(), async () => {
+      s.emit("assistant.turn_end");
+      s.emit("external_tool.requested", { requestId: "r1", toolCallId: "c1", toolName: "Bash", arguments: { command: "ls" } });
+    }, { quietMs: 10, answering: true });
+    expect(await leg).toEqual({
+      kind: "tool_calls",
+      calls: [{ id: "c1", name: "Bash", arguments: '{"command":"ls"}' }],
+    });
+  });
+
   test("a turn_end with no calls still finishes a non-answering leg", async () => {
     const s = fakeSession();
-    const leg = runNativeLeg(s, new Map(), async () => {
+    const leg = runLeg(s, new Map(), async () => {
       s.emit("assistant.message_delta", { deltaContent: "answer" });
       s.emit("assistant.turn_end");
     });
@@ -114,7 +184,7 @@ describe("runNativeLeg", () => {
 
   test("a final assistant.message replaces the accumulated deltas", async () => {
     const s = fakeSession();
-    const leg = runNativeLeg(s, new Map(), async () => {
+    const leg = runLeg(s, new Map(), async () => {
       s.emit("assistant.message_delta", { deltaContent: "Hel" });
       s.emit("assistant.message", { content: "Hello there" });
       s.emit("session.idle");
@@ -124,7 +194,7 @@ describe("runNativeLeg", () => {
 
   test("idle flushes the batch without waiting for the quiet window", async () => {
     const s = fakeSession();
-    const leg = runNativeLeg(s, new Map(), async () => {
+    const leg = runLeg(s, new Map(), async () => {
       s.emit("external_tool.requested", { requestId: "r1", toolCallId: "c1", toolName: "a", arguments: {} });
       s.emit("session.idle");
     }, { quietMs: 10_000 });
@@ -136,7 +206,7 @@ describe("runNativeLeg", () => {
     // delivered to the client, so it is parked for the next leg instead.
     const s = fakeSession();
     const orphans: OrphanedCall[] = [];
-    const leg = runNativeLeg(s, new Map(), async () => {
+    const leg = runLeg(s, new Map(), async () => {
       s.emit("external_tool.requested", { requestId: "r1", toolCallId: "c1", toolName: "a", arguments: {} });
     }, { quietMs: 10, orphans });
     await leg;
@@ -149,7 +219,7 @@ describe("runNativeLeg", () => {
     // the sibling arriving at 160ms would be orphaned instead of delivered.
     const s = fakeSession();
     const orphans: OrphanedCall[] = [];
-    const leg = runNativeLeg(s, new Map(), async () => {
+    const leg = runLeg(s, new Map(), async () => {
       s.emit("external_tool.requested", { requestId: "r1", toolCallId: "c1", toolName: "a", arguments: {} });
       setTimeout(() => s.emit("assistant.tool_call_delta", {}), 80);
       setTimeout(
@@ -169,7 +239,7 @@ describe("runNativeLeg", () => {
     const s = fakeSession();
     const pending: PendingCalls = new Map();
     const abort = new AbortController();
-    const leg = runNativeLeg(s, pending, async () => {
+    const leg = runLeg(s, pending, async () => {
       s.emit("assistant.message_delta", { deltaContent: "work" });
     }, { signal: abort.signal });
     abort.abort();
@@ -187,7 +257,7 @@ describe("runNativeLeg", () => {
     const s = fakeSession();
     const pending: PendingCalls = new Map();
     const abort = new AbortController();
-    const leg = runNativeLeg(s, pending, async () => {
+    const leg = runLeg(s, pending, async () => {
       s.emit("external_tool.requested", { requestId: "r1", toolCallId: "c1", toolName: "a", arguments: {} });
       abort.abort();
     }, { quietMs: 10_000, signal: abort.signal });
@@ -200,17 +270,18 @@ describe("runNativeLeg", () => {
 
   test("a failed leg refuses the calls it had already collected", async () => {
     // The turn is over either way; without the refusal the runtime keeps waiting
-    // for a tool result and the session stays busy after this leg is gone.
+    // for a tool result and the session stays busy after this leg is gone. The
+    // runtime is told WHY the call was dropped, so a timeout reads as one.
     const s = fakeSession();
     const pending: PendingCalls = new Map();
-    const leg = runNativeLeg(s, pending, async () => {
+    const leg = runLeg(s, pending, async () => {
       s.emit("external_tool.requested", { requestId: "r1", toolCallId: "c1", toolName: "a", arguments: {} });
       s.emit("session.error", { message: "boom" });
     });
 
     await expect(leg).rejects.toThrow("boom");
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(s.answered).toEqual([{ requestId: "r1", error: expect.stringContaining("stopped waiting") }]);
+    expect(s.answered).toEqual([{ requestId: "r1", error: "boom" }]);
     expect(pending.size).toBe(0);
   });
 });
@@ -230,6 +301,11 @@ describe("toExternalTools", () => {
     ]);
     expect(bash.overridesBuiltInTool).toBe(true);
     expect(counter.overridesBuiltInTool).toBeUndefined();
+  });
+
+  test("does not flag ToolSearch as overriding a built-in", () => {
+    const [toolSearch] = toExternalTools([{ name: "ToolSearch", description: "load", input_schema: { type: "object" } }]);
+    expect(toolSearch.overridesBuiltInTool).toBeUndefined();
   });
 
   test("drops entries with no usable name", () => {
@@ -386,12 +462,70 @@ describe("trailingToolResults", () => {
     ];
     expect(trailingToolResults(msgs)).toEqual([
       { toolCallId: "c1", content: "one" },
-      { toolCallId: "c2", content: '[{"type":"text","text":"two"}]' },
+      { toolCallId: "c2", content: "two" },
+    ]);
+  });
+
+  test("null content becomes empty text; non-text parts are dropped, text parts kept", () => {
+    const image = { type: "image_url", image_url: { url: "u" } };
+    expect(
+      trailingToolResults([
+        { role: "tool", tool_call_id: "a", content: null },
+        { role: "tool", tool_call_id: "b", content: [image] },
+        { role: "tool", tool_call_id: "c", content: [{ type: "text", text: "x" }, image, { type: "text", text: "y" }] },
+      ])
+    ).toEqual([
+      { toolCallId: "a", content: "" },
+      { toolCallId: "b", content: "" },
+      { toolCallId: "c", content: "x\ny" },
     ]);
   });
 
   test("returns [] when the request ends on anything but a tool message", () => {
     expect(trailingToolResults([])).toEqual([]);
     expect(trailingToolResults([{ role: "assistant", content: "done" }])).toEqual([]);
+  });
+});
+
+describe("toolMessageText", () => {
+  test("a string passes through unchanged", () => {
+    expect(toolMessageText("ok")).toBe("ok");
+  });
+
+  test("null and undefined become empty text", () => {
+    expect(toolMessageText(null)).toBe("");
+    expect(toolMessageText(undefined)).toBe("");
+  });
+
+  test("an array keeps only text parts, joined by newline", () => {
+    const image = { type: "image_url", image_url: { url: "u" } };
+    expect(toolMessageText([{ type: "text", text: "a" }, image, { type: "text", text: "b" }])).toBe("a\nb");
+  });
+
+  test("a non-array object falls back to JSON", () => {
+    expect(toolMessageText({ a: 1 })).toBe('{"a":1}');
+  });
+});
+
+describe("empty turn_end while answering parked calls", () => {
+  test("settles as empty text after the grace period instead of idling to failure", async () => {
+    const handlers: ((e: any) => void)[] = [];
+    const session: any = {
+      on: (fn: any) => { handlers.push(fn); return () => {}; },
+      send: async () => {},
+      rpc: { tools: { handlePendingToolCall: async () => {} } },
+    };
+    const { runNativeLeg } = await import("../native-turn");
+    const realSetTimeout = globalThis.setTimeout;
+    // Compress the 15s grace so the test stays fast.
+    (globalThis as any).setTimeout = (fn: any, ms: number, ...a: any[]) =>
+      realSetTimeout(fn, ms === 15_000 ? 20 : ms, ...a);
+    try {
+      const leg = runNativeLeg(session, new Map(), async () => {}, { answering: true, orphans: [] });
+      handlers[0]({ type: "assistant.turn_end", data: {} });
+      expect(await leg).toEqual({ kind: "text", content: "" });
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
   });
 });

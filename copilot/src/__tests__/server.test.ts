@@ -1,7 +1,7 @@
 import { describe, test, expect, mock, beforeEach, afterEach, afterAll } from "bun:test";
 import { createHmac } from "crypto";
 import { bunMockModule, clearAllMocks } from "modality-bun-kit";
-import { completionFrames, formatTokenPrice, streamCompletion } from "../copilot-to-openai";
+import { SessionReplacedError, completionFrames, formatTokenPrice, streamCompletion } from "../copilot-to-openai";
 import { TOOL_NUDGE_PROMPT } from "../turn-content";
 
 const signSyntheticToolId = (baseId: string, secret: string) =>
@@ -12,6 +12,8 @@ const mockSend = mock(async (_args?: any) => {});
 const mockOn = mock((_handler: any) => (() => {}) as () => void);
 const mockSetModel = mock(async (_model: string, _opts?: any) => {});
 const mockHandlePendingToolCall = mock(async (_args: { requestId: string; result?: string; error?: string }) => {});
+const mockSetTools = mock(async (_args: { tools: any[] }) => {});
+const mockLog = mock((_message: string) => {});
 // Session lifecycle: invalidating an entry must close the runtime turn (abort)
 // and detach the object (disconnect) — dispose() no longer exists in SDK 1.0.x.
 const mockAbort = mock(async () => {});
@@ -40,7 +42,7 @@ const mockInitSession = mock(
       abort: mockAbort,
       disconnect: mockDisconnect,
       // Native tool mode answers SDK tool requests through this RPC.
-      rpc: { tools: { handlePendingToolCall: mockHandlePendingToolCall } },
+      rpc: { tools: { handlePendingToolCall: mockHandlePendingToolCall, set: mockSetTools } },
     },
     resumed: false,
   })
@@ -52,7 +54,7 @@ const mockInitSession = mock(
 const copilotCoreMock = () => ({
   client: { listModels: mockListModels, start: mock(async () => {}) },
   initSession: mockInitSession,
-  logger: { log: () => {}, error: () => {} },
+  logger: { log: mockLog, error: () => {} },
   getState: () => ({}),
   whichCli: () => null,
   setClientCwd: mock(() => {}),
@@ -570,6 +572,57 @@ describe("server.ts", () => {
       expect(mockSend).toHaveBeenCalled();
     });
 
+    test("server-mode system prompt routes *method input and forbids empty turns when opted in", async () => {
+      const prev = process.env.COPILOT_METHOD_RULES;
+      process.env.COPILOT_METHOD_RULES = "1";
+      try {
+        mockInitSession.mockClear();
+        mockOn.mockImplementation((handler: any) => {
+          setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+          return () => {};
+        });
+
+        await fetchApp(post("/v1/chat/completions", {
+          model: "gpt-5-mini", stream: false,
+          messages: [{ role: "user", content: "*debug --init" }],
+          tools: [{ name: "mcp__Counter___Counter__ExecuteMethod", description: "run method", input_schema: { type: "object" } }],
+        }, { "x-session-id": "server-mode-prompt-test" }));
+
+        const [prompt] = mockInitSession.mock.calls[0];
+        expect(prompt).toContain("`*name`");
+        expect(prompt).toContain("ExecuteMethod");
+        expect(prompt).toContain("Never end a turn with empty output");
+        expect(prompt).toContain("Never say a tool is unavailable");
+      } finally {
+        if (prev === undefined) delete process.env.COPILOT_METHOD_RULES;
+        else process.env.COPILOT_METHOD_RULES = prev;
+      }
+    });
+
+    test("server-mode system prompt omits the *method rules by default", async () => {
+      const prev = process.env.COPILOT_METHOD_RULES;
+      delete process.env.COPILOT_METHOD_RULES;
+      try {
+        mockInitSession.mockClear();
+        mockOn.mockImplementation((handler: any) => {
+          setTimeout(() => handler({ type: "assistant.turn_end", data: {} }), 0);
+          return () => {};
+        });
+
+        await fetchApp(post("/v1/chat/completions", {
+          model: "gpt-5-mini", stream: false,
+          messages: [{ role: "user", content: "hello" }],
+          tools: [{ name: "mcp__Counter___Counter__ExecuteMethod", description: "run method", input_schema: { type: "object" } }],
+        }, { "x-session-id": "server-mode-prompt-default-test" }));
+
+        const [prompt] = mockInitSession.mock.calls[0];
+        expect(prompt).toContain("Tool calls are executed by the client application");
+        expect(prompt).not.toContain("`*name`");
+      } finally {
+        if (prev !== undefined) process.env.COPILOT_METHOD_RULES = prev;
+      }
+    });
+
     test("passes denyAllTools and native externalTools when tools[] provided", async () => {
       mockInitSession.mockClear();
       mockOn.mockImplementation((handler: any) => {
@@ -991,6 +1044,231 @@ describe("server.ts", () => {
         error: expect.any(String),
       });
       expect(mockSend).toHaveBeenCalled();
+    });
+
+    test("a side request runs in a unique session that is disposed afterwards", async () => {
+      mockInitSession.mockClear();
+      mockDisconnect.mockClear();
+      let legs = 0;
+      mockOn.mockImplementation((handler: any) => {
+        legs++;
+        setTimeout(() => {
+          if (legs === 1) {
+            handler({
+              type: "external_tool.requested",
+              data: { requestId: "req-side2", toolCallId: "call_side2", toolName: "mcp__Counter___Counter__ExecuteMethod", arguments: {} },
+            });
+            handler({ type: "session.idle", data: {} });
+          } else {
+            handler({ type: "assistant.message", data: { content: "Title" } });
+            handler({ type: "assistant.turn_end", data: {} });
+          }
+        }, 0);
+        return () => {};
+      });
+
+      const tools = [
+        { name: "mcp__Counter___Counter__ExecuteMethod", description: "Run method", input_schema: { type: "object" } },
+      ];
+      const headers = { "x-session-id": "side-dispose-test" };
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "*debug" }], tools,
+      }, headers));
+
+      const sideBody = () => post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "Write the title." }],
+      }, headers);
+      await fetchApp(sideBody());
+      await fetchApp(sideBody());
+
+      const sideKeys = mockInitSession.mock.calls
+        .map(([, opts]: any) => opts.sessionId)
+        .filter((id: string) => id.startsWith("side-side-dispose-test-"));
+      // Two side requests, two distinct sessions: no shared history between them.
+      expect(sideKeys.length).toBe(2);
+      expect(new Set(sideKeys).size).toBe(2);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(mockDisconnect.mock.calls.length).toBeGreaterThanOrEqual(2);
+    });
+
+    test("evictIdleSessions releases an idle session and a later request resumes it", async () => {
+      const { evictIdleSessions } = await import("../copilot-to-openai");
+      mockInitSession.mockClear();
+      mockDisconnect.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          handler({ type: "assistant.message", data: { content: "hi" } });
+          handler({ type: "assistant.turn_end", data: {} });
+        }, 0);
+        return () => {};
+      });
+      const send = () => fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "hello" }],
+      }, { "x-session-id": "evict-idle-test" }));
+
+      await send();
+      expect(mockInitSession.mock.calls.length).toBe(1);
+
+      // Not yet idle past the TTL: kept.
+      expect(evictIdleSessions(Date.now(), 60_000)).toBe(0);
+      // Idle past the TTL: released and disconnected.
+      expect(evictIdleSessions(Date.now() + 61_000, 60_000)).toBeGreaterThanOrEqual(1);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(mockDisconnect).toHaveBeenCalled();
+
+      await send();
+      expect(mockInitSession.mock.calls.length).toBe(2);
+    });
+
+    test("a side request leaves a parked native call for the client to answer", async () => {
+      mockInitSession.mockClear();
+      mockHandlePendingToolCall.mockClear();
+      let legs = 0;
+      mockOn.mockImplementation((handler: any) => {
+        legs++;
+        setTimeout(() => {
+          if (legs === 1) {
+            handler({
+              type: "external_tool.requested",
+              data: { requestId: "req-side", toolCallId: "call_side", toolName: "mcp__Counter___Counter__ExecuteMethod", arguments: {} },
+            });
+            handler({ type: "session.idle", data: {} });
+          } else if (legs === 2) {
+            handler({ type: "assistant.message", data: { content: "Title" } });
+            handler({ type: "assistant.turn_end", data: {} });
+          } else {
+            handler({ type: "assistant.message", data: { content: "done" } });
+            handler({ type: "session.idle", data: {} });
+          }
+        }, 0);
+        return () => {};
+      });
+
+      const tools = [
+        { name: "mcp__Counter___Counter__ExecuteMethod", description: "Run method", input_schema: { type: "object" } },
+      ];
+      const headers = { "x-session-id": "side-park-test" };
+
+      const first = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "*debug" }],
+        tools,
+      }, headers));
+      expect((await first.json() as any).choices[0].message.tool_calls[0].id).toBe("call_side");
+
+      // The title request lands while the call is parked. It used to share the
+      // session, so its leg looked like a new prompt and refused the call.
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "Write the title in the predominant language of the session." }],
+      }, headers));
+      expect(mockHandlePendingToolCall).not.toHaveBeenCalled();
+
+      // It runs in its own session and is given no tools, so it cannot start a
+      // call of its own against the live conversation either.
+      const [, sideOpts] = mockInitSession.mock.calls[mockInitSession.mock.calls.length - 1];
+      expect(sideOpts.sessionId).toStartWith("side-");
+      expect(sideOpts.externalTools).toBeUndefined();
+
+      // The real client answers the call, and only then is it resolved.
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        tools,
+        messages: [
+          { role: "user", content: "*debug" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [{ id: "call_side", type: "function", function: { name: "mcp__Counter___Counter__ExecuteMethod", arguments: "{}" } }],
+          },
+          { role: "tool", tool_call_id: "call_side", content: "ran" },
+        ],
+      }, headers));
+      expect(mockHandlePendingToolCall).toHaveBeenCalledWith({ requestId: "req-side", result: "ran" });
+    });
+
+    test("a later request that adds tools re-declares them on the live session", async () => {
+      mockInitSession.mockClear();
+      mockSetTools.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          handler({ type: "assistant.message", data: { content: "ok" } });
+          handler({ type: "assistant.turn_end", data: {} });
+        }, 0);
+        return () => {};
+      });
+      const headers = { "x-session-id": "redeclare-tools-test" };
+      const counter = { name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } };
+      const bash = { name: "Bash", description: "Run a command", input_schema: { type: "object" } };
+
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "first" }],
+        tools: [counter],
+      }, headers));
+      expect(mockSetTools).not.toHaveBeenCalled();
+
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "second" }],
+        tools: [bash],
+      }, headers));
+
+      // Remembered + new tools: Bash joins the Counter tool and keeps its override flag.
+      expect(mockSetTools).toHaveBeenCalledTimes(1);
+      const declared = mockSetTools.mock.calls[0][0].tools;
+      expect(declared.map((t: any) => t.name).sort()).toEqual(["Bash", "mcp__Counter___Counter__Deploy"]);
+      expect(declared.find((t: any) => t.name === "Bash").overridesBuiltInTool).toBe(true);
+
+      // Same set again: nothing to repair.
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "third" }],
+        tools: [bash],
+      }, headers));
+      expect(mockSetTools).toHaveBeenCalledTimes(1);
+    });
+
+    test("a failed tools.set recreates the session with the requested tools", async () => {
+      mockSetTools.mockClear();
+      mockInitSession.mockClear();
+      mockOn.mockImplementation((handler: any) => {
+        setTimeout(() => {
+          handler({ type: "assistant.message", data: { content: "ok" } });
+          handler({ type: "assistant.turn_end", data: {} });
+        }, 0);
+        return () => {};
+      });
+      const headers = { "x-session-id": "redeclare-fail-test" };
+      const counter = { name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } };
+      const bash = { name: "Bash", description: "Run a command", input_schema: { type: "object" } };
+
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "first" }],
+        tools: [counter],
+      }, headers));
+
+      mockSetTools.mockImplementationOnce(async () => { throw new Error("rpc down"); });
+      const res = await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "second" }],
+        tools: [bash],
+      }, headers));
+      expect(res.status).toBe(200);
+      expect(mockSetTools).toHaveBeenCalledTimes(1);
+      // The tool-less-in-effect session was dropped and rebuilt with the new tools.
+      expect(mockInitSession).toHaveBeenCalledTimes(2);
+      const rebuilt = mockInitSession.mock.calls[1] as any[];
+      expect(rebuilt[1].externalTools.map((t: any) => t.name)).toContain("Bash");
+
+      // The rebuilt session already holds the tools: no further re-declare.
+      await fetchApp(post("/v1/chat/completions", {
+        model: "gpt-5-mini", stream: false,
+        messages: [{ role: "user", content: "third" }],
+        tools: [bash],
+      }, headers));
+      expect(mockSetTools).toHaveBeenCalledTimes(1);
     });
 
     test("reuses remembered tools to canonicalize later turns without tools[]", async () => {
@@ -1597,10 +1875,16 @@ describe("server.ts", () => {
 
         driveWithBodies([[], ["hello"], []]);
 
-        expect((await send()).status).toBe(200);          // strike 1
+        // Each body is read to the end, as a real client does: a stream's 200 is sent
+        // before its leg finishes, and the next request must not overlap that leg.
+        const first = await send();
+        expect(first.status).toBe(200);                   // strike 1
+        await first.text();
         const contentTurn = await (await send()).text();  // content → reset
         expect(contentTurn).toContain("hello");
-        expect((await send()).status).toBe(200);          // strike 1 again, not 2
+        const third = await send();
+        expect(third.status).toBe(200);                   // strike 1 again, not 2
+        await third.text();
 
         // One initSession only — the entry survived all three turns.
         expect(mockInitSession.mock.calls.length).toBe(before + 1);
@@ -1769,6 +2053,12 @@ describe("native stream framing", () => {
     expect(frames[1]).toBe("data: [DONE]\n\n");
   });
 
+  test("a replaced session sends an error frame before finishing", async () => {
+    const frames = await drain(streamCompletion(Promise.reject(new SessionReplacedError("s1")), "chatcmpl-x", "m"));
+
+    expect(frames[0]).toContain('"type":"session_replaced"');
+  });
+
   test("a successful leg replays its frames and then closes", async () => {
     const frames = await drain(
       streamCompletion(Promise.resolve(completion({ role: "assistant", content: "ok" }, "stop")), "chatcmpl-x", "m")
@@ -1851,5 +2141,260 @@ describe("native session state isolation", () => {
     expect(mockSend).toHaveBeenCalledTimes(2);
     const data = await second.json() as any;
     expect(data.choices[0].message.content).toBe("ok");
+  });
+});
+
+// ─── Request validation and client disconnect ────────────────────────────────
+describe("request validation", () => {
+  test("completions rejects a non-object JSON body with 400", async () => {
+    for (const body of [null, [], "text", 7]) {
+      const res = await fetchApp(post("/v1/chat/completions", body));
+      expect(res.status).toBe(400);
+    }
+  });
+
+  test("completions rejects messages that are not an array with 400", async () => {
+    const res = await fetchApp(post("/v1/chat/completions", { model: "gpt-5-mini", messages: "hi" }));
+    expect(res.status).toBe(400);
+  });
+
+  test("count_tokens rejects a non-object JSON body with 400", async () => {
+    const res = await fetchApp(post("/v1/messages/count_tokens", null));
+    expect(res.status).toBe(400);
+  });
+
+  test("count_tokens tolerates null entries in system and messages", async () => {
+    const res = await fetchApp(post("/v1/messages/count_tokens", {
+      system: [null, { text: "abcd" }],
+      messages: [null, { content: [null, { type: "text", text: "abcd" }] }],
+    }));
+    expect(res.status).toBe(200);
+    expect((await res.json() as any).input_tokens).toBe(2);
+  });
+});
+
+describe("usage estimate", () => {
+  test("completion and total tokens count the reply instead of staying zero", async () => {
+    mockInitSession.mockImplementation(async () => ({
+      session: {
+        send: mockSend,
+        on: mockOn,
+        setModel: mockSetModel,
+        abort: mockAbort,
+        disconnect: mockDisconnect,
+        rpc: { tools: { handlePendingToolCall: mockHandlePendingToolCall, set: mockSetTools } },
+      },
+      resumed: false,
+    }));
+    mockOn.mockImplementation((handler: any) => {
+      setTimeout(() => {
+        handler({ type: "assistant.message", data: { content: "The quick brown fox jumps over lazy dogs." } });
+        handler({ type: "assistant.turn_end", data: {} });
+      }, 0);
+      return () => {};
+    });
+    const res = await fetchApp(post("/v1/chat/completions", {
+      model: "gpt-5-mini",
+      messages: [{ role: "user", content: "b".repeat(80) }],
+    }, { "x-session-id": "usage-estimate-test" }));
+    const usage = ((await res.json()) as any).usage;
+    expect(usage.prompt_tokens).toBe(20);
+    expect(usage.completion_tokens).toBe(10);
+    expect(usage.total_tokens).toBe(30);
+  });
+});
+
+describe("non-stream client disconnect", () => {
+  test("aborting the request resolves the leg instead of waiting for the runtime", async () => {
+    mockSend.mockClear();
+    // A turn that streams a little and never goes idle: only the abort can end it.
+    mockOn.mockImplementation((handler: any) => {
+      setTimeout(() => handler({ type: "assistant.message_delta", data: { deltaContent: "partial" } }), 0);
+      return () => {};
+    });
+
+    const ctl = new AbortController();
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-session-id": "non-stream-abort-test" },
+      body: JSON.stringify({ model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "hello" }] }),
+      signal: ctl.signal,
+    });
+    const pending = fetchApp(req);
+    setTimeout(() => ctl.abort(), 50);
+
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect((await res.json() as any).choices[0].message.content).toBe("");
+  });
+});
+
+// ─── Session sync, replaced sessions and unparked results ────────────────────
+describe("session reconciliation", () => {
+  const counter = { name: "mcp__Counter___Counter__Deploy", description: "Deploy hero", input_schema: { type: "object" } };
+  const bash = { name: "Bash", description: "Run a command", input_schema: { type: "object" } };
+  // Earlier tests swap in minimal sessions; these need the full one (rpc included).
+  beforeEach(() => {
+    mockInitSession.mockImplementation(async () => ({
+      session: {
+        send: mockSend,
+        on: mockOn,
+        setModel: mockSetModel,
+        abort: mockAbort,
+        disconnect: mockDisconnect,
+        rpc: { tools: { handlePendingToolCall: mockHandlePendingToolCall, set: mockSetTools } },
+      },
+      resumed: false,
+    }));
+  });
+  const okTurn = () =>
+    mockOn.mockImplementation((handler: any) => {
+      setTimeout(() => {
+        handler({ type: "assistant.message", data: { content: "ok" } });
+        handler({ type: "assistant.turn_end", data: {} });
+      }, 0);
+      return () => {};
+    });
+
+  test("a request that joins an in-flight create reconciles its tools and model", async () => {
+    mockInitSession.mockClear();
+    mockSetTools.mockClear();
+    mockSetModel.mockClear();
+    okTurn();
+    // Slow create so the second request arrives while the first is still building.
+    mockInitSession.mockImplementationOnce(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+      return {
+        session: {
+          send: mockSend,
+          on: mockOn,
+          setModel: mockSetModel,
+          abort: mockAbort,
+          disconnect: mockDisconnect,
+          rpc: { tools: { handlePendingToolCall: mockHandlePendingToolCall, set: mockSetTools } },
+        },
+        resumed: false,
+      };
+    });
+    const headers = { "x-session-id": "join-create-test" };
+
+    const first = fetchApp(post("/v1/chat/completions", {
+      model: "gpt-5-mini", stream: false, messages: [{ role: "user", content: "one" }], tools: [counter],
+    }, headers));
+    const second = fetchApp(post("/v1/chat/completions", {
+      model: "gpt-5.5", stream: false, messages: [{ role: "user", content: "two" }], tools: [bash],
+    }, headers));
+    expect((await first).status).toBe(200);
+    expect((await second).status).toBe(200);
+
+    // One session, built for the first request, then brought in line with the second.
+    expect(mockInitSession).toHaveBeenCalledTimes(1);
+    expect(mockSetModel.mock.calls.map((c) => c[0])).toEqual(["gpt-5.5"]);
+    expect(mockSetTools).toHaveBeenCalledTimes(1);
+    expect(mockSetTools.mock.calls[0][0].tools.map((t: any) => t.name).sort()).toEqual([
+      "Bash",
+      "mcp__Counter___Counter__Deploy",
+    ]);
+  });
+
+  test("a request queued behind a failed leg gets 503 with Retry-After, not 500", async () => {
+    // Turn 1 errors after a delay; the second request is already queued on the entry.
+    mockOn.mockImplementation((handler: any) => {
+      setTimeout(() => handler({ type: "session.error", data: { message: "transport gone" } }), 40);
+      return () => {};
+    });
+    const headers = { "x-session-id": "replaced-session-test" };
+    const body = (content: string) => ({
+      model: "gpt-5-mini", stream: false, messages: [{ role: "user", content }], tools: [counter],
+    });
+
+    const first = fetchApp(post("/v1/chat/completions", body("one"), headers));
+    await new Promise((r) => setTimeout(r, 10));
+    const second = fetchApp(post("/v1/chat/completions", body("two"), headers));
+
+    expect((await first).status).toBe(500);
+    const res = await second;
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Retry-After")).toBe("1");
+    expect(((await res.json()) as any).error.message).toContain("retry");
+  });
+
+  test("a request queued behind a client restart gets 503 with Retry-After", async () => {
+    const body = (content: string) => ({
+      model: "gpt-5-mini", stream: false, messages: [{ role: "user", content }], tools: [counter],
+    });
+    const run = (key: string, content: string) =>
+      fetchApp(post("/v1/chat/completions", body(content), { "x-session-id": key }));
+
+    // A healthy turn zeroes the consecutive-failure count, so the next two failures
+    // are exactly what it takes to respawn the client.
+    mockOn.mockImplementation((handler: any) => {
+      setTimeout(() => {
+        handler({ type: "assistant.message", data: { content: "ok" } });
+        handler({ type: "assistant.turn_end", data: {} });
+      }, 0);
+      return () => {};
+    });
+    expect((await run("restart-healthy-test", "warm")).status).toBe(200);
+
+    mockOn.mockImplementation((handler: any) => {
+      setTimeout(() => handler({ type: "session.error", data: { message: "transport gone" } }), 40);
+      return () => {};
+    });
+    expect((await run("restart-strike-test", "strike")).status).toBe(500); // strike 1
+
+    mockLog.mockClear();
+    const first = run("restart-queued-test", "one"); // strike 2 -> restartClient
+    await new Promise((r) => setTimeout(r, 10));
+    const second = run("restart-queued-test", "two");
+
+    expect((await first).status).toBe(500);
+    expect(mockLog.mock.calls.some((c) => String(c[0]).includes("client reset"))).toBe(true);
+    const res = await second;
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Retry-After")).toBe("1");
+  });
+
+  test("results for tool_call_ids that are not parked are logged by id", async () => {
+    mockLog.mockClear();
+    mockHandlePendingToolCall.mockClear();
+    let turn = 0;
+    mockOn.mockImplementation((handler: any) => {
+      const mine = turn++;
+      setTimeout(() => {
+        if (mine === 0) {
+          handler({ type: "external_tool.requested", data: { requestId: "req-1", toolCallId: "call_parked", toolName: "Bash", arguments: {} } });
+        } else {
+          handler({ type: "assistant.message_delta", data: { deltaContent: "done" } });
+          handler({ type: "session.idle", data: {} });
+        }
+      }, 0);
+      return () => {};
+    });
+    const headers = { "x-session-id": "unparked-results-test" };
+
+    await fetchApp(post("/v1/chat/completions", {
+      model: "gpt-5-mini", stream: false, tools: [bash], messages: [{ role: "user", content: "run" }],
+    }, headers));
+
+    const res = await fetchApp(post("/v1/chat/completions", {
+      model: "gpt-5-mini", stream: false, tools: [bash],
+      messages: [
+        { role: "user", content: "run" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "call_parked", type: "function", function: { name: "Bash", arguments: "{}" } }],
+        },
+        { role: "tool", tool_call_id: "call_parked", content: "ran" },
+        { role: "tool", tool_call_id: "call_stranger", content: "stray" },
+      ],
+    }, headers));
+
+    expect(res.status).toBe(200);
+    // The parked call is answered; the stranger is reported, not forwarded.
+    expect(mockHandlePendingToolCall).toHaveBeenCalledWith({ requestId: "req-1", result: "ran" });
+    expect(mockHandlePendingToolCall.mock.calls.some((c) => c[0].result === "stray")).toBe(false);
+    expect(mockLog.mock.calls.some((c) => String(c[0]).includes("call_stranger"))).toBe(true);
   });
 });

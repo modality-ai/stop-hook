@@ -31,7 +31,6 @@ const BUILTIN_CLASH_NAMES = new Set([
   "Write",
   "WebFetch",
   "WebSearch",
-  "ToolSearch",
 ]);
 
 // SDK declaration for one client tool — handler-less, per the module header.
@@ -85,11 +84,41 @@ export const PARALLEL_CALL_QUIET_MS = 300;
 
 const LEG_TIMEOUT_MS = 10 * 60_000;
 
+// A wedged turn emits no events at all, yet the ceiling above only trips after
+// 10 minutes — and every later request on the session queues behind it. The idle
+// timer restarts on each session event, so a live (even slow) turn never trips it.
+// Override with COPILOT_LEG_IDLE_TIMEOUT_MS; 0 disables the watchdog.
+const DEFAULT_LEG_IDLE_TIMEOUT_MS = 30_000;
+const rawIdleMs = process.env.COPILOT_LEG_IDLE_TIMEOUT_MS?.trim();
+// An empty value is "unset": Number("") is 0, which would silently disable the watchdog.
+const parsedIdleMs = rawIdleMs ? Number(rawIdleMs) : NaN;
+// setTimeout stores its delay as a 32-bit int; anything larger fires immediately.
+const MAX_TIMER_MS = 2 ** 31 - 1;
+const LEG_IDLE_TIMEOUT_MS =
+  Number.isFinite(parsedIdleMs) && parsedIdleMs >= 0
+    ? Math.min(parsedIdleMs, MAX_TIMER_MS)
+    : DEFAULT_LEG_IDLE_TIMEOUT_MS;
+
 // A call that lands just after the batch was returned can no longer be delivered
 // to the client, and the runtime would wait on it forever. Keep listening this
 // long, record whatever arrives, and answer it at the start of the next leg so
 // the session never wedges.
 const LATE_CALL_GRACE_MS = 2_000;
+
+// While answering parked calls, an empty turn_end is either the stale end of the
+// turn that issued them or the model's real (empty) reply. Wait this long for
+// content or a call before settling on the latter, so a model that goes silent
+// after a tool result surfaces as an empty turn the caller can recover from,
+// instead of idling until the watchdog fails the whole leg.
+const EMPTY_ANSWER_GRACE_MS = 15_000;
+
+// The idle watchdog restarts on the turn_end itself, so a grace at or beyond the
+// idle window would always lose the race and fail the leg instead of settling it.
+function emptyAnswerGraceMs(): number {
+  return LEG_IDLE_TIMEOUT_MS
+    ? Math.min(EMPTY_ANSWER_GRACE_MS, LEG_IDLE_TIMEOUT_MS / 2)
+    : EMPTY_ANSWER_GRACE_MS;
+}
 
 const ABANDONED_CALL_REASON = "The client stopped waiting for this tool call.";
 
@@ -139,8 +168,11 @@ export type NativeLegOptions = {
   quietMs?: number;
   /** True when `start` answers parked calls instead of sending a prompt. */
   answering?: boolean;
-  /** Recorder for calls that arrive after the batch was returned. */
-  orphans?: OrphanedCall[];
+  /**
+   * Recorder for calls that arrive after the batch was returned. Required: a
+   * leg without one would drop them and leave the runtime waiting forever.
+   */
+  orphans: OrphanedCall[];
   /** The client stopped waiting: resolve at once, then drain late calls. */
   signal?: AbortSignal;
 };
@@ -156,9 +188,9 @@ export function runNativeLeg(
   {
     quietMs = PARALLEL_CALL_QUIET_MS,
     answering = false,
-    orphans = [],
+    orphans,
     signal,
-  }: NativeLegOptions = {}
+  }: NativeLegOptions
 ): Promise<NativeLegResult> {
   return new Promise((resolve, reject) => {
     const calls: NativeToolCall[] = [];
@@ -173,13 +205,19 @@ export function runNativeLeg(
     // listener that dispatched synchronously during subscription would otherwise
     // hit the temporal dead zone.
     let legTimer: ReturnType<typeof setTimeout> | null = null;
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    let emptyEndTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearEmptyEnd = () => {
+      if (emptyEndTimer) clearTimeout(emptyEndTimer);
+      emptyEndTimer = null;
+    };
 
     const release = () => {
       if (released) return;
       released = true;
       if (graceTimer) clearTimeout(graceTimer);
       graceTimer = null;
-      signal?.removeEventListener("abort", abort);
+      signal?.removeEventListener("abort", onAbort);
       unsub();
     };
     // An unanswered external call keeps the runtime turn busy, and a later resume
@@ -187,19 +225,26 @@ export function runNativeLeg(
     // closes the turn. Fire-and-forget: the caller must be released even when the
     // transport is already dead, and a refusal that cannot be delivered is dropped
     // rather than retried — the turn that owned the call is gone with it.
-    const refuseParked = () => {
-      if (pending.size) void abandonPendingCalls(session, pending).catch(() => {});
+    const refuseParked = (reason: string = ABANDONED_CALL_REASON) => {
+      if (pending.size) void abandonPendingCalls(session, pending, reason).catch(() => {});
     };
     const settle = (fn: () => void) => {
       if (settled) return;
       settled = true;
       if (legTimer) clearTimeout(legTimer);
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = null;
       if (quietTimer) clearTimeout(quietTimer);
       quietTimer = null;
+      clearEmptyEnd();
       fn();
     };
     const fail = (err: unknown) => {
-      refuseParked();
+      // Pass the failure through to the runtime's tool answer: the client (and
+      // the logs) then see why a call was dropped instead of a bare refusal.
+      // After the batch was returned the parked calls belong to the client, which
+      // will answer them; refusing them here would fail calls it is about to run.
+      if (!settled) refuseParked(err instanceof Error ? err.message : String(err));
       settle(() => reject(err));
       release();
     };
@@ -222,21 +267,41 @@ export function runNativeLeg(
     // The client gave up on this response. Resolve now, then refuse the calls it
     // already collected and keep the listener: the model may still ask for tools,
     // and an unanswered call would leave the runtime busy until the next request.
-    const abort = () => {
+    const abort = (refuse = true) => {
       if (settled) return;
       aborted = true;
       settle(() => resolve({ kind: "aborted" }));
-      refuseParked();
+      if (refuse) refuseParked();
       graceTimer = setTimeout(release, LATE_CALL_GRACE_MS);
     };
-    signal?.addEventListener("abort", abort, { once: true });
+    const onAbort = () => abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    // "abort" never fires for a signal that was aborted while the request sat in
+    // the session queue, so honor that case here. An answering leg has not run
+    // start() yet: refusing the parked calls now would replace the client's real
+    // results with errors, so start() is left to answer them.
+    if (signal?.aborted) abort(!answering);
 
     legTimer = setTimeout(
       () => fail(new Error(`native turn timed out after ${LEG_TIMEOUT_MS}ms`)),
       LEG_TIMEOUT_MS
     );
 
+    // Restarted by every session event (and once now, for a leg that never hears
+    // anything). Fails through the same path as the ceiling, so the caller's
+    // existing recovery (strike + invalidateSession) runs minutes sooner.
+    const armIdle = () => {
+      if (!LEG_IDLE_TIMEOUT_MS || settled) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(
+        () => fail(new Error(`native turn idle for ${LEG_IDLE_TIMEOUT_MS}ms`)),
+        LEG_IDLE_TIMEOUT_MS
+      );
+    };
+    armIdle();
+
     unsub = session.on((event: any) => {
+      armIdle();
       // The SDK dispatches handlers inside its own try/catch, so a throw here
       // would be swallowed and this promise would stay pending until the leg
       // timeout. Convert it into an immediate rejection instead.
@@ -266,6 +331,7 @@ export function runNativeLeg(
               toolName,
               arguments: args,
             } = event.data;
+            clearEmptyEnd();
             pending.set(toolCallId, requestId);
             calls.push({
               id: toolCallId,
@@ -278,20 +344,27 @@ export function runNativeLeg(
           case "assistant.tool_call_delta":
             // The model is still emitting the batch: push the quiet window out
             // so a slow sibling is delivered instead of orphaned.
+            // A call is being built, so an earlier empty turn_end was not the answer.
+            clearEmptyEnd();
             if (calls.length) armQuiet();
             break;
           case "assistant.message_delta":
+            clearEmptyEnd();
             content += event.data?.deltaContent ?? "";
             break;
           case "assistant.message":
             // Frames must not clobber the accumulation — see mergeAssistantFrame.
             content = mergeAssistantFrame(content, event.data?.content);
+            if (content) clearEmptyEnd();
             break;
           case "assistant.turn_end":
             // A model turn that asked for nothing is final. While answering
             // parked calls, an empty turn_end can be the stale end of the turn
             // that issued them, so wait for content or idle instead.
             if (!calls.length && (content || !answering)) finishText();
+            else if (!calls.length && !emptyEndTimer) {
+              emptyEndTimer = setTimeout(finishText, emptyAnswerGraceMs());
+            }
             break;
           case "session.idle":
             // Idle = turn fully over; parked calls would have kept it busy.
@@ -306,6 +379,11 @@ export function runNativeLeg(
         fail(err);
       }
     });
+
+    // A leg aborted before it began has nobody to answer, so do not spend a model
+    // turn on it. An answering leg must still run: its start() resolves the parked
+    // calls, and skipping it would leave the runtime waiting on them.
+    if (aborted && !answering) return;
 
     start().catch(fail);
   });
@@ -354,10 +432,11 @@ export async function answerToolResults(
  * Answer the given parked calls with an error and forget them. Ids that are no
  * longer parked are skipped: a live leg may already own them.
  */
-export async function abandonCalls(
+async function abandonCalls(
   session: Session,
   pending: PendingCalls,
-  ids: Iterable<string>
+  ids: Iterable<string>,
+  reason: string = ABANDONED_CALL_REASON
 ): Promise<number> {
   let answered = 0;
   for (const toolCallId of [...ids]) {
@@ -367,7 +446,7 @@ export async function abandonCalls(
     try {
       await session.rpc.tools.handlePendingToolCall({
         requestId,
-        error: ABANDONED_CALL_REASON,
+        error: reason,
       });
       answered++;
     } catch {
@@ -384,9 +463,10 @@ export async function abandonCalls(
  */
 export async function abandonPendingCalls(
   session: Session,
-  pending: PendingCalls
+  pending: PendingCalls,
+  reason: string = ABANDONED_CALL_REASON
 ): Promise<number> {
-  return abandonCalls(session, pending, [...pending.keys()]);
+  return abandonCalls(session, pending, [...pending.keys()], reason);
 }
 
 /** Answer calls recorded after their batch was returned. Unknown-on-arrival is fine. */
@@ -422,9 +502,26 @@ export function trailingToolResults(
     i >= 0 && messages[i]?.role === "tool";
     i--
   ) {
-    const c = messages[i].content;
-    const content = typeof c === "string" ? c : JSON.stringify(c ?? "");
-    out.unshift({ toolCallId: messages[i].tool_call_id, content });
+    out.unshift({
+      toolCallId: messages[i].tool_call_id,
+      content: toolMessageText(messages[i].content),
+    });
   }
   return out;
+}
+
+// OpenAI allows tool content as a string or an array of parts. The model reads
+// the text parts; anything else (an image's base64 payload) is dropped rather
+// than pushed at it as JSON. Shared with the prompt path so a result reads the
+// same whether or not its call was still parked.
+export function toolMessageText(content: unknown): string {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((p) => p?.type === "text" && typeof p.text === "string")
+      .map((p) => p.text)
+      .join("\n");
+  }
+  return JSON.stringify(content);
 }

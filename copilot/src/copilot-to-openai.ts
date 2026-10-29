@@ -1,7 +1,7 @@
-import { chmodSync } from "fs";
 import { listFiles, removeFile, staleDumps, tryMkdir } from "./loop-fs";
 import { describeRunaway, detectRunaway } from "./runaway";
 import { isTrustedSyntheticToolId } from "./synthetic-tool-id";
+import { isSideRequest, sideSessionKey } from "./side-request";
 import {
   ClientStrikeCounter,
   StartLatch,
@@ -37,6 +37,7 @@ import {
   runNativeLeg,
   salvageValidator,
   toExternalTools,
+  toolMessageText,
   trailingToolResults,
   PARALLEL_CALL_QUIET_MS,
   type FinishedLegResult,
@@ -67,8 +68,24 @@ let anonymousSessionKey = newAnonymousSessionKey();
 // Server mode exposes no runtime tools (see denyAllTools), so the SDK's default
 // system prompt — which describes bash/edit/read — invites calls that can only
 // be denied. Replaced whenever the client supplies its own tool set.
-const SERVER_MODE_SYSTEM_PROMPT =
+const BASE_SERVER_MODE_PROMPT =
   "You are a helpful assistant. Tool calls are executed by the client application; call tools directly rather than describing them.";
+
+// Rules written for a client that routes `*name` method commands through a
+// method-execution tool. Other OpenAI-compatible clients have no such tool, so
+// the rules are opt-in: COPILOT_METHOD_RULES=1 (read per call, not at load).
+const METHOD_CLIENT_RULES = [
+  "Rules:",
+  "- The tools in your tool list are available. Never say a tool is unavailable, blocked or removed without first calling it.",
+  "- A user message that is, or starts with, `*name` (for example `*debug --init`) is a method command. Run it by calling the method-execution tool (such as ExecuteMethod) with the full text as `method`; do not describe or simulate it.",
+  "- When a tool result contains instructions, carry them out in order, calling further tools as needed.",
+  "- Never end a turn with empty output. After a tool result, either call the next tool or reply with a short text answer.",
+];
+
+export function serverModeSystemPrompt(): string {
+  if (process.env.COPILOT_METHOD_RULES?.trim() !== "1") return BASE_SERVER_MODE_PROMPT;
+  return [BASE_SERVER_MODE_PROMPT, "", ...METHOD_CLIENT_RULES].join("\n");
+}
 
 // Diagnostic dumps are for eyeballing the last few bad requests. Without a cap
 // they accumulate forever, and each one holds a full request body — prompt text
@@ -76,12 +93,12 @@ const SERVER_MODE_SYSTEM_PROMPT =
 const MAX_DIAGNOSTIC_DUMPS = 20;
 
 function writeDiagnosticDump(prefix: string, body: any): string {
-  const dumpPath = `${COPILOT_LOOP_DIR}/${prefix}-${Date.now()}.json`;
-  writeLoopFile(dumpPath, JSON.stringify(body, null, 2));
-  // Prompts carry credentials, and /tmp is shared: owner-only, best effort.
-  try {
-    chmodSync(dumpPath, 0o600);
-  } catch {}
+  // The random suffix keeps two dumps in the same millisecond apart; it follows
+  // the timestamp, so staleDumps' lexical sort stays chronological.
+  const dumpPath = `${COPILOT_LOOP_DIR}/${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
+  // Prompts carry credentials, and /tmp is shared: created owner-only, so the file
+  // is never readable even between the write and a later chmod.
+  writeLoopFile(dumpPath, JSON.stringify(body, null, 2), 0o600);
   for (const f of staleDumps(listFiles(COPILOT_LOOP_DIR), prefix, MAX_DIAGNOSTIC_DUMPS)) {
     removeFile(`${COPILOT_LOOP_DIR}/${f}`);
   }
@@ -92,11 +109,11 @@ interface SessionEntry {
   session: CopilotSession;
   // Serialise concurrent requests: each request chains onto this promise
   queue: Promise<void>;
-  // Fingerprint of the tool set this session was initialised with. Declarations
-  // are fixed at session.create, so a later mismatch is only logged.
+  // Fingerprint of the tool set the session currently declares. Updated when a
+  // later request's tools are pushed with rpc.tools.set.
   toolFingerprint: string;
-  // Copilot model this session was initialised with. Switching model on an
-  // existing session is not supported by the SDK — must replace the session.
+  // Copilot model the session currently runs. A different requested model is
+  // applied in place with session.setModel (see syncEntry), history preserved.
   model: string;
   // The proxy session key (header x-session-id or derived hash). Carried on the
   // entry so per-turn error handlers can invalidate the right map entry without
@@ -111,6 +128,16 @@ interface SessionEntry {
   // it is stuck (see ABNORMAL_TURNS_BEFORE_INVALIDATE). Reset by any healthy
   // turn — a truncated turn carries text, so only "no content" is insufficient.
   consecutiveAbnormalTurns: number;
+  // Set once the entry is dropped and its SDK session disposed. A request queued
+  // behind the failing one still holds this entry; it must not send into the
+  // disposed session (the runtime answers with a native "already disposed" error).
+  disposed: boolean;
+  // Legs queued or running on this session. Calls are parked only once the model
+  // asks for them, so a request arriving earlier would still find nothing parked
+  // and send its prompt into a turn that is busy.
+  activeLegs: number;
+  // Last time a request touched this entry; the idle sweep evicts on it.
+  lastUsed: number;
 }
 
 interface PromptInput {
@@ -254,61 +281,92 @@ function toolFingerprint(tools?: any[]): string {
   return Bun.hash(names).toString(36);
 }
 
-async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: string): Promise<SessionEntry> {
-  const fp = toolFingerprint(tools);
-  const requestedModel = model ?? DEFAULT_MODEL;
-  const existing = sessions.get(sessionKey);
+// Bring an existing entry in line with this request's tools and model. Also run on
+// an entry that a concurrent request created: it was built for THAT request's
+// tools and model, which may differ from ours.
+function syncEntry(existing: SessionEntry, tools: any[] | undefined, fp: string, requestedModel: string): boolean {
+  const sessionKey = existing.sessionKey;
 
-  // Tools are declared to the runtime once, at session.create, and there is no
-  // RPC to re-declare them. Re-initialising here would drop the in-memory
-  // session (and the conversation with it), so the mismatch is only reported:
-  // a tool the client has just added is not natively callable until the session
-  // is recreated, and this log is what makes that diagnosable.
-  if (existing && existing.toolFingerprint !== fp) {
-    logger.log(
-      `⚠️ Tool set changed for ${sessionKey} (${existing.toolFingerprint} → ${fp}) — ` +
-        `session keeps the declarations it was created with`
+  // A resumed or tool-less session holds only the tools it was opened with, so a
+  // later request that carries more (Bash, Read, ...) would find them missing.
+  // tools.set replaces the list in place, keeping the conversation. Queued like
+  // setModel so it lands before the send that needs the tools.
+  const toolsChanged = !!tools?.length && existing.toolFingerprint !== fp;
+  if (toolsChanged) {
+    existing.queue = existing.queue.then(
+      async () => {
+        // Rechecked when it runs: an earlier queued request may already have
+        // declared this same set.
+        if (existing.toolFingerprint === fp) return;
+        const from = existing.toolFingerprint;
+        try {
+          await existing.session.rpc.tools.set({ tools: toExternalTools(tools) });
+          existing.toolFingerprint = fp;
+          logger.log(`🔧 Tools re-declared for ${sessionKey} (${from} → ${fp}, ${tools.length} tools)`);
+        } catch (err: any) {
+          // Some runtimes do not implement tools.set. Keeping the session would
+          // leave the model without tools and the server-mode prompt, so drop it:
+          // getOrCreateEntry recreates it with the tools declared at creation.
+          logger.log(`⚠️ tools.set failed for ${sessionKey}: ${err?.message ?? err}`);
+          invalidateSession(existing, "tools.set failed");
+        }
+      },
+      (err) => logger.log(`⚠️ Prior queue error before tools.set for ${sessionKey}: ${err?.message ?? err}`)
     );
   }
 
-  // Model switch on existing session: the SDK supports session.setModel() —
+  // Model switch on an existing session: the SDK supports session.setModel() —
   // takes effect for the NEXT message, conversation history preserved (mirrors
   // the official copilot CLI's /model command). Enqueue the switch onto the
   // session's serialization queue so concurrent requests with different models
   // don't race: each setModel runs atomically with the send that asked for it.
+  if (existing.model !== requestedModel) {
+    const targetModel = requestedModel;
+    existing.queue = existing.queue.then(
+      async () => {
+        const prev = existing.model;
+        if (prev === targetModel) return;
+        try {
+          await existing.session.setModel(targetModel);
+          existing.model = targetModel;
+          logger.log(`🔀 Model switched for ${sessionKey}: ${prev} → ${targetModel}`);
+        } catch (err: any) {
+          // Don't update entry.model — keep it pointing at the still-active
+          // model on the SDK side. Surface the failure so callers see why
+          // their /model command appears to have done nothing.
+          logger.log(
+            `⚠️ setModel failed for ${sessionKey} (${prev} → ${targetModel}): ${err?.message ?? err}`
+          );
+        }
+      },
+      (err) => logger.log(`⚠️ Prior queue error before setModel for ${sessionKey}: ${err?.message ?? err}`)
+    );
+  }
+  return toolsChanged;
+}
+
+async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: string): Promise<SessionEntry> {
+  const fp = toolFingerprint(tools);
+  const requestedModel = model ?? DEFAULT_MODEL;
+  const existing = sessions.get(sessionKey);
   if (existing) {
-    if (existing.model !== requestedModel) {
-      const targetModel = requestedModel;
-      existing.queue = existing.queue.then(
-        async () => {
-          const prev = existing.model;
-          try {
-            await existing.session.setModel(targetModel);
-            existing.model = targetModel;
-            logger.log(`🔀 Model switched for ${sessionKey}: ${prev} → ${targetModel}`);
-          } catch (err: any) {
-            // Don't update entry.model — keep it pointing at the still-active
-            // model on the SDK side. Surface the failure so callers see why
-            // their /model command appears to have done nothing.
-            logger.log(
-              `⚠️ setModel failed for ${sessionKey} (${prev} → ${targetModel}): ${err?.message ?? err}`
-            );
-          }
-        },
-        (err) => logger.log(`⚠️ Prior queue error before setModel for ${sessionKey}: ${err?.message ?? err}`)
-      );
-    }
-    return existing;
+    const toolsChanged = syncEntry(existing, tools, fp, requestedModel);
+    if (!toolsChanged) return existing;
+    // Wait for tools.set to land: if it failed the entry is disposed, and this
+    // request must run on a recreated session that really holds its tools.
+    await existing.queue;
+    return existing.disposed ? getOrCreateEntry(sessionKey, tools, model) : existing;
   }
 
   // Deduplicate concurrent creation for the same key
   let creating = sessionCreating.get(sessionKey);
+  const joined = !!creating;
   if (!creating) {
     // Tools are declared natively to the SDK, so no inline-JSON prefix is injected.
     // With tools present the system prompt is replaced by a server-mode one: the
     // default describes built-ins this session cannot expose. Without tools the
     // default is kept, so a plain conversational turn still gets normal framing.
-    const toolPrefix = tools?.length ? SERVER_MODE_SYSTEM_PROMPT : "";
+    const toolPrefix = tools?.length ? serverModeSystemPrompt() : "";
     // Pass model through so the session uses the client-requested model, not the SDK default.
     // Pass sessionId so the SDK's create/resume logic keys on the proxy's sessionKey —
     // enabling crash recovery via client.getSessionMetadata + client.resumeSession.
@@ -347,6 +405,9 @@ async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: strin
           sessionKey,
           native: createNativeSessionState(),
           consecutiveAbnormalTurns: 0,
+          disposed: false,
+          activeLegs: 0,
+          lastUsed: Date.now(),
         };
         sessions.set(sessionKey, entry);
         logger.log(
@@ -367,7 +428,14 @@ async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: strin
       });
     sessionCreating.set(sessionKey, creating);
   }
-  return creating;
+  const entry = await creating;
+  // Joined an in-flight create: it was built for the first request's tools and
+  // model, so reconcile with ours.
+  if (joined && syncEntry(entry, tools, fp, requestedModel)) {
+    await entry.queue;
+    if (entry.disposed) return getOrCreateEntry(sessionKey, tools, model);
+  }
+  return entry;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -407,7 +475,10 @@ function restartClient(reason: string): void {
   clientStartLatch.reset();
   clientStrikes.reset();
   cachedModels = null;
-  for (const entry of sessions.values()) disposeSession(entry.session);
+  for (const entry of sessions.values()) {
+    entry.disposed = true;
+    disposeSession(entry.session);
+  }
   sessions.clear();
   sessionCreating.clear();
   resetClient(reason);
@@ -448,31 +519,52 @@ function withSystemPrompt(prompt: string, system: any): string {
   return systemText ? `${systemText}\n\n${prompt}` : prompt;
 }
 
+function isJsonObject(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function estimateInputTokens(body: any): number {
   let chars = 0;
   const sys = body.system;
   if (typeof sys === "string") chars += sys.length;
   else if (Array.isArray(sys))
-    for (const b of sys) chars += b.text?.length ?? 0;
+    for (const b of sys) chars += b?.text?.length ?? 0;
   for (const msg of body.messages ?? []) {
-    const content = msg.content;
+    const content = msg?.content;
     if (typeof content === "string") {
       chars += content.length;
     } else if (Array.isArray(content)) {
       for (const b of content) {
-        if (b.type === "text") chars += b.text?.length ?? 0;
-        else if (b.type === "tool_use")
+        if (b?.type === "text") chars += b.text?.length ?? 0;
+        else if (b?.type === "tool_use")
           chars += JSON.stringify(b.input ?? {}).length;
-        else if (b.type === "tool_result") {
+        else if (b?.type === "tool_result") {
           if (typeof b.content === "string") chars += b.content.length;
           else if (Array.isArray(b.content))
-            for (const c of b.content) chars += c.text?.length ?? 0;
+            for (const c of b.content) chars += c?.text?.length ?? 0;
         }
       }
     }
   }
   for (const tool of body.tools ?? []) chars += JSON.stringify(tool).length;
   return Math.round(chars / 4);
+}
+
+// Same chars/4 heuristic as estimateInputTokens. The SDK reports no token counts
+// for a native leg, so clients that read `usage` get an estimate, not zeros.
+function estimateUsage(body: any, outputChars: number) {
+  const promptTokens = estimateInputTokens(body);
+  const completionTokens = Math.round(outputChars / 4);
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+  };
+}
+
+function nativeResultChars(result: FinishedLegResult): number {
+  if (result.kind === "text") return result.content.length;
+  return result.calls.reduce((sum, call) => sum + call.name.length + call.arguments.length, 0);
 }
 
 // The OpenAI Chat Completions `image_url` content part accepts an image in
@@ -562,12 +654,6 @@ function findToolCall(messages: any[], toolCallId: string): ToolCallRef | undefi
   return undefined;
 }
 
-function formatToolResultContent(content: any): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) return content.map((c: any) => c?.text ?? "").join("\n");
-  return "";
-}
-
 const MAX_PROMPT_CHARS = 200;
 
 function userMessageText(content: any): string {
@@ -614,7 +700,7 @@ function syntheticCallPreamble(messages: any[], toolId: string, call: ToolCallRe
 function formatToolResultLine(messages: any[], toolId: string, content: any): string {
   const call = findToolCall(messages, toolId);
   const name = call?.name ?? toolId;
-  let formatted = formatToolResultContent(content);
+  let formatted = toolMessageText(content);
   // Slim Counter ExecuteMethod results: remove the all-methods registry chunk
   // so the Copilot model presents only the current hero's methods (from the
   // _Counter__Deploy conversation history) instead of the full system method list.
@@ -698,7 +784,7 @@ function emptyCompletion(completionId: string, model: string, body: any) {
     object: "chat.completion",
     model,
     choices: [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: "stop" }],
-    usage: { prompt_tokens: estimateInputTokens(body), completion_tokens: 0, total_tokens: 0 },
+    usage: estimateUsage(body, 0),
   };
 }
 
@@ -778,6 +864,25 @@ function newToolCallId(): string {
 // Serialised through entry.queue so it never overlaps another turn.
 // ─────────────────────────────────────────────────────────────
 
+// Chain one leg onto the session queue and count it while it is queued or running.
+// The count drops in a handler attached before the caller's await, so by the time
+// the caller answers its client the leg is no longer counted: the client's next
+// request must not be mistaken for one that overlaps it.
+function queueLeg<T>(entry: SessionEntry, run: () => Promise<T>): Promise<T> {
+  entry.activeLegs++;
+  entry.lastUsed = Date.now();
+  const leg = entry.queue.then(run);
+  const done = () => {
+    entry.activeLegs--;
+    entry.lastUsed = Date.now();
+  };
+  leg.then(done, done);
+  // Failures are surfaced by the caller awaiting `leg`; the queue itself must
+  // never stay rejected or every later request on this session dies with it.
+  entry.queue = leg.then(() => undefined, () => undefined);
+  return leg;
+}
+
 // Run one nudge turn through the native leg machinery. The nudge must not use a
 // text-only driver: every tool call in server mode arrives as
 // external_tool.requested, and a driver without a handler for it leaves the
@@ -791,20 +896,20 @@ async function nudgeLeg(
   signal?: AbortSignal
 ): Promise<FinishedLegResult | null> {
   const session = entry.session as any;
-  const leg = entry.queue.then(() =>
-    runNativeLeg(session, entry.native.pending, () => session.send({ prompt }), {
+  const leg = queueLeg(entry, () => {
+    assertLive(entry);
+    return runNativeLeg(session, entry.native.pending, () => session.send({ prompt }), {
       orphans: entry.native.orphans,
       signal,
-    })
-  );
-  // Same queue rule as completeNative: a rejected leg must not poison the queue.
-  entry.queue = leg.then(() => undefined, () => undefined);
+    });
+  });
   try {
     const result = await leg;
     // The client gave up on the response: nothing to salvage, and the calls the
     // model asked for were refused on arrival by runNativeLeg.
     return result.kind === "aborted" ? null : result;
   } catch (err: any) {
+    if (err instanceof SessionReplacedError) throw err;
     // The nudge runs inside another request's response, so it answers to the same
     // recovery rules: strike the client and drop the entry for the next resume.
     const restarted = noteClientFailure(`nudge failed: ${err?.message ?? err}`);
@@ -828,8 +933,52 @@ const sseKeepalive = encoder.encode(": keepalive\n\n");
 // degrades.
 function invalidateSession(entry: SessionEntry, reason: string): void {
   if (sessions.get(entry.sessionKey) === entry) sessions.delete(entry.sessionKey);
+  entry.disposed = true;
   disposeSession(entry.session);
   logger.log(`🩹 Invalidated entry for ${entry.sessionKey} on ${reason} — next turn will auto-resume`);
+}
+
+// Drop a session that is no longer needed, without the failure framing of
+// invalidateSession. The SDK keeps its on-disk state, so a later request on the
+// same key resumes it; side sessions use a unique key and are never resumed.
+function releaseSession(entry: SessionEntry, why: string): void {
+  if (sessions.get(entry.sessionKey) === entry) sessions.delete(entry.sessionKey);
+  sessionTools.delete(entry.sessionKey);
+  entry.disposed = true;
+  disposeSession(entry.session);
+  logger.log(`🧹 Released ${entry.sessionKey} (${why})`);
+}
+
+// Sessions are otherwise dropped only on failure, so every conversation that
+// ever connected stays in memory. A session with a leg queued, or calls parked
+// for the client, is in use however long ago it was touched.
+const SESSION_IDLE_TTL_MS = 30 * 60_000;
+const SESSION_SWEEP_MS = 60_000;
+
+export function evictIdleSessions(now: number = Date.now(), ttlMs: number = SESSION_IDLE_TTL_MS): number {
+  let evicted = 0;
+  for (const entry of [...sessions.values()]) {
+    const inUse = entry.activeLegs > 0 || entry.native.pending.size > 0;
+    if (inUse || now - entry.lastUsed < ttlMs) continue;
+    releaseSession(entry, `idle ${Math.round((now - entry.lastUsed) / 1000)}s`);
+    evicted++;
+  }
+  return evicted;
+}
+
+// unref: the sweep must never keep the process alive on its own.
+setInterval(() => evictIdleSessions(), SESSION_SWEEP_MS).unref?.();
+
+// A request that waited in the queue found its session already replaced. This is
+// the earlier request's failure, not a new client fault, so it earns no strike.
+export class SessionReplacedError extends Error {
+  constructor(sessionKey: string) {
+    super(`session ${sessionKey} was replaced while this request waited; retry it`);
+  }
+}
+
+function assertLive(entry: SessionEntry): void {
+  if (entry.disposed) throw new SessionReplacedError(entry.sessionKey);
 }
 
 // Release an SDK session we are dropping. abort() first: a turn left waiting on
@@ -980,6 +1129,7 @@ async function countTokensHandler(c: Context) {
   } catch {
     return c.json({ error: { message: "Invalid JSON" } }, 400);
   }
+  if (!isJsonObject(body)) return c.json({ error: { message: "Request body must be a JSON object" } }, 400);
   return c.json({ input_tokens: estimateInputTokens(body) });
 }
 
@@ -1029,7 +1179,14 @@ async function completeNative(
   signal?: AbortSignal
 ) {
   const { pending: parked, orphans } = entry.native;
-  const results = trailingToolResults(messages).filter((r) => parked.has(r.toolCallId));
+  const trailing = trailingToolResults(messages);
+  const results = trailing.filter((r) => parked.has(r.toolCallId));
+  // Filtered out before answerToolResults, so its own `unknown` can never fire for
+  // these: report them here instead of dropping them silently.
+  const unparked = trailing.filter((r) => !parked.has(r.toolCallId));
+  if (unparked.length) {
+    logger.log(`⚠️ native: ignoring results for unparked tool_call_ids ${unparked.map((r) => r.toolCallId).join(",")}`);
+  }
   const session = entry.session as any;
   const answerOrSend = results.length
     ? async () => {
@@ -1054,21 +1211,20 @@ async function completeNative(
     return answerOrSend();
   };
 
-  const leg = entry.queue.then(() =>
-    runNativeLeg(session, parked, start, {
+  const leg = queueLeg(entry, () => {
+    assertLive(entry);
+    return runNativeLeg(session, parked, start, {
       quietMs: PARALLEL_CALL_QUIET_MS,
       answering: results.length > 0,
       orphans,
       signal,
-    })
-  );
-  // Failures are surfaced by the caller awaiting `leg`; the queue itself must
-  // never stay rejected or every later request on this session dies with it.
-  entry.queue = leg.then(() => undefined, () => undefined);
+    });
+  });
   let result: Awaited<typeof leg>;
   try {
     result = await leg;
   } catch (err: any) {
+    if (err instanceof SessionReplacedError) throw err;
     // Same recovery as nudgeLeg: strike the client and drop the entry so the
     // next request re-probes via resume instead of reusing a broken session.
     const restarted = noteClientFailure(`native leg failed: ${err?.message ?? err}`);
@@ -1123,7 +1279,7 @@ async function completeNative(
     object: "chat.completion",
     model,
     choices: [{ index: 0, message, finish_reason: nativeFinishReason(result.kind, truncated) }],
-    usage: { prompt_tokens: estimateInputTokens(body), completion_tokens: 0, total_tokens: 0 },
+    usage: estimateUsage(body, nativeResultChars(result)),
   };
 }
 
@@ -1158,7 +1314,14 @@ export function streamCompletion(
           for (const f of completionFrames(completion)) send(f);
         })
         .catch((err: any) => {
-          logger.error(`Server stream error: ${err?.message ?? err}`);
+          if (err instanceof SessionReplacedError) {
+            // The 200 is already sent, so the 503 the JSON path returns is not
+            // available: an error frame is how a stream client learns to retry.
+            logger.log(`🔁 ${err.message}`);
+            send(sseChunk(JSON.stringify({ error: { message: err.message, type: "session_replaced" } })));
+          } else {
+            logger.error(`Server stream error: ${err?.message ?? err}`);
+          }
           send(sseOpenAIFinish(id, model, "length"));
           send(encoder.encode("data: [DONE]\n\n"));
         })
@@ -1216,6 +1379,10 @@ async function completionsHandler(c: Context) {
   } catch {
     return c.json({ error: { message: "Invalid JSON" } }, 400);
   }
+  if (!isJsonObject(body)) return c.json({ error: { message: "Request body must be a JSON object" } }, 400);
+  if (body.messages !== undefined && !Array.isArray(body.messages)) {
+    return c.json({ error: { message: "messages must be an array" } }, 400);
+  }
 
   const rawTools = Array.isArray(body.tools) ? body.tools : undefined;
   const hadRawTools = !!rawTools?.length;
@@ -1269,8 +1436,19 @@ async function completionsHandler(c: Context) {
   // the stateful Copilot session can continue after client-side tool execution.
   const messages: any[] = body.messages ?? [];
   const headerSessionId = c.req.header("x-session-id");
-  const sessionKey = resolveSessionKey(headerSessionId, messages);
-  logger.log(`🔑 session: ${sessionKey}${headerSessionId ? " (from header)" : " (derived)"}`);
+  const live = headerSessionId ? sessions.get(headerSessionId) : undefined;
+  const hasLiveTurn = !!live && (live.native.pending.size > 0 || live.activeLegs > 0);
+  const sideRequest = isSideRequest(headerSessionId, messages, body.tools, hasLiveTurn);
+  // A side request gets its own throwaway session: sharing one `side-<id>` key
+  // made each title/summary prompt inherit the earlier ones' history, and the
+  // entry was never released. Disposed once its response completes.
+  const sessionKey = sideRequest && headerSessionId
+    ? `${sideSessionKey(headerSessionId)}-${Math.random().toString(36).slice(2, 10)}`
+    : resolveSessionKey(headerSessionId, messages);
+  logger.log(
+    `🔑 session: ${sessionKey}` +
+      (sideRequest ? " (side request)" : headerSessionId ? " (from header)" : " (derived)")
+  );
   const { prompt, attachments, error } = await extractLastTurn(messages);
 
   if (error) return c.json({ error: { message: error } }, 400);
@@ -1283,9 +1461,13 @@ async function completionsHandler(c: Context) {
     // NO tools at all (hadRawTools=false). When the client explicitly sent tools but
     // they were all non-MCP (hadRawTools=true, sessionEffective empty), respect that
     // signal — the client is actively suppressing MCP tools for this turn.
-    const effectiveTools = sessionEffective?.length
-      ? sessionEffective
-      : (!hadRawTools && globalMcpTools?.length ? globalMcpTools : sessionEffective);
+    // A side request is a bare prompt for text (title, summary): giving it the
+    // conversation's tools lets it call one the caller never offered.
+    const effectiveTools = sideRequest
+      ? undefined
+      : sessionEffective?.length
+        ? sessionEffective
+        : (!hadRawTools && globalMcpTools?.length ? globalMcpTools : sessionEffective);
     logger.log(
       `🔧 tools: incomingMcp=${body.tools?.length ?? 0} remembered=${sessionTools.get(sessionKey)?.length ?? 0} ` +
         `effective=${effectiveTools?.length ?? 0} globalFallback=${!sessionEffective?.length && !hadRawTools && !!globalMcpTools} promptHasToolReminder=${containsToolReminder(prompt)}`
@@ -1315,10 +1497,20 @@ async function completionsHandler(c: Context) {
     const effectivePrompt = withSystemPrompt(prompt, body.system);
 
     // Shared by the leg and the stream: cancelling the response aborts the leg.
+    // The request's own signal covers a non-stream client that hangs up, which has
+    // no stream to cancel.
     const disconnect = new AbortController();
+    const onRequestAbort = () => disconnect.abort();
+    const requestSignal = c.req.raw.signal;
+    requestSignal?.addEventListener("abort", onRequestAbort, { once: true });
     const pendingCompletion = completeNative(
       entry, messages, effectivePrompt, attachments, completionId, model, body, effectiveTools, disconnect.signal
     );
+    const finished = () => {
+      requestSignal?.removeEventListener("abort", onRequestAbort);
+      if (sideRequest) releaseSession(entry, "side request finished");
+    };
+    pendingCompletion.then(finished, finished);
     if (body.stream) {
       return new Response(streamCompletion(pendingCompletion, completionId, model, () => disconnect.abort()), {
         status: 200,
@@ -1331,6 +1523,11 @@ async function completionsHandler(c: Context) {
     }
     return c.json(await pendingCompletion);
   } catch (err: any) {
+    if (err instanceof SessionReplacedError) {
+      // The earlier request's failure, not a server fault: tell the client to retry.
+      logger.log(`🔁 ${err.message}`);
+      return c.json({ error: { message: err.message } }, 503, { "Retry-After": "1" });
+    }
     logger.error(`Server error: ${err.message}`);
     return c.json({ error: { message: err.message } }, 500);
   }

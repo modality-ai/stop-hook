@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "fs";
+import { chmodSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -192,8 +192,61 @@ describe("removeFile", () => {
   });
 });
 
+// ─── owner-only modes ─────────────────────────────────────────────────────────
+describe("owner-only modes", () => {
+  const modeOf = (path: string) => statSync(path).mode & 0o777;
+
+  test("writeFile with a mode creates the file with exactly that mode", () => {
+    const fs = createLoopFs(dir);
+    const target = join(dir, "secret.json");
+    const prevUmask = process.umask(0o000); // a permissive umask must not widen it
+    try {
+      fs.writeFile(target, "s", 0o600);
+    } finally {
+      process.umask(prevUmask);
+    }
+    expect(modeOf(target)).toBe(0o600);
+  });
+
+  test("a recreated directory is owner-only", () => {
+    const missing = join(dir, "gone");
+    const fs = createLoopFs(missing);
+    const prevUmask = process.umask(0o000);
+    try {
+      fs.writeFile(join(missing, "note.txt"), "x");
+    } finally {
+      process.umask(prevUmask);
+    }
+    expect(modeOf(missing)).toBe(0o700);
+  });
+
+  test("ensureDir tightens a directory that already exists", () => {
+    const existing = join(dir, "open");
+    mkdirSync(existing, { mode: 0o755 });
+    chmodSync(existing, 0o755);
+    createLoopFs(existing).ensureDir();
+    expect(modeOf(existing)).toBe(0o700);
+  });
+
+  test("tryMkdir applies a requested mode", () => {
+    const target = join(dir, "private");
+    const prevUmask = process.umask(0o000);
+    try {
+      expect(tryMkdir(target, 0o700)).toBeNull();
+    } finally {
+      process.umask(prevUmask);
+    }
+    expect(modeOf(target)).toBe(0o700);
+  });
+});
+
 // ─── staleDumps ───────────────────────────────────────────────────────────────
 describe("staleDumps", () => {
+  test("random suffixes after the timestamp keep the order chronological", () => {
+    const names = ["s-1700000000002-aaaaaa.json", "s-1700000000001-zzzzzz.json", "s-1700000000003-mmmmmm.json"];
+    expect(staleDumps(names, "s", 1)).toEqual(["s-1700000000001-zzzzzz.json", "s-1700000000002-aaaaaa.json"]);
+  });
+
   const names = ["suspicious-3.json", "suspicious-1.json", "suspicious-2.json"];
 
   test("returns the oldest dumps first once the cap is exceeded", () => {

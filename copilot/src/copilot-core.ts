@@ -353,7 +353,7 @@ const hasActuator = whichCli("actuator") != null;
 // ─────────────────────────────────────────────────────────────
 // Session event listener
 // ─────────────────────────────────────────────────────────────
-const setupSessionEventListener = (session: CopilotSession, options: any) => {
+export const setupSessionEventListener = (session: CopilotSession, options: any) => {
   // ============================================================================
   // Session Event Listener - Comprehensive Event Tracking
   // ============================================================================
@@ -688,6 +688,7 @@ const setupSessionEventListener = (session: CopilotSession, options: any) => {
         case "assistant.tool_call_delta":
         case "assistant.idle":
         case "external_tool.requested":
+        case "external_tool.completed":
           break;
 
         default:
