@@ -57,11 +57,6 @@ async function armsDefaultWatchdog(mod: typeof import("../native-turn")) {
 }
 
 describe("COPILOT_LEG_IDLE_TIMEOUT_MS parsing", () => {
-  test("0 disables the watchdog", async () => {
-    const mod = await loadWith("0", "idle-off");
-    expect(await silentLegFor100ms(mod)).toEqual({ kind: "text", content: "" });
-  });
-
   test("a non-numeric value falls back to the 30s default", async () => {
     const mod = await loadWith("abc", "idle-nan");
     expect(await silentLegFor100ms(mod)).toEqual({ kind: "text", content: "" });

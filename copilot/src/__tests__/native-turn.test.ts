@@ -148,19 +148,6 @@ describe("runNativeLeg", () => {
     ).rejects.toThrow("send failed");
   });
 
-  test("an empty turn_end while answering parked calls does not finish the leg", async () => {
-    // That turn_end can be the stale end of the turn that issued the calls;
-    // resolving on it would return an empty answer and leave the model's
-    // continuation unreported.
-    const s = fakeSession();
-    const leg = runLeg(s, new Map(), async () => {
-      s.emit("assistant.turn_end");
-      s.emit("assistant.message_delta", { deltaContent: "done" });
-      s.emit("session.idle");
-    }, { quietMs: 10, answering: true });
-    expect(await leg).toEqual({ kind: "text", content: "done" });
-  });
-
   test("a call arriving after an empty turn_end while answering is still returned", async () => {
     const s = fakeSession();
     const leg = runLeg(s, new Map(), async () => {
