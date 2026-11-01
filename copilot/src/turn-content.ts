@@ -29,7 +29,9 @@ export const mergeAssistantFrame = (current: string, incoming: string | undefine
 // literal again — so this classifier stays wide even though the prose-scraping
 // rescue it once shared patterns with is gone.
 const NUDGE_PATTERNS = [
-  /\b(?:I'll|I will|I am going to|I'm going to|I am about to|I must|Let me|I need to|I should)\s+(?:now |then |first |next |also |quickly )?(?:inspect|read|open|check|look|examine|search|grep|find|review|verify|view|list|scan|fetch|run|call|use|execute|gather|invoke|issue|collect)\b/i,
+  // The lookbehind skips a conditional offer ("tell me the path and I'll read it",
+  // "if you agree, I will run it"): that promise waits on the user, not on a call.
+  /(?<!\b(?:and|or|if|you)\b[^.\n]{0,40})\b(?:I'll|I will|I am going to|I'm going to|I am about to|I must|Let me|I need to|I should)\s+(?:now |then |first |next |also |quickly )?(?:inspect|read|open|check|look|examine|search|grep|find|review|verify|view|list|scan|fetch|run|call|use|execute|gather|invoke|issue|collect)\b/i,
   // Narrations with no first-person verb of their own: a discourse marker
   // ("Next, I run the build") or a gerund ("Proceeding to run the tests",
   // "Running the following commands:"). All three are common in tool-calling
@@ -43,7 +45,8 @@ const NUDGE_PATTERNS = [
   /\b(?:please|could you|can you)\s+(?:paste|share|provide|send)\b[^.\n]{0,60}\b(?:file|code|contents?)\b/i,
   // Persona status lines ("TARGET: ... | STATUS: Inspecting the persona
   // implementation.") announce work in the gerund with no first-person verb.
-  /\bSTATUS:\s*(?:Inspect|Read|Check|Review|Analy[sz]|Examin|Search|Verif|Look|Fetch|Run|Gather|Investigat|Scann|Open)\w*/i,
+  // Gerund only: a past-tense status ("STATUS: Searched the logs") reports done work.
+  /\bSTATUS:\s*(?:Inspect|Read|Check|Review|Analy[sz]|Examin|Search|Verif|Look|Fetch|Run|Gather|Investigat|Scann|Open)\w*ing\b/i,
 ];
 
 /** True when a turn that produced no tool call ends by announcing one. */

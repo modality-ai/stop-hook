@@ -92,6 +92,21 @@ describe("isUnfulfilledToolIntent persona status line", () => {
   test("ignores a completed STATUS", () => {
     expect(isUnfulfilledToolIntent("TARGET: Done | STATUS: Tests pass")).toBe(false);
   });
+  test("ignores a past-tense STATUS", () => {
+    expect(isUnfulfilledToolIntent("TARGET: Next step | STATUS: Searched the log locations; none cover this session")).toBe(false);
+    expect(isUnfulfilledToolIntent("STATUS: Reviewed 12 files")).toBe(false);
+  });
+});
+
+describe("isUnfulfilledToolIntent conditional offers", () => {
+  test("ignores a promise that waits on the user", () => {
+    expect(isUnfulfilledToolIntent("3. Tell me where the log file is, and I'll read only that file.")).toBe(false);
+    expect(isUnfulfilledToolIntent("If you share the path, I will check it.")).toBe(false);
+    expect(isUnfulfilledToolIntent("Once you paste it, I'll inspect the frames.")).toBe(false);
+  });
+  test("still nudges an unconditional announcement", () => {
+    expect(isUnfulfilledToolIntent("Done with the diff. I'll run the tests now.")).toBe(true);
+  });
 });
 
 describe("isUnfulfilledToolIntent false capability refusal", () => {
