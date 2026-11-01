@@ -71,3 +71,84 @@ export const shouldNudgeToolIntent = (turn: {
   content: string;
 }): boolean =>
   !turn.hasCall && !turn.truncated && !!turn.tools?.length && isUnfulfilledToolIntent(turn.content);
+
+// Sent into the SAME session when a native turn ends with no text and no call.
+// Re-sending the client's request instead would replay its message (or tool
+// results) into this stateful session, so the recovery happens here, in place.
+export const EMPTY_TURN_NUDGE_PROMPT =
+  "Your last turn produced no output. Continue the task: call the next tool you need, or reply with a short text answer. Never end a turn with empty output.";
+
+/**
+ * Whether a blank turn the nudges could not fill should strike its entry. Not
+ * when the client left (the session is intact), nor when a failed nudge already
+ * dropped the entry — striking it again would re-dispose a dead session.
+ */
+export const shouldStrikeUnfilledTurn = (state: { aborted: boolean; disposed: boolean }): boolean =>
+  !state.aborted && !state.disposed;
+
+const errorMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+/**
+ * Nudge a blank turn up to `attempts` times. A thrown nudge has dropped its
+ * session, so the next attempt runs on `reacquire(entry)`, never the dropped one.
+ * Always returns the latest entry — the caller must keep using it, even on
+ * failure, since the original may have been dropped — with the filled result,
+ * or a null result when aborted or every attempt failed or came back blank.
+ */
+export async function retryEmptyTurn<E, R>(opts: {
+  entry: E;
+  attempts: number;
+  signal?: AbortSignal;
+  nudge: (entry: E) => Promise<R | null>;
+  reacquire: (entry: E) => Promise<E>;
+  isFilled: (result: R) => boolean;
+  log?: (msg: string) => void;
+}): Promise<{ entry: E; result: R | null }> {
+  const log = opts.log ?? (() => {});
+  let entry = opts.entry;
+  for (let attempt = 1; attempt <= opts.attempts; attempt++) {
+    if (opts.signal?.aborted) return { entry, result: null };
+    log(`🔔 native turn ended empty, nudge ${attempt}/${opts.attempts}`);
+    try {
+      const result = await opts.nudge(entry);
+      if (result !== null && opts.isFilled(result)) return { entry, result };
+      // null means the client left mid-nudge: not an empty turn, stop quietly.
+      if (opts.signal?.aborted) return { entry, result: null };
+      log("🔔 empty-turn nudge produced nothing");
+    } catch (err) {
+      log(`⚠️ empty-turn nudge failed: ${errorMessage(err)}`);
+      if (attempt === opts.attempts) break;
+      try {
+        entry = await opts.reacquire(entry);
+      } catch (reErr) {
+        // No live session to retry on: give up like any other exhausted retry.
+        log(`⚠️ empty-turn reacquire failed: ${errorMessage(reErr)}`);
+        return { entry, result: null };
+      }
+    }
+  }
+  return { entry, result: null };
+}
+
+/**
+ * A blank answer mid tool loop (the request carried tool results and offered
+ * tools) stalls the agent, so it is nudged. A blank reply to a bare prompt keeps
+ * the existing empty-turn handling.
+ */
+export const isBlankToolLoopTurn = (turn: {
+  resultCount: number;
+  toolCount: number;
+  kind: string;
+  content: string;
+}): boolean => turn.resultCount > 0 && turn.toolCount > 0 && turn.kind === "text" && !turn.content.trim();
+
+/**
+ * Whether a blank turn should skip its nudge: the latest strike was itself a
+ * rescue and one more strike reaches the invalidation limit — rescues have
+ * already proved this session keeps stalling.
+ */
+export const rescueStrikesSpent = (state: {
+  lastStrikeRescued: boolean;
+  consecutiveAbnormalTurns: number;
+  limit: number;
+}): boolean => state.lastStrikeRescued && state.consecutiveAbnormalTurns >= state.limit - 1;

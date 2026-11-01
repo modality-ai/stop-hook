@@ -26,7 +26,15 @@ import {
   type XmlToolSchemas,
 } from "./tool-use-text";
 import { aliasMapForTools, buildXmlToolSchemas } from "./tool-schemas";
-import { shouldNudgeToolIntent, TOOL_NUDGE_PROMPT } from "./turn-content";
+import {
+  EMPTY_TURN_NUDGE_PROMPT,
+  isBlankToolLoopTurn,
+  rescueStrikesSpent,
+  retryEmptyTurn,
+  shouldNudgeToolIntent,
+  shouldStrikeUnfilledTurn,
+  TOOL_NUDGE_PROMPT,
+} from "./turn-content";
 import { imageUrlToAttachment, type BlobAttachment } from "./image-attachment";
 import {
   abandonPendingCalls,
@@ -132,6 +140,13 @@ interface SessionEntry {
   // behind the failing one still holds this entry; it must not send into the
   // disposed session (the runtime answers with a native "already disposed" error).
   disposed: boolean;
+  // Whether initSession restored the conversation from disk. A fresh session has
+  // no history, so a nudge to "continue the task" there would make up a turn.
+  resumed: boolean;
+  // Whether the latest strike came from a blank turn a nudge had to rescue. Only
+  // then does a further blank turn at the limit skip its nudge: another kind of
+  // strike (a truncated turn) says nothing about whether nudging works here.
+  lastStrikeRescued: boolean;
   // Legs queued or running on this session. Calls are parked only once the model
   // asks for them, so a request arriving earlier would still find nothing parked
   // and send its prompt into a turn that is busy.
@@ -413,6 +428,8 @@ async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: strin
           native: createNativeSessionState(),
           consecutiveAbnormalTurns: 0,
           disposed: false,
+          resumed,
+          lastStrikeRescued: false,
           activeLegs: 0,
           lastUsed: Date.now(),
         };
@@ -785,12 +802,20 @@ function containsToolReminder(prompt: string): boolean {
   return prompt.includes("The following skills are available") || prompt.includes("Available tools:");
 }
 
-function emptyCompletion(completionId: string, model: string, body: any) {
+// finishReason "length" marks an interrupted turn — a client abort, or a blank
+// turn the empty-turn nudges could not fill: a downstream proxy must not read it
+// as a model that finished and said nothing.
+function emptyCompletion(
+  completionId: string,
+  model: string,
+  body: any,
+  finishReason: "stop" | "length" = "stop"
+) {
   return {
     id: completionId,
     object: "chat.completion",
     model,
-    choices: [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: "stop" }],
+    choices: [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: finishReason }],
     usage: estimateUsage(body, 0),
   };
 }
@@ -900,7 +925,8 @@ function queueLeg<T>(entry: SessionEntry, run: () => Promise<T>): Promise<T> {
 async function nudgeLeg(
   entry: SessionEntry,
   prompt: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  { strikeClient = true }: { strikeClient?: boolean } = {}
 ): Promise<FinishedLegResult | null> {
   const session = entry.session as any;
   const leg = queueLeg(entry, () => {
@@ -919,7 +945,9 @@ async function nudgeLeg(
     if (err instanceof SessionReplacedError) throw err;
     // The nudge runs inside another request's response, so it answers to the same
     // recovery rules: strike the client and drop the entry for the next resume.
-    const restarted = noteClientFailure(`nudge failed: ${err?.message ?? err}`);
+    // A repeat nudge in the same request drops only its entry: one stuck
+    // conversation must not spend every strike and restart all sessions.
+    const restarted = strikeClient && noteClientFailure(`nudge failed: ${err?.message ?? err}`);
     if (!restarted) invalidateSession(entry, "nudge failed");
     throw err;
   }
@@ -1041,17 +1069,28 @@ export const isAbnormalStreamTurn = (facts: {
   truncated: boolean;
 }): boolean => facts.truncated || (!facts.hasToolCall && !facts.content.trim());
 
-function recordTurnOutcome(entry: SessionEntry, abnormal: boolean, where: string): void {
+// rescued: the strike is for a blank turn a nudge filled (see lastStrikeRescued).
+// keepParked: the turn just parked calls the client is about to answer, so the
+// strike counts but invalidation waits — dropping now would lose those calls.
+// The next blank turn on such an entry at the limit is not nudged (see completeNative).
+function recordTurnOutcome(
+  entry: SessionEntry,
+  abnormal: boolean,
+  where: string,
+  { rescued = false, keepParked = false }: { rescued?: boolean; keepParked?: boolean } = {}
+): void {
   if (!abnormal) {
     entry.consecutiveAbnormalTurns = 0;
+    entry.lastStrikeRescued = false;
     return;
   }
   entry.consecutiveAbnormalTurns++;
+  entry.lastStrikeRescued = rescued;
   logger.log(
     `⚠️ upstream turn ended abnormally (${where}) — ` +
       `${entry.consecutiveAbnormalTurns}/${ABNORMAL_TURNS_BEFORE_INVALIDATE} consecutive`
   );
-  if (entry.consecutiveAbnormalTurns >= ABNORMAL_TURNS_BEFORE_INVALIDATE) {
+  if (entry.consecutiveAbnormalTurns >= ABNORMAL_TURNS_BEFORE_INVALIDATE && !keepParked) {
     invalidateSession(entry, "consecutive abnormal turns");
   }
 }
@@ -1172,6 +1211,52 @@ async function salvageTextLeg(
   };
 }
 
+const EMPTY_TURN_NUDGE_ATTEMPTS = 2;
+
+const isFilled = (result: FinishedLegResult): boolean =>
+  result.kind === "tool_calls" || result.content.trim() !== "";
+
+/**
+ * A native turn ended blank. Nudge the session so the model continues where it
+ * stopped, instead of returning an empty completion the downstream proxy would
+ * resend (which replays the request into this stateful session). Retry and
+ * entry-handoff semantics: see retryEmptyTurn.
+ *
+ * A replaced session (SessionReplacedError) is retried on the live entry like
+ * any failed nudge, as long as that entry resumed the conversation: answering
+ * 503 instead would make the client resend tool results that are no longer
+ * parked, replaying them as a new prompt.
+ */
+async function nudgeEmptyTurn(
+  entry: SessionEntry,
+  tools: any[] | undefined,
+  model: string,
+  signal?: AbortSignal
+): Promise<{ entry: SessionEntry; result: FinishedLegResult | null }> {
+  let clientStruck = false;
+  return retryEmptyTurn({
+    entry,
+    attempts: EMPTY_TURN_NUDGE_ATTEMPTS,
+    signal,
+    nudge: async (e) => {
+      try {
+        return await nudgeLeg(e, EMPTY_TURN_NUDGE_PROMPT, signal, { strikeClient: !clientStruck });
+      } catch (err) {
+        if (!(err instanceof SessionReplacedError)) clientStruck = true;
+        throw err;
+      }
+    },
+    reacquire: async (e) => {
+      const next = await getOrCreateEntry(e.sessionKey, tools, model);
+      // Only resumed history can be continued; a fresh session gives up instead.
+      if (!next.resumed) throw new Error(`session ${e.sessionKey} came back without its history`);
+      return next;
+    },
+    isFilled,
+    log: (msg) => logger.log(msg),
+  });
+}
+
 // Native mode: either answer the parked calls with the request's role:"tool"
 // messages or send the user prompt, then run until the model asks for tools
 // again or finishes. Serialised on the session queue like any turn.
@@ -1242,10 +1327,41 @@ async function completeNative(
   if (result.kind === "aborted") {
     // Client is gone: no strike and no invalidation — the session is intact.
     logger.log("⏹ native leg aborted by the client — remaining calls refused");
-    return emptyCompletion(completionId, model, body);
+    return emptyCompletion(completionId, model, body, "length");
   }
   noteClientHealthy();
 
+  // A turn the nudge had to rescue is not healthy: it strikes the entry like a
+  // blank one, so a session that keeps going blank is eventually dropped.
+  let rescued = false;
+  const blankToolLoopTurn = isBlankToolLoopTurn({
+    resultCount: results.length,
+    toolCount: tools?.length ?? 0,
+    kind: result.kind,
+    content: result.kind === "text" ? result.content : "",
+  });
+  if (blankToolLoopTurn) {
+    const strikesSpent = rescueStrikesSpent({
+      lastStrikeRescued: entry.lastStrikeRescued,
+      consecutiveAbnormalTurns: entry.consecutiveAbnormalTurns,
+      limit: ABNORMAL_TURNS_BEFORE_INVALIDATE,
+    });
+    const nudged = strikesSpent
+      ? { entry, result: null }
+      : await nudgeEmptyTurn(entry, tools, model, signal);
+    // A failed nudge drops the original entry: continue on the latest one.
+    entry = nudged.entry;
+    if (!nudged.result) {
+      // Unfilled blank turn: strike it so repeated blanks invalidate the session,
+      // and report "length" (interrupted) — a blank "stop" reads as done.
+      if (shouldStrikeUnfilledTurn({ aborted: !!signal?.aborted, disposed: entry.disposed })) {
+        recordTurnOutcome(entry, true, "native empty turn");
+      }
+      return emptyCompletion(completionId, model, body, "length");
+    }
+    result = nudged.result;
+    rescued = true;
+  }
   // A model can still narrate a call as text. Reuse the existing salvage
   // pipeline so such turns surface as tool_calls instead of prose.
   let truncated = false;
@@ -1256,15 +1372,18 @@ async function completeNative(
     ({ result, truncated } = await salvageTextLeg(entry, result.content, tools, signal));
   }
 
-  recordTurnOutcome(
-    entry,
-    isAbnormalStreamTurn({
-      hasToolCall: result.kind === "tool_calls",
-      content: result.kind === "text" ? result.content : "",
-      truncated,
-    }),
-    "native"
-  );
+  const abnormal = isAbnormalStreamTurn({
+    hasToolCall: result.kind === "tool_calls",
+    content: result.kind === "text" ? result.content : "",
+    truncated,
+  });
+  if (!rescued) recordTurnOutcome(entry, abnormal, "native");
+  else {
+    recordTurnOutcome(entry, true, "native turn rescued by nudge", {
+      rescued: true,
+      keepParked: result.kind === "tool_calls",
+    });
+  }
   logger.log(
     `🧩 native leg (${results.length ? `${results.length} results` : "prompt"}) → ` +
       (result.kind === "tool_calls" ? `${result.calls.length} tool_calls` : "text")
@@ -1517,7 +1636,12 @@ async function completionsHandler(c: Context) {
     );
     const finished = () => {
       requestSignal?.removeEventListener("abort", onRequestAbort);
-      if (sideRequest) releaseSession(entry, "side request finished");
+      if (!sideRequest) return;
+      // A failed nudge already disposed the original entry: do not dispose it twice.
+      if (!entry.disposed) releaseSession(entry, "side request finished");
+      // A failed nudge may have swapped in a new entry under the same key.
+      const live = sessions.get(sessionKey);
+      if (live) releaseSession(live, "side request finished");
     };
     pendingCompletion.then(finished, finished);
     if (body.stream) {

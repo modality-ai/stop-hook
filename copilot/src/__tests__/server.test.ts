@@ -2441,7 +2441,10 @@ describe("non-stream client disconnect", () => {
 
     const res = await pending;
     expect(res.status).toBe(200);
-    expect((await res.json() as any).choices[0].message.content).toBe("");
+    const choice = (await res.json() as any).choices[0];
+    expect(choice.message.content).toBe("");
+    // Interrupted, not finished: a blank "stop" would read as the model being done.
+    expect(choice.finish_reason).toBe("length");
   });
 });
 
@@ -2569,6 +2572,141 @@ describe("session reconciliation", () => {
     const res = await second;
     expect(res.status).toBe(503);
     expect(res.headers.get("Retry-After")).toBe("1");
+  });
+
+  // The intruding request drops the session while the blank turn waits to be nudged.
+  const replacedMidNudge = async (reacquireResumes: boolean, sessionId: string) => {
+    mockInitSession.mockClear();
+    mockLog.mockClear();
+    // Yield whole macrotasks until `cond` holds: ordering by events, not by timers.
+    const until = async (cond: () => boolean) => {
+      for (let i = 0; i < 500 && !cond(); i++) await new Promise((r) => setTimeout(r, 0));
+      expect(cond()).toBe(true);
+    };
+    const toolsLogs = () => mockLog.mock.calls.filter((c) => String(c[0]).includes("🔧 tools:")).length;
+    let turn = 0;
+    // The tool-result leg's handler, held so its blank answer is sent only once
+    // the intruding request has queued behind it.
+    let answerLeg: ((event: any) => void) | undefined;
+    mockOn.mockImplementation((handler: any) => {
+      const mine = turn++;
+      if (mine === 0) {
+        setTimeout(() => handler({ type: "external_tool.requested", data: { requestId: "req-1", toolCallId: "call_1", toolName: "Bash", arguments: {} } }), 0);
+      } else if (mine === 1) {
+        answerLeg = handler;
+      } else if (mine === 2) {
+        // The queued request runs before the nudge and drops the session.
+        setTimeout(() => handler({ type: "session.error", data: { message: "transport gone" } }), 0);
+      } else {
+        setTimeout(() => {
+          handler({ type: "assistant.message_delta", data: { deltaContent: "continued" } });
+          handler({ type: "session.idle", data: {} });
+        }, 0);
+      }
+      return () => {};
+    });
+    const headers = { "x-session-id": sessionId };
+    const call = { id: "call_1", type: "function", function: { name: "Bash", arguments: "{}" } };
+
+    await fetchApp(post("/v1/chat/completions", {
+      model: "gpt-5-mini", stream: false, tools: [bash], messages: [{ role: "user", content: "run" }],
+    }, headers));
+    if (reacquireResumes) {
+      const fresh = await mockInitSession("", {});
+      mockInitSession.mockClear();
+      mockInitSession.mockImplementationOnce(async () => ({ ...fresh, resumed: true }));
+    } else {
+      mockInitSession.mockClear();
+    }
+    const answered = fetchApp(post("/v1/chat/completions", {
+      model: "gpt-5-mini", stream: false, tools: [bash],
+      messages: [
+        { role: "user", content: "run" },
+        { role: "assistant", content: null, tool_calls: [call] },
+        { role: "tool", tool_call_id: "call_1", content: "ran" },
+      ],
+    }, headers));
+    await until(() => !!answerLeg);
+    const logsBeforeIntruder = toolsLogs();
+    const intruder = fetchApp(post("/v1/chat/completions", {
+      model: "gpt-5-mini", stream: false, tools: [bash], messages: [{ role: "user", content: "other" }],
+    }, headers));
+    // The intruder has reached its handler; one more macrotask lets it queue its leg.
+    await until(() => toolsLogs() > logsBeforeIntruder);
+    await new Promise((r) => setTimeout(r, 0));
+    // Blank answer to the tool result: the queued intruder now runs before the nudge.
+    answerLeg!({ type: "session.idle", data: {} });
+
+    expect((await intruder).status).toBe(500);
+    const res = await answered;
+    // Not a 503: that would make the client resend tool results no longer parked.
+    expect(res.status).toBe(200);
+    expect(mockLog.mock.calls.some((c) => /empty-turn nudge failed: .*was replaced/.test(String(c[0])))).toBe(true);
+    return (await res.json()) as any;
+  };
+
+  test("a blank tool-result turn whose session is replaced mid-nudge is retried on the resumed session", async () => {
+    const data = await replacedMidNudge(true, "empty-turn-replaced-test");
+    expect(data.choices[0].message.content).toBe("continued");
+    expect(data.choices[0].finish_reason).toBe("stop");
+    // The nudge was retried on a reacquired session.
+    expect(mockInitSession).toHaveBeenCalledTimes(1);
+  });
+
+  test("a replaced session that comes back without history is not nudged", async () => {
+    const data = await replacedMidNudge(false, "empty-turn-fresh-test");
+    // Nudging a fresh session would make up a turn: report the interruption instead.
+    expect(data.choices[0].message.content).toBe("");
+    expect(data.choices[0].finish_reason).toBe("length");
+    expect(mockLog.mock.calls.some((c) => /reacquire failed: .*without its history/.test(String(c[0])))).toBe(true);
+  });
+
+  test("blank turns rescued into calls strike; the next blank at the limit is not nudged and drops the session", async () => {
+    mockLog.mockClear();
+    mockSend.mockClear();
+    const askBash = (handler: any) =>
+      handler({ type: "external_tool.requested", data: { requestId: "req-1", toolCallId: "call_1", toolName: "Bash", arguments: {} } });
+    // Legs in order: prompt → call, result → blank, nudge → call (rescue),
+    // result → blank (strikes spent: no nudge).
+    const script = [askBash, null, askBash, null];
+    let leg = 0;
+    mockOn.mockImplementation((handler: any) => {
+      const step = script[leg++];
+      setTimeout(() => {
+        step?.(handler);
+        handler({ type: "session.idle", data: {} });
+      }, 0);
+      return () => {};
+    });
+    const headers = { "x-session-id": "empty-turn-rescue-strike-test" };
+    const call = { id: "call_1", type: "function", function: { name: "Bash", arguments: "{}" } };
+    const answer = () => fetchApp(post("/v1/chat/completions", {
+      model: "gpt-5-mini", stream: false, tools: [bash],
+      messages: [
+        { role: "user", content: "run" },
+        { role: "assistant", content: null, tool_calls: [call] },
+        { role: "tool", tool_call_id: "call_1", content: "ran" },
+      ],
+    }, headers));
+    const logged = (re: RegExp) => mockLog.mock.calls.some((c) => re.test(String(c[0])));
+    const nudgesSent = () =>
+      mockSend.mock.calls.filter((c: any[]) => String(c[0]?.prompt).startsWith("Your last turn produced no output")).length;
+
+    await fetchApp(post("/v1/chat/completions", {
+      model: "gpt-5-mini", stream: false, tools: [bash], messages: [{ role: "user", content: "run" }],
+    }, headers));
+    mockLog.mockClear();
+    // Blank → rescued into a call: struck, but the session and its parked call stay.
+    const first = (await (await answer()).json()) as any;
+    expect(first.choices[0].finish_reason).toBe("tool_calls");
+    expect(logged(/rescued by nudge\) — 1\//)).toBe(true);
+    expect(logged(/Invalidated entry/)).toBe(false);
+    // Blank again with the strikes spent: no second nudge, interrupted, dropped.
+    const second = (await (await answer()).json()) as any;
+    expect(second.choices[0].message.content).toBe("");
+    expect(second.choices[0].finish_reason).toBe("length");
+    expect(nudgesSent()).toBe(1);
+    expect(logged(/Invalidated entry for empty-turn-rescue-strike-test on consecutive abnormal/)).toBe(true);
   });
 
   test("results for tool_call_ids that are not parked are logged by id", async () => {

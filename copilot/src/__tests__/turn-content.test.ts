@@ -1,8 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+  EMPTY_TURN_NUDGE_PROMPT,
+  isBlankToolLoopTurn,
   isUnfulfilledToolIntent,
   mergeAssistantFrame,
+  rescueStrikesSpent,
+  retryEmptyTurn,
   shouldNudgeToolIntent,
+  shouldStrikeUnfilledTurn,
   TOOL_NUDGE_PROMPT,
 } from "../turn-content";
 
@@ -188,5 +193,240 @@ describe("isUnfulfilledToolIntent new opener boundaries", () => {
 
   test("still ignores a narration that already carries a tool_use literal", () => {
     expect(isUnfulfilledToolIntent('Next, I run the build {"tool_use":{"name":"Bash","input":{}}}')).toBe(false);
+  });
+});
+
+describe("retryEmptyTurn", () => {
+  const run = (nudge: (entry: string) => Promise<string | null>, extra: { signal?: AbortSignal } = {}) => {
+    const reacquired: string[] = [];
+    const nudged: string[] = [];
+    const promise = retryEmptyTurn<string, string>({
+      entry: "old",
+      attempts: 2,
+      signal: extra.signal,
+      nudge: (e) => {
+        nudged.push(e);
+        return nudge(e);
+      },
+      reacquire: async (e) => {
+        reacquired.push(e);
+        return "fresh";
+      },
+      isFilled: (r) => r.trim() !== "",
+    });
+    return { promise, reacquired, nudged };
+  };
+
+  test("a failed first nudge retries on the reacquired session, not the dropped one", async () => {
+    let calls = 0;
+    const { promise, reacquired, nudged } = run(async () => {
+      if (calls++ === 0) throw new Error("rpc failed");
+      return "continued";
+    });
+    expect(await promise).toEqual({ entry: "fresh", result: "continued" });
+    expect(nudged).toEqual(["old", "fresh"]);
+    expect(reacquired).toEqual(["old"]);
+  });
+
+  test("a blank first nudge retries on the same session", async () => {
+    let calls = 0;
+    const { promise, reacquired, nudged } = run(async () => (calls++ === 0 ? "  " : "ok"));
+    expect(await promise).toEqual({ entry: "old", result: "ok" });
+    expect(nudged).toEqual(["old", "old"]);
+    expect(reacquired).toEqual([]);
+  });
+
+  test("returns the reacquired entry with no result when every attempt fails, without reacquiring after the last", async () => {
+    const { promise, reacquired, nudged } = run(async () => {
+      throw new Error("down");
+    });
+    expect(await promise).toEqual({ entry: "fresh", result: null });
+    expect(nudged).toEqual(["old", "fresh"]);
+    expect(reacquired).toEqual(["old"]);
+  });
+
+  test("returns null when every attempt is blank", async () => {
+    expect(await run(async () => "").promise).toEqual({ entry: "old", result: null });
+  });
+
+  test("an aborted nudge (null) counts as no output", async () => {
+    expect(await run(async () => null).promise).toEqual({ entry: "old", result: null });
+  });
+
+  test("stops before nudging when the client already left", async () => {
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const { promise, nudged } = run(async () => "x", { signal: ctrl.signal });
+    expect(await promise).toEqual({ entry: "old", result: null });
+    expect(nudged).toEqual([]);
+  });
+
+  test("returns null when reacquiring the session fails", async () => {
+    const result = await retryEmptyTurn<string, string>({
+      entry: "old",
+      attempts: 2,
+      nudge: async () => {
+        throw new Error("rpc failed");
+      },
+      reacquire: async () => {
+        throw new Error("resume failed");
+      },
+      isFilled: (r) => r.trim() !== "",
+    });
+    expect(result).toEqual({ entry: "old", result: null });
+  });
+
+  test("a client abort during a nudge stops without a second attempt", async () => {
+    const ctrl = new AbortController();
+    const { promise, nudged } = run(
+      async () => {
+        ctrl.abort();
+        return null;
+      },
+      { signal: ctrl.signal }
+    );
+    expect(await promise).toEqual({ entry: "old", result: null });
+    expect(nudged).toEqual(["old"]);
+  });
+});
+
+describe("shouldStrikeUnfilledTurn", () => {
+  test("a live entry with the client still connected is struck", () => {
+    expect(shouldStrikeUnfilledTurn({ aborted: false, disposed: false })).toBe(true);
+  });
+  test("a client abort leaves the intact session unstruck", () => {
+    expect(shouldStrikeUnfilledTurn({ aborted: true, disposed: false })).toBe(false);
+  });
+  test("an entry a failed nudge already dropped is not struck again", () => {
+    expect(shouldStrikeUnfilledTurn({ aborted: false, disposed: true })).toBe(false);
+  });
+});
+
+describe("isBlankToolLoopTurn", () => {
+  const turn = { resultCount: 1, toolCount: 2, kind: "text", content: "" };
+  test("a blank answer to tool results with tools offered is nudged", () => {
+    expect(isBlankToolLoopTurn(turn)).toBe(true);
+  });
+  test("whitespace-only content still counts as blank", () => {
+    expect(isBlankToolLoopTurn({ ...turn, content: " \n\t" })).toBe(true);
+  });
+  test("a blank reply to a bare prompt is not nudged", () => {
+    expect(isBlankToolLoopTurn({ ...turn, resultCount: 0 })).toBe(false);
+  });
+  test("a blank turn with no tools offered is not nudged", () => {
+    expect(isBlankToolLoopTurn({ ...turn, toolCount: 0 })).toBe(false);
+  });
+  test("a turn with text is not nudged", () => {
+    expect(isBlankToolLoopTurn({ ...turn, content: "done" })).toBe(false);
+  });
+  test("a tool_calls turn is not nudged", () => {
+    expect(isBlankToolLoopTurn({ ...turn, kind: "tool_calls" })).toBe(false);
+  });
+});
+
+describe("rescueStrikesSpent", () => {
+  test("a rescued strike one short of the limit skips the nudge", () => {
+    expect(rescueStrikesSpent({ lastStrikeRescued: true, consecutiveAbnormalTurns: 1, limit: 2 })).toBe(true);
+  });
+  test("a rescued strike below that threshold still nudges", () => {
+    expect(rescueStrikesSpent({ lastStrikeRescued: true, consecutiveAbnormalTurns: 0, limit: 2 })).toBe(false);
+  });
+  test("a non-rescue strike (e.g. truncation) at the threshold still nudges", () => {
+    expect(rescueStrikesSpent({ lastStrikeRescued: false, consecutiveAbnormalTurns: 1, limit: 2 })).toBe(false);
+  });
+  test("a rescued strike past the limit skips the nudge", () => {
+    expect(rescueStrikesSpent({ lastStrikeRescued: true, consecutiveAbnormalTurns: 3, limit: 2 })).toBe(true);
+  });
+});
+
+describe("retryEmptyTurn attempt bound", () => {
+  test("never nudges more than the configured attempts", async () => {
+    let n = 0;
+    await retryEmptyTurn<string, string>({
+      entry: "e",
+      attempts: 3,
+      nudge: async () => {
+        n++;
+        return "";
+      },
+      reacquire: async (e) => e,
+      isFilled: (r) => r !== "",
+    });
+    expect(n).toBe(3);
+  });
+});
+
+describe("empty-turn nudge gaps", () => {
+  test("EMPTY_TURN_NUDGE_PROMPT asks the model to continue rather than end empty", () => {
+    expect(EMPTY_TURN_NUDGE_PROMPT).toContain("Continue the task");
+  });
+
+  test("a client abort after a blank nudge stops without a second attempt", async () => {
+    const ctrl = new AbortController();
+    let n = 0;
+    const result = await retryEmptyTurn<string, string>({
+      entry: "e",
+      attempts: 3,
+      signal: ctrl.signal,
+      nudge: async () => {
+        n++;
+        ctrl.abort();
+        return "";
+      },
+      reacquire: async (e) => e,
+      isFilled: (r) => r !== "",
+    });
+    expect({ result, n }).toEqual({ result: { entry: "e", result: null }, n: 1 });
+  });
+
+  test("a blank nudge after a failure keeps the reacquired entry", async () => {
+    let calls = 0;
+    const result = await retryEmptyTurn<string, string>({
+      entry: "old",
+      attempts: 3,
+      nudge: async () => {
+        if (calls++ === 0) throw new Error("rpc failed");
+        return "";
+      },
+      reacquire: async () => "fresh",
+      isFilled: (r) => r !== "",
+    });
+    expect(result).toEqual({ entry: "fresh", result: null });
+  });
+
+  test("isFilled is never called with a null result", async () => {
+    const seen: unknown[] = [];
+    await retryEmptyTurn<string, string>({
+      entry: "e",
+      attempts: 1,
+      nudge: async () => null,
+      reacquire: async (e) => e,
+      isFilled: (r) => {
+        seen.push(r);
+        return true;
+      },
+    });
+    expect(seen).toEqual([]);
+  });
+
+  test("logs each nudge attempt through the log callback", async () => {
+    const logs: string[] = [];
+    await retryEmptyTurn<string, string>({
+      entry: "e",
+      attempts: 2,
+      nudge: async () => "",
+      reacquire: async (e) => e,
+      isFilled: (r) => r !== "",
+      log: (m) => logs.push(m),
+    });
+    expect(logs.filter((m) => /nudge \d\/2/.test(m)).length).toBe(2);
+  });
+
+  test("a non-rescue strike past the limit still nudges", () => {
+    expect(rescueStrikesSpent({ lastStrikeRescued: false, consecutiveAbnormalTurns: 5, limit: 2 })).toBe(false);
+  });
+
+  test("an aborted client on a disposed entry is not struck", () => {
+    expect(shouldStrikeUnfilledTurn({ aborted: true, disposed: true })).toBe(false);
   });
 });
