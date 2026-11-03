@@ -205,6 +205,34 @@ const saveModelsCache = (models: any[]) => {
   writeLoopFile(MODELS_CACHE_FILE, JSON.stringify(models, null, 2));
 };
 
+const modelNotAvailableError = (
+  model: string,
+  cachedModelIds: string[]
+): Error =>
+  new Error(
+    `Model "${model}" is not available. Run --update-models to refresh.\n   Available: ${cachedModelIds.join(", ")}`
+  );
+
+// Server mode guard: verify the requested model against the cached model list
+// BEFORE creating a session, so an unknown model surfaces as a thrown error
+// (→ per-request failure for the caller) instead of initSession's
+// process.exit(1) taking the whole server down. A missing or stale cache is
+// refreshed from listModels once; throwing only if the model is still absent.
+export const ensureModelAvailable = async (model: string): Promise<void> => {
+  let cachedModelIds = loadCachedModelIds();
+  if (null == cachedModelIds || !cachedModelIds.includes(model)) {
+    const models = await client.listModels();
+    saveModelsCache(models);
+    cachedModelIds = models.map((m: any) => m.id).filter(Boolean);
+    logger.log(
+      `✅ Models cache updated: ${MODELS_CACHE_FILE} (${models.length} models)`
+    );
+  }
+  if (!cachedModelIds.includes(model)) {
+    throw modelNotAvailableError(model, cachedModelIds);
+  }
+};
+
 // ─────────────────────────────────────────────────────────────
 // Logger
 // ─────────────────────────────────────────────────────────────
@@ -724,6 +752,7 @@ export const initSession = async (
     mcpServers,
     systemPromptMode = systemPromptModes[0],
   } = options;
+  const isServerMode = options.denyAllTools;
   const finalSystemPromptMode = systemPromptModes.includes(systemPromptMode)
     ? systemPromptMode
     : systemPromptModes[0];
@@ -754,13 +783,13 @@ export const initSession = async (
     // model so it cannot pick built-ins (bash/edit/...) — picking one would be
     // permission-rejected and the turn would end with empty text.
     // (server.ts also calls setClientCwd to keep cwd hooks out of the picture.)
-    ...(options.denyAllTools ? { availableTools: ["custom:*"] } : {}),
+    ...(isServerMode ? { availableTools: ["custom:*"] } : {}),
     // Native tool mode: client tools declared WITHOUT a handler. The runtime
     // surfaces each call as external_tool.requested and waits for
     // handlePendingToolCall (verified in poc-native-tools.ts).
     ...(options.externalTools?.length ? { tools: options.externalTools } : {}),
     onPermissionRequest: async (request: any) => {
-      if (options["denyAllTools"]) {
+      if (isServerMode) {
         logger.log(`🚫 Server mode: permission blocked for: ${request?.kind}`);
         return { kind: "reject" as const };
       }
@@ -783,7 +812,7 @@ export const initSession = async (
         if (externalNames.includes(toolName)) {
           return { permissionDecision: "allow" };
         }
-        if (options["denyAllTools"]) {
+        if (isServerMode) {
           logger.log(`🚫 Server mode: tool execution blocked for: ${toolName}`);
           return {
             permissionDecision: "deny",
@@ -1040,24 +1069,21 @@ export const initSession = async (
     resumed = false;
   }
 
-  let cachedModelIds = loadCachedModelIds();
-  if (null == cachedModelIds || options.updateModels) {
+  if (options.updateModels) {
     const models = await client.listModels();
     saveModelsCache(models);
     logger.log(
       `✅ Models cache updated: ${MODELS_CACHE_FILE} (${models.length} models)`
     );
-    if (null == cachedModelIds) {
-      cachedModelIds = models.map((m: any) => m.id).filter(Boolean);
-    }
-    if (options.updateModels) {
-      process.exit(0);
-    }
+    process.exit(0);
   }
-  if (!cachedModelIds.includes(model)) {
-    logger.error(
-      `❌ Model "${model}" is not available. Run --update-models to refresh.\n   Available: ${cachedModelIds.join(", ")}`
-    );
+  try {
+    await ensureModelAvailable(model);
+  } catch (err: any) {
+    // Server mode: a per-request failure must never take the whole server down
+    // — rethrow so the HTTP caller gets an error response.
+    if (isServerMode) throw err;
+    logger.error(`❌ ${err.message}`);
     process.exit(1);
   }
 

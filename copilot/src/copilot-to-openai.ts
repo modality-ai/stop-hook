@@ -9,6 +9,7 @@ import {
 } from "./client-lifecycle";
 import {
   client,
+  ensureModelAvailable,
   initSession,
   logger,
   resetClient,
@@ -407,7 +408,11 @@ async function getOrCreateEntry(sessionKey: string, tools?: any[], model?: strin
           externalTools: toExternalTools(tools),
         }
       : { denyAllTools: true, model: requestedModel, sessionId: sessionKey };
+    // Precheck the model BEFORE creating the session: an unknown model must
+    // fail this one request (thrown error → HTTP 500 below), not let
+    // initSession's model check kill the server with process.exit(1).
     creating = ensureClientStarted()
+      .then(() => ensureModelAvailable(requestedModel))
       .then(() => initSession(toolPrefix, sessionOpts))
       .then(({ session, resumed }) => {
         // A client restart may have cleared the registry while this create was in
