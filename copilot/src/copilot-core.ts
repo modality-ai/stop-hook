@@ -9,7 +9,8 @@ import { appendFile } from "fs/promises";
 import { execSync } from "child_process";
 import { getSessionId } from "./SweAgentInteraction";
 import { createLoopFs, tryMkdir } from "./loop-fs";
-import { DEFAULT_MODEL, DEFAULT_REASON_MODEL } from "./config";
+import { DEFAULT_MODEL, DEFAULT_REASON_MODEL, COPILOT_LOOP_DIR } from "./config";
+import { printColorDiff } from "./color-diff";
 
 // ─────────────────────────────────────────────────────────────
 // Types
@@ -30,7 +31,6 @@ export interface BashResult {
 // ─────────────────────────────────────────────────────────────
 // Paths & directories
 // ─────────────────────────────────────────────────────────────
-export const COPILOT_LOOP_DIR = "/tmp/copilot-loop";
 
 // /tmp is not durable: the OS tmp-cleaner, a reboot, or a manual sweep can
 // remove COPILOT_LOOP_DIR out from under a long-running process. A single
@@ -89,51 +89,6 @@ export const getPersonaPrompt = (
 ) =>
   `Deploy ${personaName} persona to activate and maintain persistence throughout the entire workflow.${currentIteration && 1 < currentIteration ? " and use the View tool to read the LOOP_MD file for context." : ""}`;
 
-const printColorDiff = (
-  filePath: string,
-  oldStr: string,
-  newStr: string
-): void => {
-  const RESET = "\x1b[0m";
-  const RED = "\x1b[31m";
-  const GREEN = "\x1b[32m";
-  const CYAN = "\x1b[36m";
-  const DIM = "\x1b[2m";
-  const BOLD = "\x1b[1m";
-  const id = Date.now();
-  const tmpOld = `${COPILOT_LOOP_DIR}/.diff-old-${id}`;
-  const tmpNew = `${COPILOT_LOOP_DIR}/.diff-new-${id}`;
-  try {
-    writeLoopFile(tmpOld, oldStr ?? "");
-    writeLoopFile(tmpNew, newStr ?? "");
-    let rawDiff = "";
-    try {
-      execSync(
-        `diff -u --label "a/${filePath}" --label "b/${filePath}" ${shellEscape(tmpOld)} ${shellEscape(tmpNew)}`,
-        { encoding: "utf-8" }
-      );
-    } catch (e: any) {
-      rawDiff = e.stdout ?? "";
-    }
-    if (!rawDiff) return;
-    const colored = rawDiff
-      .split("\n")
-      .map((line) => {
-        if (line.startsWith("---") || line.startsWith("+++"))
-          return `${BOLD}${CYAN}${line}${RESET}`;
-        if (line.startsWith("@@")) return `${CYAN}${line}${RESET}`;
-        if (line.startsWith("-")) return `${RED}${line}${RESET}`;
-        if (line.startsWith("+")) return `${GREEN}${line}${RESET}`;
-        return `${DIM}${line}${RESET}`;
-      })
-      .join("\n");
-    writeSync(1, `\n${colored}\n`);
-  } finally {
-    try {
-      execSync(`rm -f ${shellEscape(tmpOld)} ${shellEscape(tmpNew)}`);
-    } catch {}
-  }
-};
 
 const deniedCommands: {
   name: string;
@@ -522,13 +477,35 @@ export const setupSessionEventListener = (session: CopilotSession, options: any)
                   ? JSON.parse(event.data.arguments)
                   : event.data.arguments;
               if (args?.path) {
-                printColorDiff(
-                  args.path,
-                  event.data.toolName === "edit" ? (args.old_str ?? "") : "",
+                const oldStr =
+                  event.data.toolName === "edit" ? (args.old_str ?? "") : "";
+                const newStr =
                   event.data.toolName === "edit"
                     ? (args.new_str ?? "")
-                    : (args.content ?? "")
-                );
+                    : (args.content ?? "");
+                const id = Date.now();
+                const tmpOld = `${COPILOT_LOOP_DIR}/.diff-old-${id}`;
+                const tmpNew = `${COPILOT_LOOP_DIR}/.diff-new-${id}`;
+                try {
+                  writeLoopFile(tmpOld, oldStr);
+                  writeLoopFile(tmpNew, newStr);
+                  let rawDiff = "";
+                  try {
+                    execSync(
+                      `diff -u --label ${shellEscape(`a/${args.path}`)} --label ${shellEscape(`b/${args.path}`)} ${shellEscape(tmpOld)} ${shellEscape(tmpNew)}`,
+                      { encoding: "utf-8" }
+                    );
+                  } catch (e: any) {
+                    rawDiff = e.stdout ?? "";
+                  }
+                  if (rawDiff) {
+                    writeSync(1, `\n${printColorDiff(rawDiff)}\n`);
+                  }
+                } finally {
+                  try {
+                    execSync(`rm -f ${shellEscape(tmpOld)} ${shellEscape(tmpNew)}`);
+                  } catch {}
+                }
               }
             } catch {}
           }

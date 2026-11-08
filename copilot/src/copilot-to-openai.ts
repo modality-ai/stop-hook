@@ -15,10 +15,9 @@ import {
   resetClient,
   setClientCwd,
   writeLoopFile,
-  COPILOT_LOOP_DIR,
   type SdkLifecycle,
 } from "./copilot-core";
-import { DEFAULT_MODEL } from "./config";
+import { COPILOT_LOOP_DIR, DEFAULT_MODEL } from "./config";
 import {
   extractInlineToolUse,
   slimCounterResult,
